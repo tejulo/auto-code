@@ -5,3 +5,4 @@ __pycache__/
 .auto-code/
 .opencode/
 .ralph/
+.worktrees/
