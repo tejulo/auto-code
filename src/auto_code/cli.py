@@ -12,8 +12,9 @@ import stat
 import sys
 from typing import Protocol
 
-from .contracts import EvidenceRef, RunnerIdentity
+from .contracts import EvidenceRef, RunnerIdentity, StepResult
 from .state import RunStateStore, StateGeneration, StateStoreError
+from .supervisor import SupervisorStateMismatch
 
 
 _LAUNCHER_RUNTIME_FD = 3
@@ -48,6 +49,10 @@ class _PrepareCoordinator(Protocol):
         expected_hash: str,
         receipt_ref: EvidenceRef,
     ) -> object: ...
+
+
+class _Supervisor(Protocol):
+    def step(self, run_id: str, expected_revision: int, expected_hash: str) -> StepResult: ...
 
 
 def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -156,6 +161,11 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--expected-revision")
     prepare.add_argument("--expected-hash")
     prepare.add_argument("--receipt-ref", action="append")
+    step = commands.add_parser("step")
+    step.add_argument("--run")
+    step.add_argument("--expected-revision")
+    step.add_argument("--expected-hash")
+    step.add_argument("--json", action="store_true")
     return parser
 
 
@@ -256,11 +266,47 @@ def _run_prepare(
     return 0
 
 
+def _run_step(
+    args: argparse.Namespace,
+    runtime: TrustedRuntimeConfig | None,
+    supervisor_factory: Callable[[TrustedRuntimeConfig], _Supervisor] | None,
+) -> int:
+    if not args.run or args.expected_revision is None or args.expected_hash is None or not args.json:
+        print("step: invalid arguments", file=sys.stderr)
+        return 2
+    try:
+        expected_revision = int(args.expected_revision)
+        if expected_revision < 1 or _SHA256.fullmatch(args.expected_hash) is None:
+            raise ValueError
+    except ValueError:
+        print("step: invalid arguments", file=sys.stderr)
+        return 2
+    try:
+        trusted_runtime = runtime if runtime is not None else load_launcher_runtime_from_protected_fd()
+    except RuntimeConfigurationError:
+        print("step: launcher runtime unavailable", file=sys.stderr)
+        return 2
+    if supervisor_factory is None:
+        print("step: launcher composition unavailable", file=sys.stderr)
+        return 2
+    try:
+        result = supervisor_factory(trusted_runtime).step(args.run, expected_revision, args.expected_hash)
+    except (SupervisorStateMismatch, ValueError, StateStoreError):
+        print("step: expected state does not match", file=sys.stderr)
+        return 2
+    except Exception:
+        print("step: operation unavailable", file=sys.stderr)
+        return 2
+    print(result.model_dump_json())
+    return 0
+
+
 def main(
     argv: Sequence[str] | None = None,
     runtime: TrustedRuntimeConfig | None = None,
     *,
     prepare_coordinator_factory: Callable[[TrustedRuntimeConfig], _PrepareCoordinator] | None = None,
+    supervisor_factory: Callable[[TrustedRuntimeConfig], _Supervisor] | None = None,
 ) -> int:
     arguments = sys.argv[1:] if argv is None else argv
     try:
@@ -276,6 +322,8 @@ def main(
 
     if args.command == "prepare":
         return _run_prepare(args, runtime, prepare_coordinator_factory)
+    if args.command == "step":
+        return _run_step(args, runtime, supervisor_factory)
     if args.command != "status":
         print("auto-code: a command is required", file=sys.stderr)
         return 2

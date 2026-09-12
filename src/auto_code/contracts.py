@@ -90,6 +90,16 @@ class RunDisposition(StrEnum):
     ABANDONED = "abandoned"
 
 
+class StepKind(StrEnum):
+    CONTINUE = "continue"
+    MCP_ACTION = "mcp_action"
+    ITERATION_FAILED = "iteration_failed"
+    REPAIR_REQUIRED = "repair_required"
+    READY_TO_FINALIZE = "ready_to_finalize"
+    HUMAN_REVIEW = "human_review"
+    DONE = "done"
+
+
 class PreparationPhase(StrEnum):
     SELECTED = "selected"
     IN_PROGRESS_REQUESTED = "in_progress_requested"
@@ -1707,6 +1717,50 @@ class McpActionRequest(ContractModel):
             **request_payload,
             request_hash=hash_json(request_payload),
         )
+
+
+class StepResult(ContractModel):
+    """The public, CAS-bound result of one deterministic supervisor step."""
+
+    kind: StepKind
+    run_id: EffectReference
+    state_revision: int = Field(ge=1)
+    state_hash: Sha256
+    request_id: str | None = None
+    stage: Stage | None = None
+    action: McpActionRequest | None = None
+    failure: FailureRecord | None = None
+    evidence: tuple[EvidenceRef, ...] = ()
+
+    @field_validator("run_id")
+    @classmethod
+    def validate_run_id(cls, value: str) -> str:
+        return reject_unsafe_persisted_value(value)
+
+    @field_validator("request_id")
+    @classmethod
+    def validate_request_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _canonical_uuid(value, "Step request ID")
+
+    @model_validator(mode="after")
+    def validate_result_shape(self) -> StepResult:
+        if self.kind is StepKind.MCP_ACTION:
+            if self.action is None or self.request_id != self.action.request_id:
+                raise ValueError("MCP action step results require their correlated request")
+        elif self.action is not None or self.request_id is not None:
+            raise ValueError("Only MCP action step results may contain an action")
+        if self.kind in {StepKind.ITERATION_FAILED, StepKind.REPAIR_REQUIRED, StepKind.HUMAN_REVIEW}:
+            if self.failure is None:
+                raise ValueError("Failed step results require a classified failure")
+        elif self.failure is not None:
+            raise ValueError("Only failed step results may contain a failure")
+        if self.kind is StepKind.CONTINUE and self.stage is None:
+            raise ValueError("Continuation step results require a stage")
+        if self.kind is not StepKind.CONTINUE and self.stage is not None:
+            raise ValueError("Only continuation step results may contain a stage")
+        return self
 
 
 class TrustedMcpReceipt(ContractModel):
