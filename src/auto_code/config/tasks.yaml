@@ -1,0 +1,27 @@
+analyst:
+  description: Analyze only the Ticket Snapshot and return a traceable Requirements Package without designing or programming.
+  output_contract: RequirementsPackage
+architect_outline:
+  description: Produce the Change Outline, including the mandatory Browser E2E Decision and direct dependency hashes.
+  output_contract: ChangeOutline
+architect_proposal:
+  description: Produce only the requested OpenSpec proposal Artifact Unit from its direct approved inputs.
+  output_contract: ArtifactEnvelope
+architect_specs:
+  description: Produce only the requested OpenSpec specs Artifact Unit from its direct approved inputs.
+  output_contract: ArtifactEnvelope
+architect_design:
+  description: Produce only the requested OpenSpec design Artifact Unit from its direct approved inputs.
+  output_contract: ArtifactEnvelope
+architect_tasks:
+  description: Produce only the requested OpenSpec tasks Artifact Unit from its direct approved inputs.
+  output_contract: ArtifactEnvelope
+programmer:
+  description: Implement only the approved OpenSpec artifacts and return the immutable task/hash/evidence summary.
+  output_contract: ImplementationResult
+tester:
+  description: Validate only the Browser E2E Decision scenarios and return observed Browser Result evidence.
+  output_contract: BrowserResult
+reviewer:
+  description: Independently review only the hash-bound Review Manifest and return the Review Result.
+  output_contract: ReviewResult

@@ -1,0 +1,43 @@
+git:
+  remote: origin
+  base_branch: null
+verification:
+  allow_empty: false
+  commands:
+    - ["${PROJECT}/.venv/bin/python", "-m", "pytest", "-q"]
+browser:
+  start_command: null
+  base_url: null
+  ready_timeout_seconds: 30
+  command_timeout_seconds: 120
+  playwright_command_prefix: ["${RUNNER}/bin/playwright-cli"]
+  allowed_operations: ["open", "goto", "snapshot", "click", "fill", "type", "press", "screenshot", "close"]
+process:
+  command_timeout_seconds: 120
+  termination_grace_seconds: 5
+transport:
+  total_retry_wait_seconds: 30
+preflight:
+  catalog_timeout_seconds: 30
+  max_catalog_response_bytes: 1048576
+  catalog_retry_budget: 2
+  catalog_cache_validity_seconds: 300
+finalization:
+  max_invocations_per_effect: 3
+  total_retry_wait_seconds: 60
+automation:
+  regression_command: ["${REPAIR_WORKTREE}/.venv/bin/python", "-m", "pytest", "-q"]
+protected_paths:
+  - .env
+  - .auto-code
+  - .git
+  - .venv
+  - auto-code.yaml
+commit_excluded_paths:
+  - .auto-code
+environment_allowlist: ["LANG", "LC_ALL", "TZ"]
+linear:
+  started_state_id: null
+  completed_state_id: null
+review:
+  require_distinct_model: false

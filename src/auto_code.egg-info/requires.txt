@@ -1,0 +1,9 @@
+crewai==1.15.20
+httpx
+pydantic<2.13,>=2.11.9
+python-dotenv
+PyYAML
+
+[test]
+pytest<9,>=8
+respx
