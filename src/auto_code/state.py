@@ -465,6 +465,7 @@ def _make_store_receipt_authority_binding() -> tuple[
 
 
 _BIND_STORE_RECEIPT_AUTHORITY, _RESOLVE_STORE_RECEIPT_AUTHORITY = _make_store_receipt_authority_binding()
+_BIND_REPAIR_ACTIVATION_VERIFIER, _RESOLVE_REPAIR_ACTIVATION_VERIFIER = _make_store_receipt_authority_binding()
 
 
 class RunStateStore:
@@ -477,6 +478,7 @@ class RunStateStore:
         *,
         authorization_verifier: AuthorizationVerifier | None = None,
         receipt_authority: BridgeReceiptAuthority | None = None,
+        repair_activation_verifier: object | None = None,
     ) -> None:
         self.root = _normalize_state_root(root)
         if receipt_authority is not None and (
@@ -493,10 +495,15 @@ class RunStateStore:
         self.current_path = self.run_dir / "current.json"
         self.lock_path = self.locks_dir / f"run-{hash_json(self.run_id)}.lock"
         _BIND_STORE_RECEIPT_AUTHORITY(self, receipt_authority)
+        _BIND_REPAIR_ACTIVATION_VERIFIER(self, repair_activation_verifier)
 
     @property
     def receipt_authority(self) -> BridgeReceiptAuthority | None:
         return _RESOLVE_STORE_RECEIPT_AUTHORITY(self)
+
+    @property
+    def repair_activation_verifier(self) -> object | None:
+        return _RESOLVE_REPAIR_ACTIVATION_VERIFIER(self)
 
     @classmethod
     def load_read_only(cls, root: Path, run_id: str) -> StateGeneration:
@@ -510,6 +517,7 @@ class RunStateStore:
         store.generations_dir = _ensure_directory(store.root, store.run_dir / "generations", create=False)
         store.current_path = store.run_dir / "current.json"
         _BIND_STORE_RECEIPT_AUTHORITY(store, None)
+        _BIND_REPAIR_ACTIVATION_VERIFIER(store, None)
         return store.load_locked()
 
     def generation_path(self, revision: int, state_hash: str) -> Path:
@@ -693,6 +701,11 @@ class RunStateStore:
                 raise InvalidStateTransition("terminal state is immutable")
             return state
         appended_authorizations = self._validate_appended_authorizations(previous, state)
+        if previous.disposition is RunDisposition.REPAIR_REQUIRED and state.disposition is RunDisposition.ACTIVE:
+            verifier = _RESOLVE_REPAIR_ACTIVATION_VERIFIER(self)
+            verify = getattr(verifier, "verify_transition", None)
+            if not callable(verify) or not verify(previous_generation, state):
+                raise InvalidStateTransition("repair activation transition is not verified")
         self._validate_iteration_transition(previous, state)
         self._validate_task_transition(previous, state)
         self._validate_disposition_transition(previous, state, appended_authorizations)

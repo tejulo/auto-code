@@ -893,7 +893,7 @@ def test_cas_rejects_repair_restart_without_a_new_runner_and_receipt(tmp_path: P
         store.compare_and_swap(first.revision, first.state_hash, restarted)
 
 
-def test_cas_accepts_repair_restart_with_changed_runner_and_receipt(tmp_path: Path) -> None:
+def test_cas_rejects_unverified_repair_restart_even_with_a_receipt_hash(tmp_path: Path) -> None:
     store = RunStateStore(tmp_path, "run-1")
     first = persist_after_initial(
         store,
@@ -914,7 +914,8 @@ def test_cas_accepts_repair_restart_with_changed_runner_and_receipt(tmp_path: Pa
         }
     )
 
-    assert store.compare_and_swap(first.revision, first.state_hash, restarted).state == restarted
+    with pytest.raises(InvalidStateTransition, match="repair activation"):
+        store.compare_and_swap(first.revision, first.state_hash, restarted)
 
 
 def test_cas_rejects_waiting_mcp_resume_before_pending_effect_reconciles(tmp_path: Path) -> None:

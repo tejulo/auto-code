@@ -6,10 +6,12 @@ import hashlib
 import os
 from pathlib import Path, PurePosixPath
 import re
+import stat
 import unicodedata
 from typing import TYPE_CHECKING, Protocol
 
 from .process import CommandResult, EvidenceSink, ProcessRunner, SandboxPolicy, TrustedCommandOutput
+from .hashing import hash_json
 
 if TYPE_CHECKING:
     from .project_config import ProjectConfig
@@ -216,6 +218,44 @@ class GitManifestInputs:
     @property
     def authorized_untracked_paths(self) -> tuple[str, ...]:
         return tuple(entry.path for entry in self.files if entry.untracked)
+
+
+@dataclass(frozen=True, slots=True)
+class RepairSourceFile:
+    path: str
+    status: str
+    old_path: str | None
+    old_object_id: str | None
+    object_id: str | None
+    mode: str
+    binary: bool
+    untracked: bool
+    content_sha256: str | None
+
+    def payload(self) -> dict[str, object]:
+        return {
+            "path": self.path,
+            "status": self.status,
+            "old_path": self.old_path,
+            "old_object_id": self.old_object_id,
+            "object_id": self.object_id,
+            "mode": self.mode,
+            "binary": self.binary,
+            "untracked": self.untracked,
+            "content_sha256": self.content_sha256,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RepairSourceManifest:
+    baseline_sha: str
+    files: tuple[RepairSourceFile, ...]
+
+    @property
+    def content_hash(self) -> str:
+        return hash_json(
+            {"baseline_sha": self.baseline_sha, "files": [entry.payload() for entry in self.files]}
+        )
 
 
 class GitGuard:
@@ -490,6 +530,66 @@ class GitGuard:
                 )
             )
         return GitManifestInputs(baseline_sha=baseline, files=tuple(sorted(files, key=lambda entry: entry.path)))
+
+    def collect_repair_source_manifest(
+        self,
+        baseline_sha: str,
+        *,
+        planned_paths: Iterable[str],
+        control_paths: Iterable[str] = (),
+    ) -> RepairSourceManifest:
+        """Capture the exact baseline-to-worktree repair source, including non-diff bytes."""
+        planned = tuple(sorted(_validate_relative_path(path) for path in planned_paths))
+        controls = tuple(sorted(_validate_relative_path(path) for path in control_paths))
+        if not planned or len(planned) != len(set(planned)):
+            raise ManifestMismatchError("Repair source paths must be sorted and unique")
+        if len(controls) != len(set(controls)) or set(planned).intersection(controls):
+            raise ManifestMismatchError("Repair control paths are invalid")
+        manifest = self.collect_manifest_inputs(baseline_sha, authorized_untracked=(*planned, *controls))
+        source_entries = tuple(entry for entry in manifest.files if entry.path not in controls)
+        actual = {entry.path for entry in source_entries}
+        if actual != set(planned):
+            raise ManifestMismatchError("Repair source does not match its planned paths")
+        files = tuple(
+            RepairSourceFile(
+                path=entry.path,
+                status=entry.status,
+                old_path=entry.old_path,
+                old_object_id=entry.old_object_id,
+                object_id=entry.object_id,
+                mode=entry.new_mode,
+                binary=entry.binary,
+                untracked=entry.untracked,
+                content_sha256=(
+                    None
+                    if entry.status.startswith("D")
+                    else hashlib.sha256(_read_worktree_bytes(self.repository / entry.path)).hexdigest()
+                ),
+            )
+            for entry in source_entries
+        )
+        return RepairSourceManifest(baseline_sha=manifest.baseline_sha, files=files)
+
+    def dependency_lock_hash(self) -> str:
+        entries: list[dict[str, object]] = []
+        for name in ("pyproject.toml", "poetry.lock", "uv.lock", "requirements.txt"):
+            path = self.repository / name
+            try:
+                metadata = os.lstat(path)
+            except FileNotFoundError:
+                entries.append({"path": name, "present": False})
+                continue
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                raise GitGuardError("Dependency lock path is not a regular file")
+            entries.append(
+                {
+                    "path": name,
+                    "present": True,
+                    "mode": "100755" if metadata.st_mode & 0o111 else "100644",
+                    "content_sha256": hashlib.sha256(_read_worktree_bytes(path)).hexdigest(),
+                }
+            )
+        return hash_json(entries)
 
     def commit_manifest(self, manifest: GitManifestInputs, message: str) -> str:
         if not isinstance(manifest, GitManifestInputs) or not manifest.files:
@@ -882,6 +982,25 @@ def _worktree_is_binary(path: Path) -> bool:
             return b"\x00" in stream.read(8_192)
     except OSError as error:
         raise GitGuardError("Worktree path cannot be read") from error
+
+
+def _read_worktree_bytes(path: Path) -> bytes:
+    try:
+        metadata = os.lstat(path)
+        if stat.S_ISLNK(metadata.st_mode):
+            return os.fsencode(os.readlink(path))
+        if not stat.S_ISREG(metadata.st_mode):
+            raise GitGuardError("Worktree path is not a regular file or symlink")
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+        try:
+            chunks: list[bytes] = []
+            while chunk := os.read(descriptor, 65_536):
+                chunks.append(chunk)
+            return b"".join(chunks)
+        finally:
+            os.close(descriptor)
+    except OSError as error:
+        raise GitGuardError("Worktree path cannot be read safely") from error
 
 
 def _manifest_stage_paths(manifest: GitManifestInputs) -> set[str]:
