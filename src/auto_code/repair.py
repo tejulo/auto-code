@@ -105,6 +105,8 @@ class RepairBaseline:
 @dataclass(frozen=True, slots=True)
 class RepairRequest:
     plan: RepairPlan
+    plan_path: Path
+    plan_hash: str
     baseline: RepairBaseline
     ticket_product_manifest: str
     run_id: str
@@ -120,6 +122,8 @@ class RepairRequest:
         return hash_json(
             {
                 "plan": self.plan.payload(),
+                "plan_path": str(self.plan_path),
+                "plan_hash": self.plan_hash,
                 "baseline": {
                     "workspace_id": self.baseline.workspace_id,
                     "path": str(self.baseline.path),
@@ -191,8 +195,14 @@ class RepairGuard:
             raise UnauthorizedRepairError("ticket path is invalid")
         if any(not isinstance(stage, Stage) or not isinstance(value, str) or len(value) != 64 for stage, value in contract_hashes.items()):
             raise UnauthorizedRepairError("repair contracts are invalid")
+        plan_hash = hash_json(plan.payload())
+        plan_path = self.repair_worktree / ".repair-plans" / f"{plan_hash}.json"
+        plan_path.parent.mkdir(exist_ok=True)
+        plan_path.write_text(json.dumps(plan.payload(), sort_keys=True, separators=(",", ":")), encoding="ascii")
         return RepairRequest(
             plan=plan,
+            plan_path=plan_path,
+            plan_hash=plan_hash,
             baseline=baseline,
             ticket_product_manifest=ticket_product_manifest,
             run_id=run_id,

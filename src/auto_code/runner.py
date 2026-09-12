@@ -9,7 +9,7 @@ import uuid
 
 from .contracts import RunnerIdentity, RunDisposition, Stage
 from .hashing import hash_json
-from .repair import InjectedCrash, RepairRequest, RepairTicketOverlap, RepairWorkspaceHandle, UnauthorizedRepairError, is_automation_path
+from .repair import InjectedCrash, RepairGuard, RepairRequest, RepairTicketOverlap, RepairWorkspaceHandle, UnauthorizedRepairError, is_automation_path
 from .state import (
     _atomic_replace_json,
     _ensure_directory,
@@ -33,9 +33,15 @@ class RepairGit(Protocol):
 
     def source_hash(self, workspace: Path) -> str: ...
 
+    def dependency_lock_hash(self, workspace: Path) -> str: ...
+
 
 class RepairProcess(Protocol):
     def run(self, argv: tuple[str, ...], workspace: Path) -> object: ...
+
+
+class RepairActivationAuthority:
+    """Opaque launcher-owned capability; only identity equality grants activation."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,14 +130,56 @@ class RunnerRegistry:
         self.root = _normalize_state_root(root)
         self.repair_runner_identity = repair_runner_identity
         self.activations = _ensure_directory(self.root, self.root / "runner-activations")
+        self.handles = _ensure_directory(self.root, self.root / "repair-workspace-handles")
         self.pointer_path = self.root / "runner-activation-pointer.json"
         self._crash_marker: str | None = None
+        self._repair_authority = RepairActivationAuthority()
 
     def crash_after(self, marker: str) -> None:
         self._crash_marker = marker
 
     def activation_path(self, request_hash: str) -> Path:
         return self.activations / f"{request_hash}.json"
+
+    def issue_workspace_handle(self, handle: RepairWorkspaceHandle) -> RepairWorkspaceHandle:
+        payload = {
+            "id": handle.id,
+            "path": str(handle.path),
+            "baseline_hash": handle.baseline_hash,
+            "run_id": handle.run_id,
+            "old_runner_hash": handle.old_runner_hash,
+            "expires_at": handle.expires_at.isoformat(),
+        }
+        if not _write_new_json(self.handles / f"{handle.id}.json", payload):
+            if self.load_workspace_handle(handle.id) != handle:
+                raise UnauthorizedRepairError("issued workspace handle conflicts")
+        return handle
+
+    def load_workspace_handle(self, handle_id: str) -> RepairWorkspaceHandle:
+        try:
+            payload = _read_canonical_json(self.handles / f"{handle_id}.json", "issued repair workspace handle")
+            if not isinstance(payload, dict) or set(payload) != {
+                "id",
+                "path",
+                "baseline_hash",
+                "run_id",
+                "old_runner_hash",
+                "expires_at",
+            }:
+                raise ValueError
+            handle = RepairWorkspaceHandle(
+                id=payload["id"],
+                path=Path(payload["path"]),
+                baseline_hash=payload["baseline_hash"],
+                run_id=payload["run_id"],
+                old_runner_hash=payload["old_runner_hash"],
+                expires_at=datetime.fromisoformat(payload["expires_at"]),
+            )
+            if handle.id != handle_id:
+                raise ValueError
+            return handle
+        except Exception:
+            raise UnauthorizedRepairError("repair workspace handle was not issued") from None
 
     def lookup_activation(self, request_hash: str) -> RunnerActivationReceipt:
         payload = _read_canonical_json(self.activation_path(request_hash), "runner activation receipt")
@@ -149,9 +197,9 @@ class RunnerRegistry:
         request: RepairRequest,
         new_runner_identity: RunnerIdentity,
         *,
-        caller_identity: RunnerIdentity,
+        authority: RepairActivationAuthority,
     ) -> RunnerActivationReceipt:
-        if caller_identity.content_hash != self.repair_runner_identity.content_hash:
+        if authority is not self._repair_authority:
             raise PermissionError("only the pinned repair runner may activate a runner")
         path = self.activation_path(request.content_hash)
         if _path_lstat(path, "runner activation receipt") is not None:
@@ -192,6 +240,7 @@ class RepairRunner:
         process: RepairProcess,
         registry: RunnerRegistry,
         repair_runner_identity: RunnerIdentity,
+        activation_authority: RepairActivationAuthority,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         self.worktree_factory = worktree_factory
@@ -199,6 +248,7 @@ class RepairRunner:
         self.process = process
         self.registry = registry
         self.repair_runner_identity = repair_runner_identity
+        self.activation_authority = activation_authority
         self.now = now or (lambda: datetime.now(UTC))
 
     def prepare_workspace(self, run_id: str, failure_hash: str, old_runner_identity: RunnerIdentity) -> RepairWorkspaceHandle:
@@ -208,14 +258,14 @@ class RepairRunner:
         path = self.worktree_factory.create(handle_id)
         if not path.is_dir() or not any(path.iterdir()):
             raise UnauthorizedRepairError("repair workspace must be a fresh populated worktree")
-        return RepairWorkspaceHandle(
+        return self.registry.issue_workspace_handle(RepairWorkspaceHandle(
             id=handle_id,
             path=path,
             baseline_hash=self.git.baseline_hash(path),
             run_id=run_id,
             old_runner_hash=old_runner_identity.content_hash,
             expires_at=self.now() + timedelta(hours=1),
-        )
+        ))
 
     def crash_after(self, marker: str) -> None:
         self.registry.crash_after(marker)
@@ -229,6 +279,18 @@ class RepairRunner:
             or request.baseline.expires_at < self.now()
         ):
             raise UnauthorizedRepairError("repair workspace handle is invalid")
+        issued = self.registry.load_workspace_handle(request.baseline.workspace_id)
+        if (
+            issued.path != request.baseline.path
+            or issued.baseline_hash != request.baseline.baseline_hash
+            or issued.run_id != request.run_id
+            or issued.old_runner_hash != request.old_runner_identity.content_hash
+            or issued.expires_at != request.baseline.expires_at
+        ):
+            raise UnauthorizedRepairError("repair workspace handle was not issued")
+        plan = RepairGuard(request.baseline.path).validate_path(request.plan_path)
+        if plan != request.plan or hash_json(plan.payload()) != request.plan_hash:
+            raise UnauthorizedRepairError("repair plan does not match its request")
         changed = self.git.changed_paths_since(request.baseline.path, request.baseline.baseline_hash)
         planned = set(request.plan.files)
         unauthorized = changed - planned
@@ -238,26 +300,28 @@ class RepairRunner:
             overlap = changed.intersection(request.ticket_owned_paths)
             if overlap:
                 raise RepairTicketOverlap(", ".join(sorted(overlap)))
-        result = self.process.run(request.plan.regression_command, request.baseline.path)
+        result = self.process.run(plan.regression_command, request.baseline.path)
         require_success = getattr(result, "require_success", None)
         if callable(require_success):
             require_success()
         runner = self._build_content_addressed_runner(request)
-        return self.registry.activate_once(request, runner, caller_identity=self.repair_runner_identity)
+        return self.registry.activate_once(request, runner, authority=self.activation_authority)
 
     def _build_content_addressed_runner(self, request: RepairRequest) -> RunnerIdentity:
         source_sha = self.git.source_hash(request.baseline.path)
+        dependency_lock_hash = self.git.dependency_lock_hash(request.baseline.path)
         contract_bundle_hash = hash_json({stage.value: value for stage, value in request.contract_hashes.items()})
         return RunnerIdentity(
             content_hash=hash_json(
                 {
                     "request_hash": request.content_hash,
                     "source_sha": source_sha,
+                    "dependency_lock_hash": dependency_lock_hash,
                     "contract_bundle_hash": contract_bundle_hash,
                 }
             ),
             source_sha=source_sha,
-            dependency_lock_hash="0" * 64,
+            dependency_lock_hash=dependency_lock_hash,
             contract_bundle_hash=contract_bundle_hash,
             built_at=self.now(),
         )
@@ -305,9 +369,9 @@ class TrustedLauncher:
                 "restart_receipt_hash": restart.content_hash,
             }
         )
+        _atomic_replace_json(self.restarts / f"{run_id}.json", restart.payload())
         generation = self.store.compare_and_swap(current.revision, current.state_hash, updated)
         self.terminate_old_runner(run_id)
-        _atomic_replace_json(self.restarts / f"{run_id}.json", restart.payload())
         return generation
 
     def restart_receipt(self, run_id: str) -> RestartReceipt:

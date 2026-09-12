@@ -16,6 +16,7 @@ dependencies = [
 
 [project.scripts]
 auto-code = "auto_code.cli:entrypoint"
+auto-code-repair = "auto_code.repair_entrypoint:entrypoint"
 
 [project.optional-dependencies]
 test = ["pytest>=8,<9", "respx"]

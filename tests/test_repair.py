@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -17,7 +18,7 @@ from auto_code.repair import (
     RepairTicketOverlap,
     UnauthorizedRepairError,
 )
-from auto_code.runner import RepairRunner, RunnerRegistry, TrustedLauncher
+from auto_code.runner import RepairActivationAuthority, RepairRunner, RunnerRegistry, TrustedLauncher
 from auto_code.state import EMPTY_STATE_HASH, RunStateStore
 
 
@@ -61,6 +62,9 @@ class FakeRepairGit:
     def source_hash(self, workspace: Path) -> str:
         return "2" * 64
 
+    def dependency_lock_hash(self, workspace: Path) -> str:
+        return "3" * 64
+
 
 class FakeProcess:
     def __init__(self) -> None:
@@ -72,12 +76,14 @@ class FakeProcess:
 
 @pytest.fixture
 def repair_launcher(tmp_path: Path) -> RepairRunner:
+    registry = RunnerRegistry(tmp_path / "state", repair_runner_identity=identity("e"))
     return RepairRunner(
         worktree_factory=FakeWorktreeFactory(tmp_path / "repair-worktrees"),
         git=FakeRepairGit(),
         process=FakeProcess(),
-        registry=RunnerRegistry(tmp_path / "state", repair_runner_identity=identity("e")),
+        registry=registry,
         repair_runner_identity=identity("e"),
+        activation_authority=registry._repair_authority,
         now=lambda: NOW,
     )
 
@@ -125,12 +131,14 @@ def test_repair_rejects_unplanned_product_file(
 ) -> None:
     """Dropping automation-path checks would permit a repair to change product code."""
     git = FakeRepairGit({"product.py"})
+    registry = RunnerRegistry(tmp_path / "state", repair_runner_identity=identity("e"))
     launcher = RepairRunner(
         worktree_factory=FakeWorktreeFactory(tmp_path / "repair-worktrees"),
         git=git,
         process=FakeProcess(),
-        registry=RunnerRegistry(tmp_path / "state", repair_runner_identity=identity("e")),
+        registry=registry,
         repair_runner_identity=identity("e"),
+        activation_authority=registry._repair_authority,
         now=lambda: NOW,
     )
     request = repair_request(launcher, valid_repair_plan)
@@ -145,12 +153,14 @@ def test_repair_rejects_path_owned_by_same_repository_ticket(
 ) -> None:
     """Removing same-repository overlap detection would let repair alter ticket-owned files."""
     git = FakeRepairGit({"src/auto_code/runner.py"})
+    registry = RunnerRegistry(tmp_path / "state", repair_runner_identity=identity("e"))
     launcher = RepairRunner(
         worktree_factory=FakeWorktreeFactory(tmp_path / "repair-worktrees"),
         git=git,
         process=FakeProcess(),
-        registry=RunnerRegistry(tmp_path / "state", repair_runner_identity=identity("e")),
+        registry=registry,
         repair_runner_identity=identity("e"),
+        activation_authority=registry._repair_authority,
         now=lambda: NOW,
     )
     workspace = launcher.prepare_workspace("run-1", "f" * 64, identity("a"))
@@ -181,6 +191,7 @@ def test_active_runner_cannot_activate_itself(tmp_path: Path, valid_repair_plan:
         process=FakeProcess(),
         registry=registry,
         repair_runner_identity=identity("e"),
+        activation_authority=registry._repair_authority,
         now=lambda: NOW,
     )
     request = repair_request(launcher, valid_repair_plan)
@@ -202,6 +213,7 @@ def test_activation_revalidates_contracts_before_restart(
         process=FakeProcess(),
         registry=registry,
         repair_runner_identity=identity("e"),
+        activation_authority=registry._repair_authority,
         now=lambda: NOW,
     )
     authority = CheckpointAuthority(tmp_path / "state")
@@ -269,6 +281,7 @@ def test_crash_after_registry_activation_recovers_receipt(
         process=FakeProcess(),
         registry=registry,
         repair_runner_identity=identity("e"),
+        activation_authority=registry._repair_authority,
         now=lambda: NOW,
     )
     store = RunStateStore(tmp_path / "state", "run-1")
@@ -349,3 +362,53 @@ def test_protected_repair_entrypoint_dispatches_only_the_selected_operation() ->
     ) == 0
 
     assert calls == [("run-1", "a" * 64)]
+
+
+def test_registry_rejects_a_forged_activation_authority(
+    tmp_path: Path,
+    valid_repair_plan: RepairPlan,
+) -> None:
+    """Replacing the protected capability with a caller value would let ticket code self-activate."""
+    registry = RunnerRegistry(tmp_path / "state", repair_runner_identity=identity("e"))
+    launcher = RepairRunner(
+        worktree_factory=FakeWorktreeFactory(tmp_path / "repair-worktrees"),
+        git=FakeRepairGit({"src/auto_code/runner.py"}),
+        process=FakeProcess(),
+        registry=registry,
+        repair_runner_identity=identity("e"),
+        activation_authority=registry._repair_authority,
+        now=lambda: NOW,
+    )
+    request = repair_request(launcher, valid_repair_plan)
+
+    with pytest.raises(PermissionError):
+        registry.activate_once(request, identity("b"), authority=RepairActivationAuthority())
+
+
+def test_restarted_repair_runner_rejects_an_unissued_workspace_handle(
+    tmp_path: Path,
+    valid_repair_plan: RepairPlan,
+) -> None:
+    """Dropping the durable issued-handle lookup would permit a forged repair workspace."""
+    registry = RunnerRegistry(tmp_path / "state", repair_runner_identity=identity("e"))
+    launcher = RepairRunner(
+        worktree_factory=FakeWorktreeFactory(tmp_path / "repair-worktrees"),
+        git=FakeRepairGit({"src/auto_code/runner.py"}),
+        process=FakeProcess(),
+        registry=registry,
+        repair_runner_identity=identity("e"),
+        activation_authority=registry._repair_authority,
+        now=lambda: NOW,
+    )
+    request = repair_request(launcher, valid_repair_plan)
+    forged = request.baseline.__class__(
+        workspace_id="f" * 32,
+        path=request.baseline.path,
+        baseline_hash=request.baseline.baseline_hash,
+        run_id=request.baseline.run_id,
+        old_runner_hash=request.baseline.old_runner_hash,
+        expires_at=request.baseline.expires_at,
+    )
+
+    with pytest.raises(UnauthorizedRepairError, match="issued"):
+        launcher.validate_build_activate(replace(request, baseline=forged))
