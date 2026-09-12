@@ -55,6 +55,17 @@ class _Supervisor(Protocol):
     def step(self, run_id: str, expected_revision: int, expected_hash: str) -> StepResult: ...
 
 
+class _RepairRequestCoordinator(Protocol):
+    def create_request(
+        self,
+        run_id: str,
+        expected_revision: int,
+        expected_hash: str,
+        workspace: Path,
+        plan: Path,
+    ) -> object: ...
+
+
 def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
     config: dict[str, object] = {}
     for key, value in pairs:
@@ -166,6 +177,13 @@ def build_parser() -> argparse.ArgumentParser:
     step.add_argument("--expected-revision")
     step.add_argument("--expected-hash")
     step.add_argument("--json", action="store_true")
+    repair_request = commands.add_parser("repair-request")
+    repair_request.add_argument("--run")
+    repair_request.add_argument("--expected-revision")
+    repair_request.add_argument("--expected-hash")
+    repair_request.add_argument("--workspace")
+    repair_request.add_argument("--plan")
+    repair_request.add_argument("--json", action="store_true")
     return parser
 
 
@@ -301,12 +319,53 @@ def _run_step(
     return 0
 
 
+def _run_repair_request(
+    args: argparse.Namespace,
+    runtime: TrustedRuntimeConfig | None,
+    coordinator_factory: Callable[[TrustedRuntimeConfig], _RepairRequestCoordinator] | None,
+) -> int:
+    if (
+        not args.run
+        or args.expected_revision is None
+        or not args.expected_hash
+        or _CANONICAL_SHA256.fullmatch(args.expected_hash) is None
+        or not args.workspace
+        or not args.plan
+        or not args.json
+    ):
+        print("repair-request: invalid arguments", file=sys.stderr)
+        return 2
+    try:
+        revision = int(args.expected_revision)
+        if revision < 1:
+            raise ValueError
+        trusted_runtime = runtime if runtime is not None else load_launcher_runtime_from_protected_fd()
+        if coordinator_factory is None:
+            raise RuntimeConfigurationError("repair coordinator is unavailable")
+        request = coordinator_factory(trusted_runtime).create_request(
+            args.run,
+            revision,
+            args.expected_hash,
+            Path(args.workspace),
+            Path(args.plan),
+        )
+        content_hash = getattr(request, "content_hash", None)
+        if not isinstance(content_hash, str):
+            raise ValueError
+    except (RuntimeConfigurationError, ValueError, StateStoreError):
+        print("repair-request: operation unavailable", file=sys.stderr)
+        return 2
+    print(json.dumps({"request_hash": content_hash}, sort_keys=True))
+    return 0
+
+
 def main(
     argv: Sequence[str] | None = None,
     runtime: TrustedRuntimeConfig | None = None,
     *,
     prepare_coordinator_factory: Callable[[TrustedRuntimeConfig], _PrepareCoordinator] | None = None,
     supervisor_factory: Callable[[TrustedRuntimeConfig], _Supervisor] | None = None,
+    repair_request_coordinator_factory: Callable[[TrustedRuntimeConfig], _RepairRequestCoordinator] | None = None,
 ) -> int:
     arguments = sys.argv[1:] if argv is None else argv
     try:
@@ -324,6 +383,8 @@ def main(
         return _run_prepare(args, runtime, prepare_coordinator_factory)
     if args.command == "step":
         return _run_step(args, runtime, supervisor_factory)
+    if args.command == "repair-request":
+        return _run_repair_request(args, runtime, repair_request_coordinator_factory)
     if args.command != "status":
         print("auto-code: a command is required", file=sys.stderr)
         return 2
