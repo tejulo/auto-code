@@ -126,6 +126,7 @@ class RunnerRegistry:
         self.repair_runner_identity = repair_runner_identity
         self.activations = _ensure_directory(self.root, self.root / "runner-activations")
         self.handles = _ensure_directory(self.root, self.root / "repair-workspace-handles")
+        self.nonces = _ensure_directory(self.root, self.root / "repair-nonces")
         self.pointer_path = self.root / "runner-activation-pointer.json"
         self._crash_marker: str | None = None
 
@@ -182,6 +183,10 @@ class RunnerRegistry:
             raise ValueError("activation receipt request hash is invalid")
         return receipt
 
+    def consume_nonce(self, nonce: str, request_hash: str) -> bool:
+        """Write-once nonce consumption prevents a descriptor from authorizing a second repair."""
+        return _write_new_json(self.nonces / f"{nonce}.json", {"request_hash": request_hash})
+
 class RepairRunner:
     def __init__(
         self,
@@ -192,6 +197,9 @@ class RepairRunner:
         registry: RunnerRegistry,
         repair_runner_identity: RunnerIdentity,
         activate: Callable[[RepairRequest, RunnerIdentity], RunnerActivationReceipt],
+        state_root: Path | None = None,
+        repair_workspace_root: Path | None = None,
+        regression_command: tuple[str, ...] | None = None,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         self.worktree_factory = worktree_factory
@@ -200,6 +208,9 @@ class RepairRunner:
         self.registry = registry
         self.repair_runner_identity = repair_runner_identity
         self._activate = activate
+        self.state_root = state_root
+        self.repair_workspace_root = repair_workspace_root
+        self.regression_command = regression_command
         self.now = now or (lambda: datetime.now(UTC))
 
     def prepare_workspace(self, run_id: str, failure_hash: str, old_runner_identity: RunnerIdentity) -> RepairWorkspaceHandle:
@@ -207,7 +218,11 @@ class RepairRunner:
             raise PermissionError("repair runner identity is not pinned by the launcher")
         handle_id = uuid.uuid4().hex
         path = self.worktree_factory.create(handle_id)
-        if not path.is_dir() or not any(path.iterdir()):
+        if (
+            not path.is_dir()
+            or not any(path.iterdir())
+            or (self.repair_workspace_root is not None and not path.is_relative_to(self.repair_workspace_root))
+        ):
             raise UnauthorizedRepairError("repair workspace must be a fresh populated worktree")
         return self.registry.issue_workspace_handle(RepairWorkspaceHandle(
             id=handle_id,
@@ -224,6 +239,13 @@ class RepairRunner:
     def validate_build_activate(self, request: RepairRequest) -> RunnerActivationReceipt:
         if self.repair_runner_identity.content_hash != self.registry.repair_runner_identity.content_hash:
             raise PermissionError("repair runner identity is not pinned by the launcher")
+        if self.state_root is not None:
+            state = RunStateStore.load_read_only(self.state_root, request.run_id).state
+            if (
+                state.disposition is not RunDisposition.REPAIR_REQUIRED
+                or state.runner_identity != request.old_runner_identity
+            ):
+                raise UnauthorizedRepairError("repair request does not match protected run state")
         if (
             request.baseline.run_id != request.run_id
             or request.baseline.old_runner_hash != request.old_runner_identity.content_hash
@@ -242,6 +264,10 @@ class RepairRunner:
         plan = RepairGuard(request.baseline.path).validate_path(request.plan_path)
         if plan != request.plan or hash_json(plan.payload()) != request.plan_hash:
             raise UnauthorizedRepairError("repair plan does not match its request")
+        if self.repair_workspace_root is not None and not request.baseline.path.is_relative_to(self.repair_workspace_root):
+            raise UnauthorizedRepairError("repair workspace is outside the protected root")
+        if self.regression_command is not None and plan.regression_command != self.regression_command:
+            raise UnauthorizedRepairError("repair plan regression command is not launcher approved")
         changed = self.git.changed_paths_since(request.baseline.path, request.baseline.baseline_hash)
         planned = set(request.plan.files)
         unauthorized = changed - planned
@@ -251,7 +277,7 @@ class RepairRunner:
             overlap = changed.intersection(request.ticket_owned_paths)
             if overlap:
                 raise RepairTicketOverlap(", ".join(sorted(overlap)))
-        result = self.process.run(plan.regression_command, request.baseline.path)
+        result = self.process.run(self.regression_command or plan.regression_command, request.baseline.path)
         require_success = getattr(result, "require_success", None)
         if callable(require_success):
             require_success()
@@ -292,6 +318,10 @@ class TrustedLauncher:
         self.terminate_old_runner = terminate_old_runner or (lambda _: None)
         self.ticket_invoker = ticket_invoker
         self.restarts = _ensure_directory(store.root, store.root / "runner-restarts")
+        self._crash_marker: str | None = None
+
+    def crash_after(self, marker: str) -> None:
+        self._crash_marker = marker
 
     def reconcile_activation(self, run_id: str, request_hash: str) -> StateGeneration:
         if run_id != self.store.run_id:
@@ -300,6 +330,7 @@ class TrustedLauncher:
         restart = RestartReceipt(run_id, request_hash, activation.new_runner_identity)
         current = self.store.load()
         if current.state.runner_identity == activation.new_runner_identity and current.state.restart_receipt_hash == restart.content_hash:
+            self.terminate_old_runner(run_id)
             return current
         if (
             current.state.disposition is not RunDisposition.REPAIR_REQUIRED
@@ -322,6 +353,10 @@ class TrustedLauncher:
         )
         _atomic_replace_json(self.restarts / f"{run_id}.json", restart.payload())
         generation = self.store.compare_and_swap(current.revision, current.state_hash, updated)
+        if self._crash_marker == "STATE_CAS_REPLACED":
+            self._crash_marker = None
+            from .repair import InjectedCrash
+            raise InjectedCrash("injected crash after state CAS replacement")
         self.terminate_old_runner(run_id)
         return generation
 

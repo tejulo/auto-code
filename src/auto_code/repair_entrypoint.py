@@ -110,13 +110,46 @@ class ProtectedRepairRuntime:
             self.descriptor.registry_root,
             repair_runner_identity=self.descriptor.repair_runner_identity,
         )
+        def activate(request: RepairRequest, new_runner_identity: RunnerIdentity) -> RunnerActivationReceipt:
+            path = registry.activation_path(request.content_hash)
+            if _path_lstat(path, "runner activation receipt") is not None:
+                existing = registry.lookup_activation(request.content_hash)
+                if existing.old_runner_identity != request.old_runner_identity or existing.new_runner_identity != new_runner_identity:
+                    raise UnauthorizedRepairError("activation replay does not match its request")
+                return existing
+            if not registry.consume_nonce(self.descriptor.nonce, request.content_hash):
+                raise UnauthorizedRepairError("repair descriptor nonce was already consumed")
+            receipt = RunnerActivationReceipt(
+                request_hash=request.content_hash,
+                old_runner_identity=request.old_runner_identity,
+                new_runner_identity=new_runner_identity,
+                old_contract_bundle_hash=request.old_runner_identity.contract_bundle_hash,
+                new_contract_bundle_hash=new_runner_identity.contract_bundle_hash,
+                compatible_checkpoint_stages=(
+                    tuple(Stage)
+                    if request.old_runner_identity.contract_bundle_hash == new_runner_identity.contract_bundle_hash
+                    else ()
+                ),
+                contract_hashes=dict(request.contract_hashes),
+            )
+            if not _write_new_json(path, receipt.payload()):
+                return registry.lookup_activation(request.content_hash)
+            _atomic_replace_json(registry.pointer_path, {"request_hash": request.content_hash})
+            if registry._crash_marker == "REGISTRY_POINTER_REPLACED":
+                registry._crash_marker = None
+                raise InjectedCrash("injected crash after registry pointer replacement")
+            return receipt
+
         return RepairRunner(
             worktree_factory=worktree_factory,
             git=git,
             process=process,
             registry=registry,
             repair_runner_identity=self.descriptor.repair_runner_identity,
-            activate=_compose_activation(registry),
+            activate=activate,
+            state_root=self.descriptor.state_root,
+            repair_workspace_root=self.descriptor.repair_workspace_root,
+            regression_command=self.descriptor.regression_command,
             now=now,
         )
 
@@ -126,40 +159,12 @@ class ProtectedRepairRuntime:
     def apply(self, workspace: str, request_hash: str) -> object:
         raise PermissionError("protected repair composition is unavailable")
 
-
-def _compose_activation(
-    registry: RunnerRegistry,
-) -> Callable[[RepairRequest, RunnerIdentity], RunnerActivationReceipt]:
-    """Keep the registry writer reachable only from this protected executable module."""
-    def activate(request: RepairRequest, new_runner_identity: RunnerIdentity) -> RunnerActivationReceipt:
-        path = registry.activation_path(request.content_hash)
-        if _path_lstat(path, "runner activation receipt") is not None:
-            existing = registry.lookup_activation(request.content_hash)
-            if existing.old_runner_identity != request.old_runner_identity or existing.new_runner_identity != new_runner_identity:
-                raise UnauthorizedRepairError("activation replay does not match its request")
-            return existing
-        receipt = RunnerActivationReceipt(
-            request_hash=request.content_hash,
-            old_runner_identity=request.old_runner_identity,
-            new_runner_identity=new_runner_identity,
-            old_contract_bundle_hash=request.old_runner_identity.contract_bundle_hash,
-            new_contract_bundle_hash=new_runner_identity.contract_bundle_hash,
-            compatible_checkpoint_stages=(
-                tuple(Stage)
-                if request.old_runner_identity.contract_bundle_hash == new_runner_identity.contract_bundle_hash
-                else ()
-            ),
-            contract_hashes=dict(request.contract_hashes),
+    def consume_nonce(self, request_hash: str) -> bool:
+        registry = RunnerRegistry(
+            self.descriptor.registry_root,
+            repair_runner_identity=self.descriptor.repair_runner_identity,
         )
-        if not _write_new_json(path, receipt.payload()):
-            return registry.lookup_activation(request.content_hash)
-        _atomic_replace_json(registry.pointer_path, {"request_hash": request.content_hash})
-        if registry._crash_marker == "REGISTRY_POINTER_REPLACED":
-            registry._crash_marker = None
-            raise InjectedCrash("injected crash after registry pointer replacement")
-        return receipt
-
-    return activate
+        return registry.consume_nonce(self.descriptor.nonce, request_hash)
 
 
 def load_protected_runtime() -> ProtectedRepairRuntime:

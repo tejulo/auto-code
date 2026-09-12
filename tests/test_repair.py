@@ -21,8 +21,8 @@ from auto_code.repair import (
     RepairTicketOverlap,
     UnauthorizedRepairError,
 )
-from auto_code.runner import RepairRunner, RunnerRegistry, TrustedLauncher
-from auto_code.state import EMPTY_STATE_HASH, RunStateStore
+from auto_code.runner import RepairRunner, RunnerActivationReceipt, RunnerRegistry, TrustedLauncher
+from auto_code.state import EMPTY_STATE_HASH, RunStateStore, _atomic_replace_json, _path_lstat, _write_new_json
 from auto_code.hashing import canonical_json_bytes
 
 
@@ -60,7 +60,28 @@ def signed_repair_descriptor(tmp_path: Path, *, expiry: str = "2030-01-01T00:00:
 
 
 def protected_activation(registry: RunnerRegistry):
-    return repair_entrypoint._compose_activation(registry)
+    """Test-only activation harness; production composition is reachable only from the verified runtime."""
+    def activate(request, new_runner_identity):
+        path = registry.activation_path(request.content_hash)
+        if _path_lstat(path, "runner activation receipt") is not None:
+            return registry.lookup_activation(request.content_hash)
+        receipt = RunnerActivationReceipt(
+            request_hash=request.content_hash,
+            old_runner_identity=request.old_runner_identity,
+            new_runner_identity=new_runner_identity,
+            old_contract_bundle_hash=request.old_runner_identity.contract_bundle_hash,
+            new_contract_bundle_hash=new_runner_identity.contract_bundle_hash,
+            compatible_checkpoint_stages=(),
+            contract_hashes=dict(request.contract_hashes),
+        )
+        _write_new_json(path, receipt.payload())
+        _atomic_replace_json(registry.pointer_path, {"request_hash": request.content_hash})
+        if registry._crash_marker == "REGISTRY_POINTER_REPLACED":
+            registry._crash_marker = None
+            raise InjectedCrash("injected crash after registry pointer replacement")
+        return receipt
+
+    return activate
 
 
 class FakeWorktreeFactory:
@@ -409,6 +430,7 @@ def test_registry_has_no_ticket_facing_activation_api(
     assert not hasattr(registry, "activate")
     assert not hasattr(registry, "activate_once")
     assert not hasattr(registry, "_activate_once")
+    assert not hasattr(repair_entrypoint, "_compose_activation")
 
 
 def test_restarted_repair_runner_rejects_an_unissued_workspace_handle(
@@ -475,6 +497,16 @@ def test_protected_repair_runtime_requires_a_signed_descriptor(
     finally:
         os.close(descriptor)
 
+    descriptor_path.write_bytes(signed_repair_descriptor(tmp_path, expiry="2020-01-01T00:00:00+00:00"))
+    descriptor = os.open(descriptor_path, os.O_RDONLY)
+    try:
+        monkeypatch.setattr(repair_entrypoint, "_REPAIR_DESCRIPTOR_FD", descriptor)
+
+        with pytest.raises(repair_entrypoint.RepairRuntimeConfigurationError, match="descriptor is invalid"):
+            repair_entrypoint.load_protected_runtime()
+    finally:
+        os.close(descriptor)
+
 
 def test_protected_repair_runtime_loads_a_valid_signed_descriptor(
     tmp_path: Path,
@@ -514,12 +546,61 @@ def test_protected_repair_runtime_rejects_a_forged_or_expired_descriptor(
     finally:
         os.close(descriptor)
 
-    descriptor_path.write_bytes(signed_repair_descriptor(tmp_path, expiry="2020-01-01T00:00:00+00:00"))
+
+def test_protected_repair_runtime_consumes_a_nonce_for_one_activation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reusing a valid descriptor must fail before its expiry time."""
+    descriptor_path = tmp_path / "repair-runtime.json"
+    descriptor_path.write_bytes(signed_repair_descriptor(tmp_path))
     descriptor = os.open(descriptor_path, os.O_RDONLY)
     try:
         monkeypatch.setattr(repair_entrypoint, "_REPAIR_DESCRIPTOR_FD", descriptor)
-
-        with pytest.raises(repair_entrypoint.RepairRuntimeConfigurationError, match="descriptor is invalid"):
-            repair_entrypoint.load_protected_runtime()
+        runtime = repair_entrypoint.load_protected_runtime()
     finally:
         os.close(descriptor)
+
+    assert runtime.consume_nonce("a" * 64)
+    assert not runtime.consume_nonce("a" * 64)
+
+
+def test_reconciliation_recovers_old_runner_termination_after_state_cas(
+    tmp_path: Path,
+    valid_repair_plan: RepairPlan,
+) -> None:
+    """A crash after the state transition must still terminate the old runner on recovery."""
+    registry = RunnerRegistry(tmp_path / "registry", repair_runner_identity=identity("e"))
+    launcher = RepairRunner(
+        worktree_factory=FakeWorktreeFactory(tmp_path / "repair-worktrees"),
+        git=FakeRepairGit({"src/auto_code/runner.py"}),
+        process=FakeProcess(),
+        registry=registry,
+        repair_runner_identity=identity("e"),
+        activate=protected_activation(registry),
+        now=lambda: NOW,
+    )
+    store = RunStateStore(tmp_path / "state", "run-1")
+    initial = store.compare_and_swap(
+        0,
+        EMPTY_STATE_HASH,
+        RunState(run_id="run-1", ticket_id="ENG-1", repository_id="repo-1", max_crew_iterations=3),
+    )
+    store.compare_and_swap(
+        initial.revision,
+        initial.state_hash,
+        initial.state.model_copy(update={"disposition": RunDisposition.REPAIR_REQUIRED, "runner_identity": identity("a")}),
+    )
+    request = repair_request(launcher, valid_repair_plan)
+    launcher.validate_build_activate(request)
+    interrupted = TrustedLauncher(store, registry)
+    interrupted.crash_after("STATE_CAS_REPLACED")
+
+    with pytest.raises(InjectedCrash):
+        interrupted.reconcile_activation("run-1", request.content_hash)
+
+    terminated: list[str] = []
+    recovered = TrustedLauncher(store, registry, terminate_old_runner=terminated.append)
+    recovered.reconcile_activation("run-1", request.content_hash)
+
+    assert terminated == ["run-1"]
