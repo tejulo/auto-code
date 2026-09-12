@@ -5,10 +5,12 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 
 from cryptography.exceptions import InvalidSignature
@@ -16,9 +18,9 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from .contracts import RepairRunnerIdentity, RunnerIdentity, Stage
 from .hashing import canonical_json_bytes
-from .repair import InjectedCrash, RepairRequest, UnauthorizedRepairError
+from .repair import InjectedCrash, RepairError, RepairGuard, RepairRequest
 from .runner import RepairGit, RepairProcess, RepairRunner, RepairWorktreeFactory, RunnerActivationReceipt, RunnerRegistry
-from .state import _atomic_replace_json, _path_lstat, _write_new_json
+from .state import RunStateStore, StateStoreError
 
 
 _REPAIR_DESCRIPTOR_FD = 3
@@ -52,7 +54,9 @@ class RepairRuntimeDescriptor:
     repair_runner_identity: RepairRunnerIdentity
     registry_root: Path
     state_root: Path
+    repair_repository_root: Path
     repair_workspace_root: Path
+    git_executable: Path
     regression_command: tuple[str, ...]
     expiry: datetime
     nonce: str
@@ -63,7 +67,9 @@ class RepairRuntimeDescriptor:
             "repair_runner_identity",
             "registry_root",
             "state_root",
+            "repair_repository_root",
             "repair_workspace_root",
+            "git_executable",
             "regression_command",
             "expiry",
             "nonce",
@@ -84,11 +90,95 @@ class RepairRuntimeDescriptor:
             repair_runner_identity=RepairRunnerIdentity.model_validate(value["repair_runner_identity"]),
             registry_root=_absolute_path(value["registry_root"], "registry root"),
             state_root=_absolute_path(value["state_root"], "state root"),
+            repair_repository_root=_absolute_path(value["repair_repository_root"], "repair repository root"),
             repair_workspace_root=_absolute_path(value["repair_workspace_root"], "repair workspace root"),
+            git_executable=_absolute_path(value["git_executable"], "git executable"),
             regression_command=tuple(command),
             expiry=expiry,
             nonce=nonce,
         )
+
+
+_GIT_ENVIRONMENT = {
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_SYSTEM": "/dev/null",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_TERMINAL_PROMPT": "0",
+}
+
+
+class _LauncherRepairWorktreeFactory:
+    def __init__(self, repository_root: Path, workspace_root: Path, git_executable: Path) -> None:
+        self.repository_root = repository_root
+        self.workspace_root = workspace_root
+        self.git_executable = git_executable
+
+    def create(self, handle_id: str) -> Path:
+        path = self.workspace_root / handle_id
+        if path.exists():
+            raise PermissionError("repair workspace already exists")
+        self.workspace_root.mkdir(parents=True, exist_ok=True)
+        try:
+            subprocess.run(
+                (str(self.git_executable), "-C", str(self.repository_root), "worktree", "add", "--detach", str(path)),
+                check=True,
+                capture_output=True,
+                env=_GIT_ENVIRONMENT,
+            )
+        except (OSError, subprocess.SubprocessError):
+            raise PermissionError("launcher repair worktree is unavailable") from None
+        return path
+
+
+class _LauncherRepairGit:
+    def __init__(self, git_executable: Path) -> None:
+        self.git_executable = git_executable
+
+    def _run(self, workspace: Path, *arguments: str) -> bytes:
+        try:
+            result = subprocess.run(
+                (str(self.git_executable), "-C", str(workspace), *arguments),
+                check=True,
+                capture_output=True,
+                env=_GIT_ENVIRONMENT,
+            )
+        except (OSError, subprocess.SubprocessError):
+            raise PermissionError("launcher git operation failed") from None
+        return result.stdout
+
+    def baseline_hash(self, workspace: Path) -> str:
+        return self._run(workspace, "rev-parse", "HEAD").decode("ascii").strip()
+
+    def changed_paths_since(self, workspace: Path, baseline_hash: str) -> set[str]:
+        paths = self._run(workspace, "diff", "--name-only", "-z", baseline_hash).split(b"\0")
+        return {path.decode("utf-8") for path in paths if path}
+
+    def source_hash(self, workspace: Path) -> str:
+        return hashlib.sha256(self._run(workspace, "diff", "--binary", "HEAD")).hexdigest()
+
+    def dependency_lock_hash(self, workspace: Path) -> str:
+        return hashlib.sha256(
+            self._run(workspace, "ls-files", "-s", "--", "pyproject.toml", "poetry.lock", "uv.lock", "requirements.txt")
+        ).hexdigest()
+
+
+class _LauncherRepairProcessResult:
+    def __init__(self, returncode: int) -> None:
+        self.returncode = returncode
+
+    def require_success(self) -> _LauncherRepairProcessResult:
+        if self.returncode != 0:
+            raise PermissionError("launcher repair regression command failed")
+        return self
+
+
+class _LauncherRepairProcess:
+    def run(self, argv: tuple[str, ...], workspace: Path) -> _LauncherRepairProcessResult:
+        try:
+            result = subprocess.run(argv, cwd=workspace, check=False, capture_output=True)
+        except OSError:
+            raise PermissionError("launcher repair regression command is unavailable") from None
+        return _LauncherRepairProcessResult(result.returncode)
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,14 +201,6 @@ class ProtectedRepairRuntime:
             repair_runner_identity=self.descriptor.repair_runner_identity,
         )
         def activate(request: RepairRequest, new_runner_identity: RunnerIdentity) -> RunnerActivationReceipt:
-            path = registry.activation_path(request.content_hash)
-            if _path_lstat(path, "runner activation receipt") is not None:
-                existing = registry.lookup_activation(request.content_hash)
-                if existing.old_runner_identity != request.old_runner_identity or existing.new_runner_identity != new_runner_identity:
-                    raise UnauthorizedRepairError("activation replay does not match its request")
-                return existing
-            if not registry.consume_nonce(self.descriptor.nonce, request.content_hash):
-                raise UnauthorizedRepairError("repair descriptor nonce was already consumed")
             receipt = RunnerActivationReceipt(
                 request_hash=request.content_hash,
                 old_runner_identity=request.old_runner_identity,
@@ -132,13 +214,11 @@ class ProtectedRepairRuntime:
                 ),
                 contract_hashes=dict(request.contract_hashes),
             )
-            if not _write_new_json(path, receipt.payload()):
-                return registry.lookup_activation(request.content_hash)
-            _atomic_replace_json(registry.pointer_path, {"request_hash": request.content_hash})
-            if registry._crash_marker == "REGISTRY_POINTER_REPLACED":
+            intention = registry.record_nonce_intention(self.descriptor.nonce, receipt)
+            if registry._crash_marker == "NONCE_INTENTION_PERSISTED":
                 registry._crash_marker = None
-                raise InjectedCrash("injected crash after registry pointer replacement")
-            return receipt
+                raise InjectedCrash("injected crash after descriptor nonce intention")
+            return registry.publish_nonce_intention(intention)
 
         return RepairRunner(
             worktree_factory=worktree_factory,
@@ -154,18 +234,30 @@ class ProtectedRepairRuntime:
         )
 
     def prepare(self, run_id: str, failure_hash: str) -> object:
-        raise PermissionError("protected repair composition is unavailable")
+        state = RunStateStore.load_read_only(self.descriptor.state_root, run_id).state
+        if state.disposition.value != "repair_required" or state.runner_identity is None:
+            raise PermissionError("repair run is not authorized")
+        return self._launcher_runner().prepare_workspace(run_id, failure_hash, state.runner_identity)
 
     def apply(self, workspace: str, request_hash: str) -> object:
-        raise PermissionError("protected repair composition is unavailable")
+        workspace_path = _absolute_path(workspace, "repair workspace")
+        if not workspace_path.is_relative_to(self.descriptor.repair_workspace_root):
+            raise PermissionError("repair workspace is outside the protected root")
+        request = RepairGuard(workspace_path).load_request(request_hash)
+        if request.baseline.path != workspace_path:
+            raise PermissionError("repair request does not match its workspace")
+        return self._launcher_runner().validate_build_activate(request)
 
-    def consume_nonce(self, request_hash: str) -> bool:
-        registry = RunnerRegistry(
-            self.descriptor.registry_root,
-            repair_runner_identity=self.descriptor.repair_runner_identity,
+    def _launcher_runner(self) -> RepairRunner:
+        return self.compose_runner(
+            worktree_factory=_LauncherRepairWorktreeFactory(
+                self.descriptor.repair_repository_root,
+                self.descriptor.repair_workspace_root,
+                self.descriptor.git_executable,
+            ),
+            git=_LauncherRepairGit(self.descriptor.git_executable),
+            process=_LauncherRepairProcess(),
         )
-        return registry.consume_nonce(self.descriptor.nonce, request_hash)
-
 
 def load_protected_runtime() -> ProtectedRepairRuntime:
     """Read and authenticate the launcher descriptor from a fixed read-only FD."""
@@ -233,7 +325,7 @@ def main(
         if args.command == "apply":
             (apply if apply is not None else runtime.apply)(args.workspace, args.request)
             return 0
-    except (RepairRuntimeConfigurationError, ValueError, PermissionError):
+    except (RepairRuntimeConfigurationError, RepairError, StateStoreError, ValueError, PermissionError, OSError, subprocess.SubprocessError):
         pass
     print("auto-code-repair: operation unavailable", file=sys.stderr)
     return 2

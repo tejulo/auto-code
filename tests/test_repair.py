@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from dataclasses import replace
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -44,7 +46,9 @@ def repair_descriptor_payload(tmp_path: Path, *, expiry: str = "2030-01-01T00:00
         "repair_runner_identity": identity("e").model_dump(mode="json"),
         "registry_root": str(tmp_path / "registry"),
         "state_root": str(tmp_path / "state"),
+        "repair_repository_root": str(tmp_path / "repair-repository"),
         "repair_workspace_root": str(tmp_path / "repair-workspaces"),
+        "git_executable": "/usr/bin/git",
         "regression_command": ["pytest", "tests/test_repair.py"],
         "expiry": expiry,
         "nonce": "f" * 64,
@@ -163,6 +167,20 @@ def repair_request(repair_launcher: RepairRunner, plan: RepairPlan, *, contracts
         project_policy_hash="8" * 64,
         ticket_owned_paths=(),
         contract_hashes=contracts or {},
+    )
+
+
+def mark_repair_required(state_root: Path) -> None:
+    store = RunStateStore(state_root, "run-1")
+    initial = store.compare_and_swap(
+        0,
+        EMPTY_STATE_HASH,
+        RunState(run_id="run-1", ticket_id="ENG-1", repository_id="repo-1", max_crew_iterations=3),
+    )
+    store.compare_and_swap(
+        initial.revision,
+        initial.state_hash,
+        initial.state.model_copy(update={"disposition": RunDisposition.REPAIR_REQUIRED, "runner_identity": identity("a")}),
     )
 
 
@@ -547,22 +565,142 @@ def test_protected_repair_runtime_rejects_a_forged_or_expired_descriptor(
         os.close(descriptor)
 
 
-def test_protected_repair_runtime_consumes_a_nonce_for_one_activation(
+def test_nonce_intention_recovers_activation_after_crash_before_receipt_publication(
+    tmp_path: Path,
+    valid_repair_plan: RepairPlan,
+) -> None:
+    """Dropping the receipt from the nonce intention would permanently strand a valid request."""
+    descriptor = repair_entrypoint.RepairRuntimeDescriptor.from_payload(repair_descriptor_payload(tmp_path), now=NOW)
+    runtime = repair_entrypoint.ProtectedRepairRuntime(descriptor)
+    factory = FakeWorktreeFactory(tmp_path / "repair-workspaces")
+    git = FakeRepairGit({"src/auto_code/runner.py"})
+    runner = runtime.compose_runner(worktree_factory=factory, git=git, process=FakeProcess(), now=lambda: NOW)
+    mark_repair_required(tmp_path / "state")
+    request = repair_request(runner, valid_repair_plan)
+    runner.crash_after("NONCE_INTENTION_PERSISTED")
+
+    with pytest.raises(InjectedCrash):
+        runner.validate_build_activate(request)
+
+    recovered = runtime.compose_runner(
+        worktree_factory=factory,
+        git=git,
+        process=FakeProcess(),
+        now=lambda: NOW + timedelta(minutes=1),
+    )
+    activation = recovered.validate_build_activate(request)
+
+    replay = repair_request(recovered, valid_repair_plan)
+
+    assert recovered.registry.lookup_activation(request.content_hash) == activation
+    assert recovered.registry.pointer_path.exists()
+    with pytest.raises(UnauthorizedRepairError, match="nonce"):
+        recovered.validate_build_activate(replay)
+
+
+def test_nonce_intention_replays_the_receipt_after_crash_before_pointer_publication(
+    tmp_path: Path,
+    valid_repair_plan: RepairPlan,
+) -> None:
+    """Returning an existing receipt without reconciliation would leave its pointer unpublished."""
+    descriptor = repair_entrypoint.RepairRuntimeDescriptor.from_payload(repair_descriptor_payload(tmp_path), now=NOW)
+    runtime = repair_entrypoint.ProtectedRepairRuntime(descriptor)
+    factory = FakeWorktreeFactory(tmp_path / "repair-workspaces")
+    git = FakeRepairGit({"src/auto_code/runner.py"})
+    runner = runtime.compose_runner(worktree_factory=factory, git=git, process=FakeProcess(), now=lambda: NOW)
+    mark_repair_required(tmp_path / "state")
+    request = repair_request(runner, valid_repair_plan)
+    runner.crash_after("ACTIVATION_RECEIPT_PUBLISHED")
+
+    with pytest.raises(InjectedCrash):
+        runner.validate_build_activate(request)
+
+    recovered = runtime.compose_runner(
+        worktree_factory=factory,
+        git=git,
+        process=FakeProcess(),
+        now=lambda: NOW + timedelta(minutes=1),
+    )
+    activation = recovered.validate_build_activate(request)
+
+    assert recovered.registry.lookup_activation(request.content_hash) == activation
+    assert recovered.registry.pointer_path.exists()
+
+
+def test_authenticated_runtime_executes_prepare_and_apply_with_descriptor_owned_adapters(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Reusing a valid descriptor must fail before its expiry time."""
+    """Replacing descriptor-owned adapters with ticket inputs would make the repair boundary bypassable."""
+    repository = tmp_path / "repair-repository"
+    source = repository / "src" / "auto_code"
+    source.mkdir(parents=True)
+    (source / "runner.py").write_text("baseline\n", encoding="ascii")
+    subprocess.run(("git", "init", str(repository)), check=True, capture_output=True)
+    subprocess.run(("git", "-C", str(repository), "config", "user.email", "test@example.invalid"), check=True)
+    subprocess.run(("git", "-C", str(repository), "config", "user.name", "Test User"), check=True)
+    subprocess.run(("git", "-C", str(repository), "add", "."), check=True)
+    subprocess.run(("git", "-C", str(repository), "commit", "-m", "baseline"), check=True, capture_output=True)
+
+    payload = repair_descriptor_payload(tmp_path)
+    payload["regression_command"] = [sys.executable, "-c", "pass"]
     descriptor_path = tmp_path / "repair-runtime.json"
-    descriptor_path.write_bytes(signed_repair_descriptor(tmp_path))
-    descriptor = os.open(descriptor_path, os.O_RDONLY)
+    signature = Ed25519PrivateKey.from_private_bytes(
+        bytes.fromhex("a5e8e70e8f786ccf0020ae4dcdbcf1a6b2d687e65c7a179ef23def7bfb6a02ad")
+    ).sign(canonical_json_bytes(payload)).hex()
+    descriptor_path.write_text(json.dumps({"payload": payload, "signature": signature}), encoding="ascii")
+    descriptor_fd = os.open(descriptor_path, os.O_RDONLY)
     try:
-        monkeypatch.setattr(repair_entrypoint, "_REPAIR_DESCRIPTOR_FD", descriptor)
+        monkeypatch.setattr(repair_entrypoint, "_REPAIR_DESCRIPTOR_FD", descriptor_fd)
         runtime = repair_entrypoint.load_protected_runtime()
     finally:
-        os.close(descriptor)
+        os.close(descriptor_fd)
 
-    assert runtime.consume_nonce("a" * 64)
-    assert not runtime.consume_nonce("a" * 64)
+    store = RunStateStore(tmp_path / "state", "run-1")
+    initial = store.compare_and_swap(
+        0,
+        EMPTY_STATE_HASH,
+        RunState(run_id="run-1", ticket_id="ENG-1", repository_id="repo-1", max_crew_iterations=3),
+    )
+    store.compare_and_swap(
+        initial.revision,
+        initial.state_hash,
+        initial.state.model_copy(update={"disposition": RunDisposition.REPAIR_REQUIRED, "runner_identity": identity("a")}),
+    )
+    monkeypatch.setattr(repair_entrypoint, "load_protected_runtime", lambda: runtime)
+
+    assert repair_entrypoint.main(["prepare", "--run", "run-1", "--failure", "f" * 64]) == 0
+
+    workspace = runtime.prepare("run-1", "f" * 64)
+    (workspace.path / "src" / "auto_code" / "runner.py").write_text("repaired\n", encoding="ascii")
+    plan = RepairPlan(
+        root_cause="A durable repair request needs a verified runtime.",
+        files=("src/auto_code/runner.py",),
+        change="Compose protected adapters from the descriptor.",
+        regression_command=(sys.executable, "-c", "pass"),
+        evidence=("failure-evidence-hash",),
+    )
+    guard = RepairGuard(workspace.path)
+    request = guard.create_request(
+        plan,
+        guard.capture_baseline(workspace),
+        ticket_product_manifest="9" * 64,
+        run_id="run-1",
+        ticket_repository_id="ticket-repository",
+        repair_repository_id="repair-repository",
+        old_runner_identity=identity("a"),
+        project_policy_hash="8" * 64,
+        ticket_owned_paths=(),
+        contract_hashes={},
+    )
+
+    assert repair_entrypoint.main(["apply", "--workspace", str(workspace.path), "--request", request.content_hash]) == 0
+    activation = RunnerRegistry(
+        tmp_path / "registry",
+        repair_runner_identity=identity("e"),
+    ).lookup_activation(request.content_hash)
+
+    assert activation.request_hash == request.content_hash
 
 
 def test_reconciliation_recovers_old_runner_termination_after_state_cas(

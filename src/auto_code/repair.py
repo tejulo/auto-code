@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .contracts import RunnerIdentity, Stage
 from .hashing import hash_json
+from .state import _read_canonical_json, _write_new_json
 
 
 class RepairError(RuntimeError):
@@ -119,29 +120,71 @@ class RepairRequest:
 
     @property
     def content_hash(self) -> str:
-        return hash_json(
-            {
-                "plan": self.plan.payload(),
-                "plan_path": str(self.plan_path),
-                "plan_hash": self.plan_hash,
-                "baseline": {
-                    "workspace_id": self.baseline.workspace_id,
-                    "path": str(self.baseline.path),
-                    "baseline_hash": self.baseline.baseline_hash,
-                    "run_id": self.baseline.run_id,
-                    "old_runner_hash": self.baseline.old_runner_hash,
-                    "expires_at": self.baseline.expires_at.isoformat(),
-                },
-                "ticket_product_manifest": self.ticket_product_manifest,
-                "run_id": self.run_id,
-                "ticket_repository_id": self.ticket_repository_id,
-                "repair_repository_id": self.repair_repository_id,
-                "old_runner_identity": self.old_runner_identity.model_dump(mode="json", round_trip=True),
-                "project_policy_hash": self.project_policy_hash,
-                "ticket_owned_paths": list(self.ticket_owned_paths),
-                "contract_hashes": {stage.value: value for stage, value in self.contract_hashes.items()},
-            }
-        )
+        return hash_json(self.payload())
+
+    def payload(self) -> dict[str, object]:
+        return {
+            "plan": self.plan.payload(),
+            "plan_path": str(self.plan_path),
+            "plan_hash": self.plan_hash,
+            "baseline": {
+                "workspace_id": self.baseline.workspace_id,
+                "path": str(self.baseline.path),
+                "baseline_hash": self.baseline.baseline_hash,
+                "run_id": self.baseline.run_id,
+                "old_runner_hash": self.baseline.old_runner_hash,
+                "expires_at": self.baseline.expires_at.isoformat(),
+            },
+            "ticket_product_manifest": self.ticket_product_manifest,
+            "run_id": self.run_id,
+            "ticket_repository_id": self.ticket_repository_id,
+            "repair_repository_id": self.repair_repository_id,
+            "old_runner_identity": self.old_runner_identity.model_dump(mode="json", round_trip=True),
+            "project_policy_hash": self.project_policy_hash,
+            "ticket_owned_paths": list(self.ticket_owned_paths),
+            "contract_hashes": {stage.value: value for stage, value in self.contract_hashes.items()},
+        }
+
+    @classmethod
+    def from_payload(cls, value: object) -> RepairRequest:
+        expected = {
+            "plan", "plan_path", "plan_hash", "baseline", "ticket_product_manifest", "run_id",
+            "ticket_repository_id", "repair_repository_id", "old_runner_identity", "project_policy_hash",
+            "ticket_owned_paths", "contract_hashes",
+        }
+        if not isinstance(value, dict) or set(value) != expected or not isinstance(value["baseline"], dict):
+            raise UnauthorizedRepairError("repair request is invalid")
+        baseline = value["baseline"]
+        if set(baseline) != {"workspace_id", "path", "baseline_hash", "run_id", "old_runner_hash", "expires_at"}:
+            raise UnauthorizedRepairError("repair request is invalid")
+        contracts = value["contract_hashes"]
+        paths = value["ticket_owned_paths"]
+        if not isinstance(contracts, dict) or not isinstance(paths, list) or any(not isinstance(path, str) for path in paths):
+            raise UnauthorizedRepairError("repair request is invalid")
+        try:
+            return cls(
+                plan=RepairPlan.from_payload(value["plan"]),
+                plan_path=Path(value["plan_path"]),
+                plan_hash=value["plan_hash"],
+                baseline=RepairBaseline(
+                    workspace_id=baseline["workspace_id"],
+                    path=Path(baseline["path"]),
+                    baseline_hash=baseline["baseline_hash"],
+                    run_id=baseline["run_id"],
+                    old_runner_hash=baseline["old_runner_hash"],
+                    expires_at=datetime.fromisoformat(baseline["expires_at"]),
+                ),
+                ticket_product_manifest=value["ticket_product_manifest"],
+                run_id=value["run_id"],
+                ticket_repository_id=value["ticket_repository_id"],
+                repair_repository_id=value["repair_repository_id"],
+                old_runner_identity=RunnerIdentity.model_validate(value["old_runner_identity"]),
+                project_policy_hash=value["project_policy_hash"],
+                ticket_owned_paths=tuple(paths),
+                contract_hashes={Stage(stage): digest for stage, digest in contracts.items()},
+            )
+        except (TypeError, ValueError):
+            raise UnauthorizedRepairError("repair request is invalid") from None
 
 
 class RepairGuard:
@@ -199,7 +242,7 @@ class RepairGuard:
         plan_path = self.repair_worktree / ".repair-plans" / f"{plan_hash}.json"
         plan_path.parent.mkdir(exist_ok=True)
         plan_path.write_text(json.dumps(plan.payload(), sort_keys=True, separators=(",", ":")), encoding="ascii")
-        return RepairRequest(
+        request = RepairRequest(
             plan=plan,
             plan_path=plan_path,
             plan_hash=plan_hash,
@@ -213,3 +256,19 @@ class RepairGuard:
             ticket_owned_paths=ticket_owned_paths,
             contract_hashes=dict(contract_hashes),
         )
+        request_path = self.repair_worktree / ".repair-requests" / f"{request.content_hash}.json"
+        request_path.parent.mkdir(exist_ok=True)
+        if not _write_new_json(request_path, request.payload()) and self.load_request(request.content_hash) != request:
+            raise UnauthorizedRepairError("repair request conflicts with a prior request")
+        return request
+
+    def load_request(self, request_hash: str) -> RepairRequest:
+        try:
+            request = RepairRequest.from_payload(
+                _read_canonical_json(self.repair_worktree / ".repair-requests" / f"{request_hash}.json", "repair request")
+            )
+        except Exception:
+            raise UnauthorizedRepairError("repair request is unavailable") from None
+        if request.content_hash != request_hash:
+            raise UnauthorizedRepairError("repair request is invalid")
+        return request

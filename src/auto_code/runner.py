@@ -91,6 +91,25 @@ class RunnerActivationReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class DescriptorNonceIntent:
+    """The replay-safe activation result reserved by one signed descriptor nonce."""
+
+    nonce: str
+    receipt: RunnerActivationReceipt
+
+    def payload(self) -> dict[str, object]:
+        return {"nonce": self.nonce, "receipt": self.receipt.payload()}
+
+    @classmethod
+    def from_payload(cls, payload: object) -> DescriptorNonceIntent:
+        if not isinstance(payload, dict) or set(payload) != {"nonce", "receipt"}:
+            raise ValueError("descriptor nonce intention is invalid")
+        if not isinstance(payload["nonce"], str):
+            raise ValueError("descriptor nonce intention is invalid")
+        return cls(nonce=payload["nonce"], receipt=RunnerActivationReceipt.from_payload(payload["receipt"]))
+
+
+@dataclass(frozen=True, slots=True)
 class RestartReceipt:
     run_id: str
     request_hash: str
@@ -183,9 +202,40 @@ class RunnerRegistry:
             raise ValueError("activation receipt request hash is invalid")
         return receipt
 
-    def consume_nonce(self, nonce: str, request_hash: str) -> bool:
-        """Write-once nonce consumption prevents a descriptor from authorizing a second repair."""
-        return _write_new_json(self.nonces / f"{nonce}.json", {"request_hash": request_hash})
+    def record_nonce_intention(self, nonce: str, receipt: RunnerActivationReceipt) -> DescriptorNonceIntent:
+        """Reserve a nonce with the exact receipt that a replay may safely publish."""
+        intention = DescriptorNonceIntent(nonce=nonce, receipt=receipt)
+        path = self.nonces / f"{nonce}.json"
+        if _write_new_json(path, intention.payload()):
+            return intention
+        try:
+            existing = DescriptorNonceIntent.from_payload(_read_canonical_json(path, "repair descriptor nonce intention"))
+        except Exception:
+            raise UnauthorizedRepairError("repair descriptor nonce was already consumed") from None
+        if (
+            existing.receipt.request_hash != receipt.request_hash
+            or existing.receipt.old_runner_identity != receipt.old_runner_identity
+        ):
+            raise UnauthorizedRepairError("repair descriptor nonce was already consumed")
+        return existing
+
+    def publish_nonce_intention(self, intention: DescriptorNonceIntent) -> RunnerActivationReceipt:
+        """Reconcile a persisted nonce intention into its immutable activation receipt and pointer."""
+        path = self.activation_path(intention.receipt.request_hash)
+        if not _write_new_json(path, intention.receipt.payload()):
+            existing = self.lookup_activation(intention.receipt.request_hash)
+            if existing != intention.receipt:
+                raise UnauthorizedRepairError("activation replay does not match its request")
+        elif self._crash_marker == "ACTIVATION_RECEIPT_PUBLISHED":
+            self._crash_marker = None
+            from .repair import InjectedCrash
+            raise InjectedCrash("injected crash after activation receipt publication")
+        _atomic_replace_json(self.pointer_path, {"request_hash": intention.receipt.request_hash})
+        if self._crash_marker == "REGISTRY_POINTER_REPLACED":
+            self._crash_marker = None
+            from .repair import InjectedCrash
+            raise InjectedCrash("injected crash after registry pointer replacement")
+        return intention.receipt
 
 class RepairRunner:
     def __init__(
