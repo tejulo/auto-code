@@ -5,16 +5,20 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 import hashlib
 import hmac
+import json
 import math
 import os
 from pathlib import Path
 import re
+import socket
 import stat
 import subprocess
 import time
 from typing import Protocol
+import uuid
 
 from .contracts import EvidenceRef, sanitize_untrusted_text
+from .hashing import canonical_json_bytes
 
 
 MAX_CAPTURE_TEXT = 8_192
@@ -111,6 +115,12 @@ class SandboxCompleted:
     stderr: str | bytes = ""
 
 
+@dataclass(frozen=True, slots=True)
+class ObservedLauncherEffect:
+    receipt_hash: str
+    returncode: int
+
+
 class EvidenceSink(Protocol):
     def write(self, result: CommandResult) -> CommandResult:
         """Persist already-redacted output outside the target repository."""
@@ -155,6 +165,237 @@ class Sandbox(Protocol):
         new_process_group: bool,
     ) -> ProcessHandle:
         """Start an owned process or raise SandboxStartError with any created handle."""
+
+
+class LauncherSocketSandbox:
+    """Delegate execution to the launcher-owned sandbox service over a pinned Unix socket."""
+
+    def __init__(self, socket_path: Path, identity: str) -> None:
+        path = Path(socket_path)
+        if not path.is_absolute() or ".." in path.parts or not identity or len(identity) > 255:
+            raise ProcessConfigurationError("Launcher sandbox configuration is invalid")
+        metadata = os.lstat(path)
+        if not stat.S_ISSOCK(metadata.st_mode):
+            raise ProcessConfigurationError("Launcher sandbox socket is invalid")
+        self.socket_path = path
+        self.identity = identity
+        self._device = metadata.st_dev
+        self._inode = metadata.st_ino
+
+    def run(
+        self,
+        argv: tuple[str, ...],
+        *,
+        executable: VerifiedExecutable,
+        timeout: float,
+        env: Mapping[str, str],
+        policy: SandboxPolicyHandoff,
+    ) -> SandboxCompleted:
+        metadata = os.lstat(self.socket_path)
+        if not stat.S_ISSOCK(metadata.st_mode) or (metadata.st_dev, metadata.st_ino) != (self._device, self._inode):
+            raise ProcessConfigurationError("Launcher sandbox socket identity changed")
+        request = {
+            "schema_version": "v1",
+            "sandbox_identity": self.identity,
+            "argv": list(argv),
+            "executable_path": executable.path,
+            "timeout": timeout,
+            "environment": dict(env),
+            "policy": {
+                "cwd": str(policy.cwd.path),
+                "project_root": str(policy.project_root.path),
+                "readable_roots": [str(directory.path) for directory in policy.readable_roots],
+                "writable_roots": [str(directory.path) for directory in policy.writable_roots],
+                "controlled_home": str(policy.controlled_home.path),
+                "dynamic_downloads_disabled": policy.dynamic_downloads_disabled,
+            },
+        }
+        raw = canonical_json_bytes(request) + b"\n"
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as transport:
+            transport.settimeout(timeout)
+            transport.connect(str(self.socket_path))
+            transport.sendall(raw)
+            response = b""
+            while not response.endswith(b"\n"):
+                chunk = transport.recv(65_536)
+                if not chunk:
+                    break
+                response += chunk
+                if len(response) > 1_048_576:
+                    raise ProcessConfigurationError("Launcher sandbox response is too large")
+        try:
+            payload = json.loads(response.decode("utf-8"))
+            if not isinstance(payload, dict) or set(payload) != {"returncode", "stdout", "stderr"}:
+                raise ValueError
+            if (
+                isinstance(payload["returncode"], bool)
+                or not isinstance(payload["returncode"], int)
+                or not isinstance(payload["stdout"], (str, bytes))
+                or not isinstance(payload["stderr"], (str, bytes))
+            ):
+                raise ValueError
+            return SandboxCompleted(payload["returncode"], payload["stdout"], payload["stderr"])
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            raise ProcessConfigurationError("Launcher sandbox response is invalid") from error
+
+    def observe_effect(
+        self, effect_id: str, binding_hash: str, *, timeout: float
+    ) -> ObservedLauncherEffect | None:
+        _require_effect_hash(effect_id)
+        _require_effect_hash(binding_hash)
+        payload = self._exchange(
+            {
+                "schema_version": "v1",
+                "sandbox_identity": self.identity,
+                "operation": "observe_effect",
+                "effect_id": effect_id,
+                "binding_hash": binding_hash,
+            },
+            timeout,
+        )
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"effect_id", "binding_hash", "receipt_hash", "returncode"}
+            or payload["effect_id"] != effect_id
+            or payload["binding_hash"] != binding_hash
+            or (payload["receipt_hash"] is None) != (payload["returncode"] is None)
+        ):
+            raise ProcessConfigurationError("Launcher effect observation is invalid")
+        if payload["receipt_hash"] is None:
+            return None
+        if isinstance(payload["returncode"], bool) or not isinstance(payload["returncode"], int):
+            raise ProcessConfigurationError("Launcher effect observation is invalid")
+        return ObservedLauncherEffect(_require_effect_hash(payload["receipt_hash"]), payload["returncode"])
+
+    def run_effect(
+        self,
+        argv: tuple[str, ...],
+        *,
+        executable: VerifiedExecutable,
+        timeout: float,
+        env: Mapping[str, str],
+        policy: SandboxPolicyHandoff,
+        effect_id: str,
+        binding_hash: str,
+    ) -> tuple[SandboxCompleted, str]:
+        _require_effect_hash(effect_id)
+        _require_effect_hash(binding_hash)
+        payload = self._exchange(
+            {
+                "schema_version": "v1",
+                "sandbox_identity": self.identity,
+                "operation": "invoke_effect",
+                "effect_id": effect_id,
+                "binding_hash": binding_hash,
+                "argv": list(argv),
+                "executable_path": executable.path,
+                "timeout": timeout,
+                "environment": dict(env),
+                "policy": {
+                    "cwd": str(policy.cwd.path),
+                    "project_root": str(policy.project_root.path),
+                    "readable_roots": [str(directory.path) for directory in policy.readable_roots],
+                    "writable_roots": [str(directory.path) for directory in policy.writable_roots],
+                    "controlled_home": str(policy.controlled_home.path),
+                    "dynamic_downloads_disabled": policy.dynamic_downloads_disabled,
+                },
+            },
+            timeout,
+        )
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"returncode", "stdout", "stderr", "effect_id", "binding_hash", "receipt_hash"}
+            or isinstance(payload["returncode"], bool)
+            or not isinstance(payload["returncode"], int)
+            or not isinstance(payload["stdout"], str)
+            or not isinstance(payload["stderr"], str)
+            or payload["effect_id"] != effect_id
+            or payload["binding_hash"] != binding_hash
+        ):
+            raise ProcessConfigurationError("Launcher effect response is invalid")
+        receipt = _require_effect_hash(payload["receipt_hash"])
+        return SandboxCompleted(payload["returncode"], payload["stdout"], payload["stderr"]), receipt
+
+    def _exchange(self, request: Mapping[str, object], timeout: float) -> object:
+        metadata = os.lstat(self.socket_path)
+        if not stat.S_ISSOCK(metadata.st_mode) or (metadata.st_dev, metadata.st_ino) != (self._device, self._inode):
+            raise ProcessConfigurationError("Launcher sandbox socket identity changed")
+        raw = canonical_json_bytes(request) + b"\n"
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as transport:
+            transport.settimeout(timeout)
+            transport.connect(str(self.socket_path))
+            transport.sendall(raw)
+            response = b""
+            while not response.endswith(b"\n"):
+                chunk = transport.recv(65_536)
+                if not chunk:
+                    break
+                response += chunk
+                if len(response) > 1_048_576:
+                    raise ProcessConfigurationError("Launcher sandbox response is too large")
+        try:
+            return json.loads(response.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ProcessConfigurationError("Launcher sandbox response is invalid") from error
+
+    def start(self, *args: object, **kwargs: object) -> ProcessHandle:
+        raise SandboxStartError()
+
+
+class FilesystemEvidenceSink:
+    """Persist bounded process output as immutable launcher-owned evidence files."""
+
+    def __init__(self, root: Path, *, creator: str = "trusted-process-runner") -> None:
+        path = Path(root)
+        if not path.is_absolute() or ".." in path.parts or not creator or len(creator) > 255:
+            raise EvidenceSinkError("Evidence sink configuration is invalid")
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if path.is_symlink() or not path.is_dir():
+            raise EvidenceSinkError("Evidence sink root is invalid")
+        self.root = path
+        self.creator = creator
+        self._root_identity = _directory_identity(path)
+
+    def write(self, result: CommandResult) -> CommandResult:
+        identifier = uuid.uuid4().hex
+        stdout = self._write_new(f"{identifier}.stdout.txt", result.stdout_text.encode("utf-8"))
+        stderr = self._write_new(f"{identifier}.stderr.txt", result.stderr_text.encode("utf-8"))
+        return replace(
+            result,
+            stdout_path=EvidenceRef(
+                relative_path=f"repair/{stdout.name}",
+                sha256=hashlib.sha256(result.stdout_text.encode("utf-8")).hexdigest(),
+                media_type="text/plain",
+                creator=self.creator,
+            ),
+            stderr_path=EvidenceRef(
+                relative_path=f"repair/{stderr.name}",
+                sha256=hashlib.sha256(result.stderr_text.encode("utf-8")).hexdigest(),
+                media_type="text/plain",
+                creator=self.creator,
+            ),
+        )
+
+    def _write_new(self, name: str, content: bytes) -> Path:
+        directory = _open_pinned_directory(self._root_identity)
+        try:
+            descriptor = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | _required_no_follow_flag(),
+                0o600,
+                dir_fd=directory.descriptor,
+            )
+            try:
+                remaining = memoryview(content)
+                while remaining:
+                    remaining = remaining[os.write(descriptor, remaining):]
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.fsync(directory.descriptor)
+        finally:
+            directory.close()
+        return self.root / name
 
 
 class ProcessHandle(Protocol):
@@ -427,6 +668,62 @@ class ProcessRunner:
             environment,
             sandbox_policy,
         ).result
+
+    def observe_reconciled_effect(
+        self, effect_id: str, binding_hash: str, timeout: float
+    ) -> ObservedLauncherEffect | None:
+        if self.sandbox is None or not callable(getattr(self.sandbox, "observe_effect", None)):
+            raise ProcessConfigurationError("Observable launcher effects are unavailable")
+        return self.sandbox.observe_effect(  # type: ignore[attr-defined,no-any-return]
+            _require_effect_hash(effect_id),
+            _require_effect_hash(binding_hash),
+            timeout=_positive_timeout(timeout),
+        )
+
+    def run_reconciled_effect(
+        self,
+        effect_id: str,
+        binding_hash: str,
+        argv: Sequence[str],
+        cwd: Path,
+        timeout: float,
+        evidence_sink: EvidenceSink,
+        environment: Mapping[str, str],
+        sandbox_policy: SandboxPolicy,
+    ) -> tuple[CommandResult, str]:
+        if self.sandbox is None or not callable(getattr(self.sandbox, "run_effect", None)):
+            raise ProcessConfigurationError("Observable launcher effects are unavailable")
+        executable: VerifiedExecutable | None = None
+        handoff: SandboxPolicyHandoff | None = None
+        try:
+            executable, command, handoff, command_timeout, command_environment = self._prepare(
+                argv, cwd, timeout, environment, sandbox_policy
+            )
+            completed, receipt = self.sandbox.run_effect(  # type: ignore[attr-defined]
+                command,
+                executable=executable,
+                timeout=command_timeout,
+                env=command_environment,
+                policy=handoff,
+                effect_id=_require_effect_hash(effect_id),
+                binding_hash=_require_effect_hash(binding_hash),
+            )
+            if not isinstance(completed, SandboxCompleted):
+                raise ProcessConfigurationError("Launcher effect returned an invalid command result")
+            result = self._record(
+                command,
+                completed.returncode,
+                completed.stdout,
+                completed.stderr,
+                None if completed.returncode == 0 else CommandFailureKind.EXIT,
+                evidence_sink,
+            )
+            return result, _require_effect_hash(receipt)
+        finally:
+            if handoff is not None:
+                handoff.close()
+            if executable is not None:
+                _close_verified_executable(executable)
 
     def run_with_trusted_output(
         self,
@@ -890,6 +1187,12 @@ def _is_relative_to(path: Path, root: Path) -> bool:
 
 def _paths_overlap(first: Path, second: Path) -> bool:
     return _is_relative_to(first, second) or _is_relative_to(second, first)
+
+
+def _require_effect_hash(value: object) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ProcessConfigurationError("Launcher effect hash is invalid")
+    return value
 
 
 def _open_regular_file_no_follow(path: Path) -> int:

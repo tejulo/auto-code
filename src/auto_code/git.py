@@ -247,14 +247,37 @@ class RepairSourceFile:
 
 
 @dataclass(frozen=True, slots=True)
+class RepairWorkspaceFile:
+    path: str
+    kind: str
+    mode: str
+    binary: bool
+    content_sha256: str
+
+    def payload(self) -> dict[str, object]:
+        return {
+            "path": self.path,
+            "kind": self.kind,
+            "mode": self.mode,
+            "binary": self.binary,
+            "content_sha256": self.content_sha256,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class RepairSourceManifest:
     baseline_sha: str
     files: tuple[RepairSourceFile, ...]
+    workspace_files: tuple[RepairWorkspaceFile, ...] = ()
 
     @property
     def content_hash(self) -> str:
         return hash_json(
-            {"baseline_sha": self.baseline_sha, "files": [entry.payload() for entry in self.files]}
+            {
+                "baseline_sha": self.baseline_sha,
+                "files": [entry.payload() for entry in self.files],
+                "workspace_files": [entry.payload() for entry in self.workspace_files],
+            }
         )
 
 
@@ -568,7 +591,51 @@ class GitGuard:
             )
             for entry in source_entries
         )
-        return RepairSourceManifest(baseline_sha=manifest.baseline_sha, files=files)
+        workspace_files = self._repair_workspace_files(controls)
+        return RepairSourceManifest(
+            baseline_sha=manifest.baseline_sha,
+            files=files,
+            workspace_files=workspace_files,
+        )
+
+    def _repair_workspace_files(self, control_paths: tuple[str, ...]) -> tuple[RepairWorkspaceFile, ...]:
+        controls = frozenset(control_paths)
+        entries: list[RepairWorkspaceFile] = []
+        for current, directories, files in os.walk(self.repository, followlinks=False):
+            current_path = Path(current)
+            if current_path == self.repository:
+                directories[:] = [name for name in directories if name != ".git"]
+                files = [name for name in files if name != ".git"]
+            for name in tuple(directories):
+                path = current_path / name
+                if path.is_symlink():
+                    directories.remove(name)
+                    files.append(name)
+            for name in files:
+                path = current_path / name
+                relative = path.relative_to(self.repository).as_posix()
+                if relative in controls:
+                    continue
+                metadata = os.lstat(path)
+                if stat.S_ISLNK(metadata.st_mode):
+                    kind = "symlink"
+                elif stat.S_ISREG(metadata.st_mode):
+                    kind = "file"
+                else:
+                    raise GitGuardError("Repair workspace contains an unsupported file")
+                entries.append(
+                    RepairWorkspaceFile(
+                        path=_validate_relative_path(relative),
+                        kind=kind,
+                        mode=_worktree_mode(path),
+                        binary=_worktree_is_binary(path),
+                        content_sha256=hashlib.sha256(_read_worktree_bytes(path)).hexdigest(),
+                    )
+                )
+        result = tuple(sorted(entries, key=lambda entry: entry.path))
+        if len({entry.path for entry in result}) != len(result):
+            raise GitGuardError("Repair workspace manifest paths are not unique")
+        return result
 
     def dependency_lock_hash(self) -> str:
         entries: list[dict[str, object]] = []

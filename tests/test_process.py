@@ -16,6 +16,7 @@ from auto_code.process import (
     CommandFailureKind,
     CommandResult,
     EvidenceSinkError,
+    FilesystemEvidenceSink,
     HashVerifiedExecutables,
     ManagedProcessRunner,
     ManagedProcessStartError,
@@ -27,6 +28,22 @@ from auto_code.process import (
     SandboxPolicy,
     VerifiedExecutable,
 )
+
+
+def test_filesystem_evidence_sink_rejects_replaced_root(tmp_path: Path) -> None:
+    root = tmp_path / "evidence"
+    sink = FilesystemEvidenceSink(root)
+    original = tmp_path / "original-evidence"
+    root.rename(original)
+    attacker = tmp_path / "attacker"
+    attacker.mkdir()
+    root.symlink_to(attacker, target_is_directory=True)
+    result = CommandResult(("probe",), 0, "output", "", None, None, True)
+
+    with pytest.raises(ProcessConfigurationError, match="symlinks|identity changed"):
+        sink.write(result)
+
+    assert tuple(attacker.iterdir()) == ()
 
 
 class RecordingEvidenceSink:

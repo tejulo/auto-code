@@ -588,6 +588,25 @@ def test_repair_source_manifest_excludes_only_explicit_control_files_and_rejects
         )
 
 
+def test_repair_source_manifest_binds_unchanged_and_ignored_workspace_files(
+    git_repo_with_remote: GitRepository,
+) -> None:
+    guard = git_repo_with_remote.guard()
+    baseline = git_repo_with_remote.git("rev-parse", "HEAD").stdout_text.strip()
+    (git_repo_with_remote.root / "old.txt").write_text("repaired\n", encoding="ascii")
+    (git_repo_with_remote.root / ".git" / "info" / "exclude").write_text("ignored.cache\n", encoding="ascii")
+    (git_repo_with_remote.root / "ignored.cache").write_bytes(b"\x00ignored\n")
+
+    manifest = guard.collect_repair_source_manifest(baseline, planned_paths=("old.txt",))
+    workspace = {entry.path: entry for entry in manifest.workspace_files}
+
+    assert "old.txt" in workspace
+    assert "script.sh" in workspace
+    assert workspace["ignored.cache"].binary is True
+    assert workspace["ignored.cache"].content_sha256 == sha256(b"\x00ignored\n").hexdigest()
+    assert not any(entry.path.startswith(".git/") for entry in manifest.workspace_files)
+
+
 def test_collect_manifest_inputs_uses_trusted_full_output_when_public_evidence_is_capped(
     git_repo_with_remote: GitRepository,
 ) -> None:

@@ -12,7 +12,8 @@ import stat
 import sys
 from typing import Protocol
 
-from .contracts import EvidenceRef, RunnerIdentity, StepResult
+from .contracts import EvidenceRef, ProductChangeManifest, RepairRunnerIdentity, RunnerIdentity, StepResult
+from .hashing import canonical_json_bytes
 from .state import RunStateStore, StateGeneration, StateStoreError
 from .supervisor import SupervisorStateMismatch
 
@@ -87,16 +88,21 @@ class TrustedRuntimeConfig:
     project_policy_path: Path
     project_policy_hash: str
     runner_identity: RunnerIdentity
+    repair_registry_root: Path | None = None
+    repair_runner_identity: RepairRunnerIdentity | None = None
+    repair_repository_id: str | None = None
 
     @classmethod
     def from_descriptor(cls, value: object) -> TrustedRuntimeConfig:
-        if not isinstance(value, dict) or set(value) != {
+        base = {
             "state_root",
             "project_root",
             "project_policy_path",
             "project_policy_hash",
             "runner_identity",
-        }:
+        }
+        repair = {"repair_registry_root", "repair_runner_identity", "repair_repository_id"}
+        if not isinstance(value, dict) or frozenset(value) not in {frozenset(base), frozenset(base | repair)}:
             raise ValueError("runtime descriptor shape is invalid")
         return cls(
             state_root=Path(value["state_root"]),
@@ -104,6 +110,13 @@ class TrustedRuntimeConfig:
             project_policy_path=Path(value["project_policy_path"]),
             project_policy_hash=value["project_policy_hash"],
             runner_identity=RunnerIdentity.model_validate(value["runner_identity"]),
+            repair_registry_root=(Path(value["repair_registry_root"]) if "repair_registry_root" in value else None),
+            repair_runner_identity=(
+                RepairRunnerIdentity.model_validate(value["repair_runner_identity"])
+                if "repair_runner_identity" in value
+                else None
+            ),
+            repair_repository_id=value.get("repair_repository_id"),
         )
 
     def __post_init__(self) -> None:
@@ -127,6 +140,24 @@ class TrustedRuntimeConfig:
             raise ValueError("project policy hash is invalid")
         if not isinstance(self.runner_identity, RunnerIdentity):
             raise ValueError("runner identity is invalid")
+        repair_values = (self.repair_registry_root, self.repair_runner_identity, self.repair_repository_id)
+        if any(value is not None for value in repair_values):
+            if not all(value is not None for value in repair_values):
+                raise ValueError("repair runtime bindings are incomplete")
+            assert self.repair_registry_root is not None
+            repair_root = Path(self.repair_registry_root)
+            if not repair_root.is_absolute() or ".." in repair_root.parts:
+                raise ValueError("repair registry root is invalid")
+            object.__setattr__(self, "repair_registry_root", repair_root)
+            if not isinstance(self.repair_runner_identity, RepairRunnerIdentity):
+                raise ValueError("repair runner identity is invalid")
+            if (
+                not isinstance(self.repair_repository_id, str)
+                or not self.repair_repository_id
+                or len(self.repair_repository_id) > 255
+                or any(character in self.repair_repository_id for character in ("/", "\x00"))
+            ):
+                raise ValueError("repair repository ID is invalid")
 
 
 def load_launcher_runtime_from_protected_fd() -> TrustedRuntimeConfig:
@@ -340,9 +371,12 @@ def _run_repair_request(
         if revision < 1:
             raise ValueError
         trusted_runtime = runtime if runtime is not None else load_launcher_runtime_from_protected_fd()
-        if coordinator_factory is None:
-            raise RuntimeConfigurationError("repair coordinator is unavailable")
-        request = coordinator_factory(trusted_runtime).create_request(
+        coordinator = (
+            coordinator_factory(trusted_runtime)
+            if coordinator_factory is not None
+            else _compose_repair_request_coordinator(trusted_runtime, args.run)
+        )
+        request = coordinator.create_request(
             args.run,
             revision,
             args.expected_hash,
@@ -357,6 +391,48 @@ def _run_repair_request(
         return 2
     print(json.dumps({"request_hash": content_hash}, sort_keys=True))
     return 0
+
+
+def _compose_repair_request_coordinator(
+    runtime: TrustedRuntimeConfig,
+    run_id: str,
+) -> _RepairRequestCoordinator:
+    if (
+        runtime.repair_registry_root is None
+        or runtime.repair_runner_identity is None
+        or runtime.repair_repository_id is None
+    ):
+        raise RuntimeConfigurationError("repair coordinator is unavailable")
+    from .repair import RepairRequestCoordinator, _open_regular_no_follow
+    from .runner import RunnerRegistry
+
+    registry = RunnerRegistry(runtime.repair_registry_root, repair_runner_identity=runtime.repair_runner_identity)
+    store = RunStateStore(runtime.state_root, run_id)
+
+    def load_product_manifest(relative_path: str) -> ProductChangeManifest:
+        if not isinstance(relative_path, str):
+            raise ValueError("product manifest path is invalid")
+        path = runtime.project_root / relative_path
+        try:
+            path.relative_to(runtime.project_root)
+            descriptor = _open_regular_no_follow(path)
+            with os.fdopen(descriptor, "rb") as stream:
+                raw = stream.read(1_048_577)
+            if len(raw) > 1_048_576:
+                raise ValueError
+            payload = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_json_keys)
+            if raw != canonical_json_bytes(payload):
+                raise ValueError
+            return ProductChangeManifest.model_validate(payload)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            raise RuntimeConfigurationError("product manifest is unavailable") from None
+
+    return RepairRequestCoordinator(
+        store,
+        load_workspace_handle=registry.load_workspace_handle,
+        load_product_manifest=load_product_manifest,
+        repair_repository_id=runtime.repair_repository_id,
+    )
 
 
 def main(
