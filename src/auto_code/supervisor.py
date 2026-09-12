@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Protocol
 
 from .checkpoint import CheckpointAuthority
@@ -46,7 +45,6 @@ class StageExecution:
     validator_version: str
     validation_receipt_hash: str
     evidence: tuple[EvidenceRef, ...] = ()
-    state_updates: Mapping[str, object] = field(default_factory=dict)
     review: ReviewResult | None = None
 
 
@@ -176,7 +174,6 @@ class Supervisor:
                 evidence=outcome.evidence,
             )
             updates = {
-                **dict(outcome.state_updates),
                 "checkpoints": {**generation.state.checkpoints, stage: checkpoint},
                 "stage_outputs": (*generation.state.stage_outputs, StageOutput(stage=stage, content_hash=checkpoint.output_manifest_hash)),
                 "current_stage": stage,
@@ -194,6 +191,8 @@ class Supervisor:
         review = outcome.review
         if review is None:
             return self._route_failure(generation, self._orchestration_failure(Stage.REVIEWER))
+        if review.review_manifest_hash != generation.state.review_manifest:
+            return self._route_failure(generation, self._supervisor_failure(FindingKind.INVALID_ROUTING))
         if not review.approved:
             failure = FailureRecord(
                 failure_class=review.failure_class,
@@ -221,7 +220,6 @@ class Supervisor:
                 generation.state_hash,
                 generation.state.model_copy(
                     update={
-                        **dict(outcome.state_updates),
                         "checkpoints": {**generation.state.checkpoints, Stage.REVIEWER: checkpoint},
                         "stage_outputs": (
                             *generation.state.stage_outputs,
@@ -259,6 +257,7 @@ class Supervisor:
                     request_id=action.request_id,
                     action=action,
                 )
+            return self._route_failure(generation, self._supervisor_failure(FindingKind.INVALID_ROUTING))
         if state.disposition is RunDisposition.REPAIR_REQUIRED:
             return self._result(StepKind.REPAIR_REQUIRED, generation, failure=self._latest_failure(state))
         if state.disposition is RunDisposition.HUMAN_REVIEW:

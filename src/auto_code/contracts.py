@@ -1747,8 +1747,12 @@ class StepResult(ContractModel):
     @model_validator(mode="after")
     def validate_result_shape(self) -> StepResult:
         if self.kind is StepKind.MCP_ACTION:
-            if self.action is None or self.request_id != self.action.request_id:
-                raise ValueError("MCP action step results require their correlated request")
+            if (
+                self.action is None
+                or self.request_id != self.action.request_id
+                or self.action.run_id != self.run_id
+            ):
+                raise ValueError("MCP action step results require correlated request and run identifiers")
         elif self.action is not None or self.request_id is not None:
             raise ValueError("Only MCP action step results may contain an action")
         if self.kind in {StepKind.ITERATION_FAILED, StepKind.REPAIR_REQUIRED, StepKind.HUMAN_REVIEW}:

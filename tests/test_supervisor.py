@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from hashlib import sha256
 import json
 from pathlib import Path
 
+from pydantic import ValidationError
 import pytest
 
 from auto_code.checkpoint import CheckpointAuthority
@@ -14,11 +16,17 @@ from auto_code.contracts import (
     FailureRecord,
     FailureSource,
     FindingKind,
+    EffectIntention,
+    EffectIntentionPayload,
+    McpActionRequest,
+    PendingExternalRequest,
     ReviewResult,
+    RunDisposition,
     RunState,
     RunnerIdentity,
     Stage,
     StageOutput,
+    StepResult,
     TaskDefinition,
     TaskDefinitionManifest,
     TaskStatus,
@@ -221,7 +229,7 @@ def test_exhausted_budget_requires_human_review(dependencies: Dependencies) -> N
 def test_reviewer_checkpoint_and_iteration_close_are_one_generation(dependencies: Dependencies) -> None:
     """Fails if reviewer approval can persist a reusable checkpoint before closure."""
     state = approved_planning_state(dependencies.checkpoint_authority, dependencies.expectations)
-    generation = persist_reviewer(dependencies.store, state, "review-manifest-1")
+    generation = persist_reviewer(dependencies.store, state, "a" * 64)
     dependencies.executor.results[Stage.REVIEWER] = StageExecution(
         output_manifest_hash=digest("reviewer-output"),
         validator="test_validator",
@@ -267,6 +275,118 @@ def test_reviewer_rejection_closes_and_routes_in_one_generation(dependencies: De
     assert reloaded.finalization_eligible is False
     assert reloaded.current_stage is Stage.PROGRAMMER
     assert Stage.REVIEWER not in reloaded.checkpoints
+
+
+def test_reviewer_approval_requires_the_persisted_review_manifest_hash(dependencies: Dependencies) -> None:
+    """Fails if a reviewer can approve a result for another review manifest."""
+    persisted_manifest = digest("persisted-review-manifest")
+    state = approved_planning_state(dependencies.checkpoint_authority, dependencies.expectations)
+    generation = persist_reviewer(dependencies.store, state, persisted_manifest)
+    dependencies.executor.results[Stage.REVIEWER] = StageExecution(
+        output_manifest_hash=digest("reviewer-output"),
+        validator="test_validator",
+        validator_version="1",
+        validation_receipt_hash=digest("reviewer-receipt"),
+        review=ReviewResult(
+            approved=True,
+            review_manifest_hash=digest("other-review-manifest"),
+            cited_ids=(),
+            blocking_findings=(),
+            evidence=(),
+            next_action="Proceed to finalization.",
+        ),
+    )
+
+    result = Supervisor(dependencies.as_supervisor_dependencies()).execute_and_checkpoint(generation, Stage.REVIEWER)
+    reloaded = dependencies.store.load().state
+
+    assert result.kind is StepKind.HUMAN_REVIEW
+    assert reloaded.review_manifest == persisted_manifest
+    assert reloaded.finalization_eligible is False
+    assert Stage.REVIEWER not in reloaded.checkpoints
+
+
+def test_stage_execution_rejects_arbitrary_lifecycle_updates() -> None:
+    """Fails if an executor can request a supervisor-owned disposition transition."""
+    with pytest.raises(TypeError):
+        StageExecution(
+            output_manifest_hash=digest("output"),
+            validator="test_validator",
+            validator_version="1",
+            validation_receipt_hash=digest("receipt"),
+            state_updates={"disposition": RunDisposition.HUMAN_REVIEW},
+        )
+
+
+def test_mcp_step_result_requires_the_action_run_binding() -> None:
+    """Fails if a correlated MCP action can target another run."""
+    action = McpActionRequest.create(
+        operation="query_repository",
+        entity="repository",
+        target="repo-1",
+        expected_external_revision=None,
+        run_id="run-2",
+        expected_revision=1,
+        expected_state_hash="a" * 64,
+        arguments={},
+    )
+
+    with pytest.raises(ValidationError, match="run"):
+        StepResult(
+            kind=StepKind.MCP_ACTION,
+            run_id="run-1",
+            state_revision=1,
+            state_hash="a" * 64,
+            request_id=action.request_id,
+            action=action,
+        )
+
+
+def test_unreconstructable_waiting_mcp_request_enters_persisted_human_review(dependencies: Dependencies) -> None:
+    """Fails if malformed pending MCP state returns an unpersisted synthetic result."""
+    state = approved_planning_state(dependencies.checkpoint_authority, dependencies.expectations)
+    generation = persist(dependencies.store, state)
+    pending = PendingExternalRequest(
+        request_id="request-1",
+        effect_id="effect-1",
+        request_hash="a" * 64,
+        operation="query_ticket_state",
+        expected_revision=generation.revision,
+        expected_state_hash=generation.state_hash,
+    )
+    waiting = generation.state.model_copy(
+        update={
+            "disposition": RunDisposition.WAITING_MCP,
+            "pending_external_request": pending,
+            "effect_ledger": (
+                EffectIntention(
+                    effect_id="effect-1",
+                    sequence=1,
+                    timestamp=datetime(2026, 9, 12, tzinfo=UTC),
+                    payload=EffectIntentionPayload(
+                        operation="query_ticket_state",
+                        target="ENG-1",
+                        request_hash="a" * 64,
+                    ),
+                ),
+            ),
+        }
+    )
+    waiting_generation = dependencies.store.compare_and_swap(generation.revision, generation.state_hash, waiting)
+
+    result = Supervisor(dependencies.as_supervisor_dependencies()).step(
+        waiting_generation.state.run_id,
+        waiting_generation.revision,
+        waiting_generation.state_hash,
+    )
+    reloaded = dependencies.store.load().state
+
+    assert result.kind is StepKind.HUMAN_REVIEW
+    assert result.failure is not None
+    assert result.failure.failure_class is FailureClass.ORCHESTRATION
+    assert result.failure.failure_source is FailureSource.SUPERVISOR
+    assert reloaded.disposition is RunDisposition.HUMAN_REVIEW
+    assert reloaded.failure_history[-1] == result.failure
 
 
 def test_step_cli_dispatches_a_cas_bound_json_result(
