@@ -9,12 +9,11 @@ import uuid
 
 from .contracts import RunnerIdentity, RunDisposition, Stage
 from .hashing import hash_json
-from .repair import InjectedCrash, RepairGuard, RepairRequest, RepairTicketOverlap, RepairWorkspaceHandle, UnauthorizedRepairError, is_automation_path
+from .repair import RepairGuard, RepairRequest, RepairTicketOverlap, RepairWorkspaceHandle, UnauthorizedRepairError, is_automation_path
 from .state import (
     _atomic_replace_json,
     _ensure_directory,
     _normalize_state_root,
-    _path_lstat,
     _read_canonical_json,
     _write_new_json,
     RunStateStore,
@@ -38,10 +37,6 @@ class RepairGit(Protocol):
 
 class RepairProcess(Protocol):
     def run(self, argv: tuple[str, ...], workspace: Path) -> object: ...
-
-
-class RepairActivationAuthority:
-    """Opaque launcher-owned capability; only identity equality grants activation."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,7 +128,6 @@ class RunnerRegistry:
         self.handles = _ensure_directory(self.root, self.root / "repair-workspace-handles")
         self.pointer_path = self.root / "runner-activation-pointer.json"
         self._crash_marker: str | None = None
-        self._repair_authority = RepairActivationAuthority()
 
     def crash_after(self, marker: str) -> None:
         self._crash_marker = marker
@@ -188,49 +182,6 @@ class RunnerRegistry:
             raise ValueError("activation receipt request hash is invalid")
         return receipt
 
-    def activate(self, request: RepairRequest) -> None:
-        """The active ticket runner has no activation capability."""
-        raise PermissionError("the active ticket runner cannot activate a repair")
-
-    def activate_once(
-        self,
-        request: RepairRequest,
-        new_runner_identity: RunnerIdentity,
-        *,
-        authority: RepairActivationAuthority,
-    ) -> RunnerActivationReceipt:
-        if authority is not self._repair_authority:
-            raise PermissionError("only the pinned repair runner may activate a runner")
-        path = self.activation_path(request.content_hash)
-        if _path_lstat(path, "runner activation receipt") is not None:
-            existing = self.lookup_activation(request.content_hash)
-            if existing.old_runner_identity != request.old_runner_identity or existing.new_runner_identity != new_runner_identity:
-                raise UnauthorizedRepairError("activation replay does not match its request")
-            return existing
-        receipt = RunnerActivationReceipt(
-            request_hash=request.content_hash,
-            old_runner_identity=request.old_runner_identity,
-            new_runner_identity=new_runner_identity,
-            old_contract_bundle_hash=request.old_runner_identity.contract_bundle_hash,
-            new_contract_bundle_hash=new_runner_identity.contract_bundle_hash,
-            # Without an identical bundle, no stage can be proven reusable from the
-            # request alone. Reconciliation therefore restarts at the first checkpoint.
-            compatible_checkpoint_stages=(
-                tuple(Stage)
-                if request.old_runner_identity.contract_bundle_hash == new_runner_identity.contract_bundle_hash
-                else ()
-            ),
-            contract_hashes=dict(request.contract_hashes),
-        )
-        if not _write_new_json(path, receipt.payload()):
-            return self.lookup_activation(request.content_hash)
-        _atomic_replace_json(self.pointer_path, {"request_hash": request.content_hash})
-        if self._crash_marker == "REGISTRY_POINTER_REPLACED":
-            self._crash_marker = None
-            raise InjectedCrash("injected crash after registry pointer replacement")
-        return receipt
-
-
 class RepairRunner:
     def __init__(
         self,
@@ -240,7 +191,7 @@ class RepairRunner:
         process: RepairProcess,
         registry: RunnerRegistry,
         repair_runner_identity: RunnerIdentity,
-        activation_authority: RepairActivationAuthority,
+        activate: Callable[[RepairRequest, RunnerIdentity], RunnerActivationReceipt],
         now: Callable[[], datetime] | None = None,
     ) -> None:
         self.worktree_factory = worktree_factory
@@ -248,7 +199,7 @@ class RepairRunner:
         self.process = process
         self.registry = registry
         self.repair_runner_identity = repair_runner_identity
-        self.activation_authority = activation_authority
+        self._activate = activate
         self.now = now or (lambda: datetime.now(UTC))
 
     def prepare_workspace(self, run_id: str, failure_hash: str, old_runner_identity: RunnerIdentity) -> RepairWorkspaceHandle:
@@ -305,7 +256,7 @@ class RepairRunner:
         if callable(require_success):
             require_success()
         runner = self._build_content_addressed_runner(request)
-        return self.registry.activate_once(request, runner, authority=self.activation_authority)
+        return self._activate(request, runner)
 
     def _build_content_addressed_runner(self, request: RepairRequest) -> RunnerIdentity:
         source_sha = self.git.source_hash(request.baseline.path)

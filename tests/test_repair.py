@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from dataclasses import replace
+import json
+import os
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from auto_code.checkpoint import CheckpointAuthority
 from auto_code.cli import TrustedRuntimeConfig, main as ticket_main
@@ -18,8 +21,9 @@ from auto_code.repair import (
     RepairTicketOverlap,
     UnauthorizedRepairError,
 )
-from auto_code.runner import RepairActivationAuthority, RepairRunner, RunnerRegistry, TrustedLauncher
+from auto_code.runner import RepairRunner, RunnerRegistry, TrustedLauncher
 from auto_code.state import EMPTY_STATE_HASH, RunStateStore
+from auto_code.hashing import canonical_json_bytes
 
 
 NOW = datetime(2026, 9, 12, tzinfo=UTC)
@@ -33,6 +37,30 @@ def identity(character: str, *, contract: str = "d") -> RunnerIdentity:
         contract_bundle_hash=contract * 64,
         built_at=NOW,
     )
+
+
+def repair_descriptor_payload(tmp_path: Path, *, expiry: str = "2030-01-01T00:00:00+00:00") -> dict[str, object]:
+    return {
+        "repair_runner_identity": identity("e").model_dump(mode="json"),
+        "registry_root": str(tmp_path / "registry"),
+        "state_root": str(tmp_path / "state"),
+        "repair_workspace_root": str(tmp_path / "repair-workspaces"),
+        "regression_command": ["pytest", "tests/test_repair.py"],
+        "expiry": expiry,
+        "nonce": "f" * 64,
+    }
+
+
+def signed_repair_descriptor(tmp_path: Path, *, expiry: str = "2030-01-01T00:00:00+00:00") -> bytes:
+    payload = repair_descriptor_payload(tmp_path, expiry=expiry)
+    signature = Ed25519PrivateKey.from_private_bytes(
+        bytes.fromhex("a5e8e70e8f786ccf0020ae4dcdbcf1a6b2d687e65c7a179ef23def7bfb6a02ad")
+    ).sign(canonical_json_bytes(payload)).hex()
+    return json.dumps({"payload": payload, "signature": signature}).encode("ascii")
+
+
+def protected_activation(registry: RunnerRegistry):
+    return repair_entrypoint._compose_activation(registry)
 
 
 class FakeWorktreeFactory:
@@ -83,7 +111,7 @@ def repair_launcher(tmp_path: Path) -> RepairRunner:
         process=FakeProcess(),
         registry=registry,
         repair_runner_identity=identity("e"),
-        activation_authority=registry._repair_authority,
+        activate=protected_activation(registry),
         now=lambda: NOW,
     )
 
@@ -138,7 +166,7 @@ def test_repair_rejects_unplanned_product_file(
         process=FakeProcess(),
         registry=registry,
         repair_runner_identity=identity("e"),
-        activation_authority=registry._repair_authority,
+        activate=protected_activation(registry),
         now=lambda: NOW,
     )
     request = repair_request(launcher, valid_repair_plan)
@@ -160,7 +188,7 @@ def test_repair_rejects_path_owned_by_same_repository_ticket(
         process=FakeProcess(),
         registry=registry,
         repair_runner_identity=identity("e"),
-        activation_authority=registry._repair_authority,
+        activate=protected_activation(registry),
         now=lambda: NOW,
     )
     workspace = launcher.prepare_workspace("run-1", "f" * 64, identity("a"))
@@ -191,13 +219,11 @@ def test_active_runner_cannot_activate_itself(tmp_path: Path, valid_repair_plan:
         process=FakeProcess(),
         registry=registry,
         repair_runner_identity=identity("e"),
-        activation_authority=registry._repair_authority,
+        activate=protected_activation(registry),
         now=lambda: NOW,
     )
-    request = repair_request(launcher, valid_repair_plan)
-
-    with pytest.raises(PermissionError):
-        registry.activate(request)
+    assert launcher.registry is registry
+    assert not hasattr(registry, "activate")
 
 
 def test_activation_revalidates_contracts_before_restart(
@@ -213,7 +239,7 @@ def test_activation_revalidates_contracts_before_restart(
         process=FakeProcess(),
         registry=registry,
         repair_runner_identity=identity("e"),
-        activation_authority=registry._repair_authority,
+        activate=protected_activation(registry),
         now=lambda: NOW,
     )
     authority = CheckpointAuthority(tmp_path / "state")
@@ -281,7 +307,7 @@ def test_crash_after_registry_activation_recovers_receipt(
         process=FakeProcess(),
         registry=registry,
         repair_runner_identity=identity("e"),
-        activation_authority=registry._repair_authority,
+        activate=protected_activation(registry),
         now=lambda: NOW,
     )
     store = RunStateStore(tmp_path / "state", "run-1")
@@ -364,7 +390,7 @@ def test_protected_repair_entrypoint_dispatches_only_the_selected_operation() ->
     assert calls == [("run-1", "a" * 64)]
 
 
-def test_registry_rejects_a_forged_activation_authority(
+def test_registry_has_no_ticket_facing_activation_api(
     tmp_path: Path,
     valid_repair_plan: RepairPlan,
 ) -> None:
@@ -376,13 +402,13 @@ def test_registry_rejects_a_forged_activation_authority(
         process=FakeProcess(),
         registry=registry,
         repair_runner_identity=identity("e"),
-        activation_authority=registry._repair_authority,
+        activate=protected_activation(registry),
         now=lambda: NOW,
     )
-    request = repair_request(launcher, valid_repair_plan)
-
-    with pytest.raises(PermissionError):
-        registry.activate_once(request, identity("b"), authority=RepairActivationAuthority())
+    assert launcher.registry is registry
+    assert not hasattr(registry, "activate")
+    assert not hasattr(registry, "activate_once")
+    assert not hasattr(registry, "_activate_once")
 
 
 def test_restarted_repair_runner_rejects_an_unissued_workspace_handle(
@@ -397,7 +423,7 @@ def test_restarted_repair_runner_rejects_an_unissued_workspace_handle(
         process=FakeProcess(),
         registry=registry,
         repair_runner_identity=identity("e"),
-        activation_authority=registry._repair_authority,
+        activate=protected_activation(registry),
         now=lambda: NOW,
     )
     request = repair_request(launcher, valid_repair_plan)
@@ -412,3 +438,88 @@ def test_restarted_repair_runner_rejects_an_unissued_workspace_handle(
 
     with pytest.raises(UnauthorizedRepairError, match="issued"):
         launcher.validate_build_activate(replace(request, baseline=forged))
+
+
+def test_installed_entrypoint_composes_a_protected_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Leaving the installed command callback-only would make protected repair unavailable."""
+    calls: list[tuple[str, str]] = []
+
+    class Runtime:
+        def prepare(self, run_id: str, failure_hash: str) -> None:
+            calls.append((run_id, failure_hash))
+
+        def apply(self, workspace: str, request_hash: str) -> None:
+            raise AssertionError("apply was not requested")
+
+    monkeypatch.setattr(repair_entrypoint, "load_protected_runtime", lambda: Runtime())
+
+    assert repair_entrypoint.main(["prepare", "--run", "run-1", "--failure", "a" * 64]) == 0
+    assert calls == [("run-1", "a" * 64)]
+
+
+def test_protected_repair_runtime_requires_a_signed_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Falling back to an environment or unsigned config would expose repair authority."""
+    descriptor_path = tmp_path / "repair-runtime.json"
+    descriptor_path.write_bytes(json.dumps(repair_descriptor_payload(tmp_path)).encode("ascii"))
+    descriptor = os.open(descriptor_path, os.O_RDONLY)
+    try:
+        monkeypatch.setattr(repair_entrypoint, "_REPAIR_DESCRIPTOR_FD", descriptor)
+
+        with pytest.raises(repair_entrypoint.RepairRuntimeConfigurationError, match="descriptor is invalid"):
+            repair_entrypoint.load_protected_runtime()
+    finally:
+        os.close(descriptor)
+
+
+def test_protected_repair_runtime_loads_a_valid_signed_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The protected executable receives its complete authority only from its descriptor."""
+    descriptor_path = tmp_path / "repair-runtime.json"
+    descriptor_path.write_bytes(signed_repair_descriptor(tmp_path))
+    descriptor = os.open(descriptor_path, os.O_RDONLY)
+    try:
+        monkeypatch.setattr(repair_entrypoint, "_REPAIR_DESCRIPTOR_FD", descriptor)
+
+        runtime = repair_entrypoint.load_protected_runtime()
+    finally:
+        os.close(descriptor)
+
+    assert runtime.descriptor.registry_root == tmp_path / "registry"
+    assert runtime.descriptor.regression_command == ("pytest", "tests/test_repair.py")
+
+
+def test_protected_repair_runtime_rejects_a_forged_or_expired_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A repaired runner must not accept descriptor substitution or replay."""
+    descriptor_path = tmp_path / "repair-runtime.json"
+    payload = repair_descriptor_payload(tmp_path)
+    descriptor_path.write_bytes(
+        json.dumps({"payload": payload, "signature": "0" * 128}).encode("ascii")
+    )
+    descriptor = os.open(descriptor_path, os.O_RDONLY)
+    try:
+        monkeypatch.setattr(repair_entrypoint, "_REPAIR_DESCRIPTOR_FD", descriptor)
+
+        with pytest.raises(repair_entrypoint.RepairRuntimeConfigurationError, match="descriptor is invalid"):
+            repair_entrypoint.load_protected_runtime()
+    finally:
+        os.close(descriptor)
+
+    descriptor_path.write_bytes(signed_repair_descriptor(tmp_path, expiry="2020-01-01T00:00:00+00:00"))
+    descriptor = os.open(descriptor_path, os.O_RDONLY)
+    try:
+        monkeypatch.setattr(repair_entrypoint, "_REPAIR_DESCRIPTOR_FD", descriptor)
+
+        with pytest.raises(repair_entrypoint.RepairRuntimeConfigurationError, match="descriptor is invalid"):
+            repair_entrypoint.load_protected_runtime()
+    finally:
+        os.close(descriptor)
