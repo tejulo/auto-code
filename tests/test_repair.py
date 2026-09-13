@@ -571,6 +571,7 @@ class FakeActivationSigner:
 class FakeProtectedRepairService:
     def __init__(self) -> None:
         self.request_hash: str | None = None
+        self.crash_after_receipt = False
 
     def require_prepare(self, generation: object, failure_hash: str) -> None:
         return None
@@ -604,33 +605,73 @@ class FakeProtectedRepairService:
         pending: PendingRunnerActivation,
         receipt: RunnerActivationReceipt,
         journal: RepairJournal,
-    ) -> RunnerActivationReceipt:
+    ) -> runner_module.RunnerActivationPublication:
         from auto_code.state import _atomic_replace_json, _write_new_json
 
         path = registry.activation_path(receipt.request_hash)
         if not _write_new_json(path, receipt.payload()):
             receipt = registry.lookup_activation(receipt.request_hash)
-        _atomic_replace_json(
-            registry.pointer_path,
-            {
-                "request_hash": receipt.request_hash,
-                "receipt_hash": receipt.content_hash,
-                "runner_identity": receipt.new_runner_identity.model_dump(mode="json", round_trip=True),
-            },
+        if self.crash_after_receipt:
+            self.crash_after_receipt = False
+            raise InjectedCrash("injected crash after activation receipt")
+        if registry.pointer_path.exists():
+            previous = json.loads(registry.pointer_path.read_text(encoding="utf-8"))
+            current_receipt = registry.current_activation()
+            if current_receipt == receipt:
+                pointer = previous
+            elif current_receipt.new_runner_identity != pending.old_runner_identity:
+                raise PermissionError("runner activation pointer does not match expected old runner")
+            else:
+                pointer = runner_module.activation_pointer_payload(
+                    receipt,
+                    generation=previous["generation"] + 1,
+                    previous_pointer_hash=hash_json(previous),
+                    registry_root_hash=registry.root_hash,
+                    registry_identity_hash=registry.identity_hash,
+                    nonce="5" * 64,
+                )
+        else:
+            pointer = runner_module.activation_pointer_payload(
+                receipt,
+                generation=1,
+                previous_pointer_hash=runner_module._EMPTY_ACTIVATION_POINTER_HASH,
+                registry_root_hash=registry.root_hash,
+                registry_identity_hash=registry.identity_hash,
+                nonce="5" * 64,
+            )
+        _atomic_replace_json(registry.pointer_path, pointer)
+        return runner_module.RunnerActivationPublication(
+            receipt=receipt,
+            registry_root_hash=registry.root_hash,
+            registry_identity_hash=registry.identity_hash,
+            pointer_generation=pointer["generation"],
+            previous_pointer_hash=pointer["previous_pointer_hash"],
+            pointer_hash=hash_json(pointer),
+            nonce=pointer["nonce"],
         )
-        return receipt
 
 
 class RepairHarness:
-    def __init__(self, tmp_path: Path, *, same_repository: bool = False) -> None:
+    def __init__(
+        self,
+        tmp_path: Path,
+        *,
+        same_repository: bool = False,
+        ticket_manifest: ProductChangeManifest | None = None,
+        registry_root: Path | None = None,
+    ) -> None:
         self.state_root = tmp_path / "state"
+        self.product_manifest = ticket_manifest or product_manifest()
         self.activation_private_key = Ed25519PrivateKey.generate()
         activation_public_key = self.activation_private_key.public_key().public_bytes(
             encoding=serialization.Encoding.Raw,
             format=serialization.PublicFormat.Raw,
         )
         self.activation_signer = FakeActivationSigner(self.activation_private_key)
-        self.registry = RunnerRegistry(self.state_root, repair_runner_identity=identity("e", repair=True))
+        self.registry = RunnerRegistry(
+            self.state_root if registry_root is None else registry_root,
+            repair_runner_identity=identity("e", repair=True),
+        )
         self.store = RunStateStore(self.state_root, "run-1")
         initial = self.store.compare_and_swap(
             0,
@@ -645,7 +686,7 @@ class RepairHarness:
                 update={
                     "disposition": RunDisposition.REPAIR_REQUIRED,
                     "product_change_manifest": "manifests/product.json",
-                    "product_change_manifest_hash": product_manifest().content_hash,
+                    "product_change_manifest_hash": self.product_manifest.content_hash,
                     "failure_history": (self.failure,),
                 }
             ),
@@ -682,7 +723,7 @@ class RepairHarness:
         self.coordinator = RepairRequestCoordinator(
             self.store,
             load_workspace_handle=self.registry.load_workspace_handle,
-            load_product_manifest=lambda _: product_manifest(),
+            load_product_manifest=lambda _: self.product_manifest,
             repair_repository_id="repo-1" if same_repository else "repair-repo",
         )
 
@@ -736,6 +777,38 @@ def activation_receipt(request_hash: str, old: RunnerIdentity, new: RunnerIdenti
         contract_hashes={},
         activation_public_key_hash="a" * 64,
         signature="0" * 128,
+    )
+
+
+def signed_selection_proof(
+    receipt: RunnerActivationReceipt,
+    registry: RunnerRegistry,
+    private_key: Ed25519PrivateKey,
+) -> runner_module.RunnerActivationSelectionProof:
+    pointer = runner_module.activation_pointer_payload(
+        receipt,
+        generation=1,
+        previous_pointer_hash=runner_module._EMPTY_ACTIVATION_POINTER_HASH,
+        registry_root_hash=registry.root_hash,
+        registry_identity_hash=registry.identity_hash,
+        nonce="5" * 64,
+    )
+    publication = runner_module.RunnerActivationPublication(
+        receipt=receipt,
+        registry_root_hash=registry.root_hash,
+        registry_identity_hash=registry.identity_hash,
+        pointer_generation=pointer["generation"],
+        previous_pointer_hash=pointer["previous_pointer_hash"],
+        pointer_hash=hash_json(pointer),
+        nonce=pointer["nonce"],
+    )
+    unsigned = runner_module.RunnerActivationSelectionProof.unsigned(
+        publication,
+        receipt.activation_public_key_hash,
+    )
+    return replace(
+        unsigned,
+        signature=private_key.sign(canonical_json_bytes(unsigned.signed_payload())).hex(),
     )
 
 
@@ -1229,6 +1302,46 @@ def test_runner_rejects_same_repository_ticket_overlap_before_regression(tmp_pat
     request = harness.request()
     with pytest.raises(RepairTicketOverlap):
         harness.runner.validate_regress_build(request)
+    assert harness.regression.calls == 0
+    assert harness.builder.calls == 0
+
+
+@pytest.mark.parametrize(
+    "repair_path",
+    ("src/auto_code/runner.py", "src/auto_code/repaired.py"),
+)
+def test_both_ticket_rename_endpoints_are_owned_and_block_repair(
+    tmp_path: Path,
+    repair_path: str,
+) -> None:
+    manifest = ProductChangeManifest.from_files(
+        "a" * 40,
+        (
+            ProductChangeFile(
+                path="src/auto_code/repaired.py",
+                status="R100",
+                old_path="src/auto_code/runner.py",
+                old_mode="100644",
+                mode="100644",
+                old_object_id="b" * 40,
+                object_id="c" * 40,
+                binary=False,
+                untracked=False,
+            ),
+        ),
+    )
+    harness = RepairHarness(tmp_path, same_repository=True, ticket_manifest=manifest)
+    harness.plan = replace(harness.plan, files=(repair_path,))
+    harness.plan_path.write_bytes(canonical_json_bytes(harness.plan.payload()))
+    request = harness.request()
+
+    assert request.ticket_owned_paths == (
+        "src/auto_code/repaired.py",
+        "src/auto_code/runner.py",
+    )
+    with pytest.raises(RepairTicketOverlap):
+        harness.runner.validate_regress_build(request)
+
     assert harness.regression.calls == 0
     assert harness.builder.calls == 0
 
@@ -1837,6 +1950,113 @@ def test_recovery_after_pointer_publication_completes_the_exact_state_transition
     assert calls == ["terminate", "start", "attest"]
 
 
+def test_activation_receipt_written_before_pointer_cas_cannot_authorize_active_state(tmp_path: Path) -> None:
+    harness = RepairHarness(tmp_path)
+    request = harness.request()
+    harness.runner.validate_regress_build(request)
+    calls: list[str] = []
+    launcher = TrustedLauncher(
+        harness.store,
+        harness.registry,
+        repair_service=harness.repair_service,
+        activation_signer=harness.activation_signer,
+        terminate_old_runner=FakeLifecycleEffect("terminate", calls),
+        start_new_runner=FakeLifecycleEffect("start", calls),
+        attest_new_runner=FakeLifecycleEffect("attest", calls),
+    )
+    harness.repair_service.crash_after_receipt = True
+
+    with pytest.raises(InjectedCrash, match="activation receipt"):
+        launcher.reconcile_activation("run-1", request.content_hash)
+
+    receipt = harness.registry.lookup_activation(request.content_hash)
+    assert not harness.registry.pointer_path.exists()
+    current = harness.store.load()
+    assert current.state.disposition is RunDisposition.REPAIR_REQUIRED
+    with pytest.raises(InvalidStateTransition, match="repair activation"):
+        harness.store.compare_and_swap(
+            current.revision,
+            current.state_hash,
+            current.state.model_copy(
+                update={
+                    "disposition": RunDisposition.ACTIVE,
+                    "runner_identity": receipt.new_runner_identity,
+                    "restart_receipt_hash": receipt.content_hash,
+                    "restart_receipt_request_hash": receipt.request_hash,
+                }
+            ),
+        )
+
+    generation = launcher.reconcile_activation("run-1", request.content_hash)
+    assert generation.state.disposition is RunDisposition.ACTIVE
+    assert generation.state.repair_activation_selection_proof is not None
+
+
+def test_activation_state_contains_self_contained_selection_evidence_across_distinct_roots(
+    tmp_path: Path,
+) -> None:
+    registry_root = tmp_path / "registry"
+    harness = RepairHarness(tmp_path, registry_root=registry_root)
+    request = harness.request()
+    harness.runner.validate_regress_build(request)
+    calls: list[str] = []
+    launcher = TrustedLauncher(
+        harness.store,
+        harness.registry,
+        repair_service=harness.repair_service,
+        activation_signer=harness.activation_signer,
+        terminate_old_runner=FakeLifecycleEffect("terminate", calls),
+        start_new_runner=FakeLifecycleEffect("start", calls),
+        attest_new_runner=FakeLifecycleEffect("attest", calls),
+    )
+
+    generation = launcher.reconcile_activation("run-1", request.content_hash)
+
+    assert generation.state.disposition is RunDisposition.ACTIVE
+    assert generation.state.repair_activation_receipt == canonical_json_bytes(
+        harness.registry.current_activation().payload()
+    ).decode("ascii")
+    assert generation.state.repair_activation_selection_proof is not None
+    assert not (harness.state_root / "runner-activations").exists()
+
+
+def test_selection_proof_signature_binds_registry_pointer_and_transition(tmp_path: Path) -> None:
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    unsigned_receipt = replace(
+        activation_receipt("1" * 64, identity("a"), identity("b")),
+        activation_public_key_hash=sha256(public_key).hexdigest(),
+        signature="0" * 128,
+    )
+    receipt = replace(
+        unsigned_receipt,
+        signature=private_key.sign(canonical_json_bytes(unsigned_receipt.signed_payload())).hex(),
+    )
+    registry = RunnerRegistry(tmp_path / "registry", repair_runner_identity=identity("e", repair=True))
+    proof = signed_selection_proof(receipt, registry, private_key)
+
+    proof.verify_signature(public_key)
+    payload = proof.signed_payload()
+    assert payload["domain"] == "auto-code-runner-registry-selection/v1"
+    assert payload["registry_root_hash"] == registry.root_hash
+    assert payload["registry_identity_hash"] == registry.identity_hash
+    assert payload["pointer_generation"] == 1
+    assert payload["previous_pointer_hash"] == runner_module._EMPTY_ACTIVATION_POINTER_HASH
+    assert payload["pointer_hash"] == hash_json(proof.pointer_payload())
+    assert payload["activation_receipt_hash"] == receipt.content_hash
+    assert payload["run_id"] == receipt.run_id
+    assert payload["expected_revision"] == receipt.expected_revision
+    assert payload["expected_state_hash"] == receipt.expected_state_hash
+    assert payload["failure_hash"] == receipt.failure_hash
+    assert payload["old_runner_identity"] == receipt.old_runner_identity.model_dump(mode="json", round_trip=True)
+    assert payload["new_runner_identity"] == receipt.new_runner_identity.model_dump(mode="json", round_trip=True)
+    assert payload["nonce"] == "5" * 64
+    assert payload["request_hash"] == receipt.request_hash
+
+
 def test_protected_runtime_exposes_no_unbound_capability_injection(tmp_path: Path) -> None:
     descriptor = repair_entrypoint.RepairRuntimeDescriptor.from_payload(
         descriptor_payload(tmp_path, issued_at=NOW), now=NOW
@@ -2016,15 +2236,16 @@ def test_state_transition_verifies_activation_with_the_old_state_pinned_key(tmp_
         unsigned,
         signature=private_key.sign(canonical_json_bytes(unsigned.signed_payload())).hex(),
     )
-    receipts = tmp_path / "runner-activations"
-    receipts.mkdir()
-    assert _write_new_json(receipts / f"{receipt.request_hash}.json", receipt.payload())
+    registry = RunnerRegistry(tmp_path / "registry", repair_runner_identity=identity("e", repair=True))
+    proof = signed_selection_proof(receipt, registry, private_key)
     activated = repair.state.model_copy(
         update={
             "disposition": RunDisposition.ACTIVE,
             "runner_identity": receipt.new_runner_identity,
             "restart_receipt_hash": receipt.content_hash,
             "restart_receipt_request_hash": receipt.request_hash,
+            "repair_activation_receipt": canonical_json_bytes(receipt.payload()).decode("ascii"),
+            "repair_activation_selection_proof": canonical_json_bytes(proof.payload()).decode("ascii"),
         }
     )
 
@@ -2040,8 +2261,6 @@ def test_state_transition_verifies_activation_with_the_old_state_pinned_key(tmp_
             update={"disposition": RunDisposition.REPAIR_REQUIRED, "failure_history": (failure,)}
         ),
     )
-    forged_receipts = forged_store.root / "runner-activations"
-    forged_receipts.mkdir()
     forged = replace(
         receipt,
         expected_revision=forged_repair.revision,
@@ -2049,7 +2268,7 @@ def test_state_transition_verifies_activation_with_the_old_state_pinned_key(tmp_
     )
     attacker = Ed25519PrivateKey.generate()
     forged = replace(forged, signature=attacker.sign(canonical_json_bytes(forged.signed_payload())).hex())
-    assert _write_new_json(forged_receipts / f"{forged.request_hash}.json", forged.payload())
+    forged_proof = signed_selection_proof(forged, registry, attacker)
     with pytest.raises(InvalidStateTransition, match="repair activation"):
         forged_store.compare_and_swap(
             forged_repair.revision,
@@ -2060,6 +2279,8 @@ def test_state_transition_verifies_activation_with_the_old_state_pinned_key(tmp_
                     "runner_identity": forged.new_runner_identity,
                     "restart_receipt_hash": forged.content_hash,
                     "restart_receipt_request_hash": forged.request_hash,
+                    "repair_activation_receipt": canonical_json_bytes(forged.payload()).decode("ascii"),
+                    "repair_activation_selection_proof": canonical_json_bytes(forged_proof.payload()).decode("ascii"),
                 }
             ),
         )
@@ -2334,6 +2555,13 @@ def test_installed_protected_apply_builds_reconciles_and_activates_from_descript
     receipt = harness.registry.current_activation()
     assert receipt.release_root.is_relative_to(tmp_path / "runner-releases")
     assert receipt.release_manifest
+    assert generation.state.repair_activation_selection_proof is not None
+    selection_proof = runner_module.RunnerActivationSelectionProof.from_payload(
+        json.loads(generation.state.repair_activation_selection_proof)
+    )
+    assert selection_proof.nonce == "f" * 64
+    assert selection_proof.registry_root_hash == harness.registry.root_hash
+    assert selection_proof.registry_identity_hash == harness.registry.identity_hash
     assert observed_build == {
         "workspace": tmp_path / "repair-source-snapshots" / next(
             request["effect_id"]

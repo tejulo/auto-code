@@ -716,7 +716,7 @@ class RunStateStore:
     def _verify_repair_activation(self, previous: StateGeneration, state: RunState) -> None:
         error = "repair activation transition is not verified"
         try:
-            from .runner import RunnerActivationReceipt
+            from .runner import RunnerActivationReceipt, RunnerActivationSelectionProof
 
             old = previous.state
             request_hash = state.restart_receipt_request_hash
@@ -725,6 +725,8 @@ class RunStateStore:
                 or old.repair_activation_public_key_hash is None
                 or request_hash is None
                 or state.restart_receipt_hash is None
+                or state.repair_activation_receipt is None
+                or state.repair_activation_selection_proof is None
                 or old.runner_identity is None
                 or state.runner_identity is None
                 or not old.failure_history
@@ -733,13 +735,17 @@ class RunStateStore:
             public_key = bytes.fromhex(old.repair_activation_public_key)
             if hashlib.sha256(public_key).hexdigest() != old.repair_activation_public_key_hash:
                 raise ValueError
-            receipt = RunnerActivationReceipt.from_payload(
-                _read_canonical_json(
-                    self.root / "runner-activations" / f"{_require_sha256(request_hash, 'repair request')}.json",
-                    "runner activation receipt",
-                )
-            )
+            receipt_payload = json.loads(state.repair_activation_receipt)
+            proof_payload = json.loads(state.repair_activation_selection_proof)
+            if (
+                canonical_json_bytes(receipt_payload).decode("ascii") != state.repair_activation_receipt
+                or canonical_json_bytes(proof_payload).decode("ascii") != state.repair_activation_selection_proof
+            ):
+                raise ValueError
+            receipt = RunnerActivationReceipt.from_payload(receipt_payload)
+            proof = RunnerActivationSelectionProof.from_payload(proof_payload)
             receipt.verify_signature(public_key)
+            proof.verify_signature(public_key)
             failure_hash = hash_json(
                 old.failure_history[-1].model_dump(mode="json", round_trip=True)
             )
@@ -754,6 +760,15 @@ class RunStateStore:
                 or receipt.new_runner_identity != state.runner_identity
                 or receipt.project_policy_hash != old.project_policy_hash
                 or receipt.activation_public_key_hash != old.repair_activation_public_key_hash
+                or proof.activation_public_key_hash != old.repair_activation_public_key_hash
+                or proof.activation_receipt_hash != receipt.content_hash
+                or proof.request_hash != receipt.request_hash
+                or proof.run_id != receipt.run_id
+                or proof.expected_revision != receipt.expected_revision
+                or proof.expected_state_hash != receipt.expected_state_hash
+                or proof.failure_hash != receipt.failure_hash
+                or proof.old_runner_identity != receipt.old_runner_identity
+                or proof.new_runner_identity != receipt.new_runner_identity
             ):
                 raise ValueError
         except Exception:

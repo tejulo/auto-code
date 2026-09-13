@@ -105,6 +105,17 @@ class ActivationSigner(Protocol):
     def sign(self, payload: bytes, public_key_hash: str) -> str: ...
 
 
+class ActivationPointerReceipt(Protocol):
+    request_hash: str
+    content_hash: str
+    run_id: str
+    expected_revision: int
+    expected_state_hash: str
+    failure_hash: str
+    old_runner_identity: RunnerIdentity
+    new_runner_identity: RunnerIdentity
+
+
 class ProtectedRepairService(Protocol):
     """OS-capability service supplied only by the verified repair entrypoint."""
 
@@ -132,7 +143,7 @@ class ProtectedRepairService(Protocol):
         pending: PendingRunnerActivation,
         receipt: RunnerActivationReceipt,
         journal: RepairJournal,
-    ) -> RunnerActivationReceipt: ...
+    ) -> RunnerActivationPublication: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -766,6 +777,249 @@ class RunnerActivationReceipt:
             raise ValueError("activation receipt is invalid") from None
 
 
+_EMPTY_ACTIVATION_POINTER_HASH = hash_json({"domain": "auto-code-runner-activation-pointer-empty/v1"})
+
+
+def activation_pointer_payload(
+    receipt: ActivationPointerReceipt,
+    *,
+    generation: int,
+    previous_pointer_hash: str,
+    registry_root_hash: str,
+    registry_identity_hash: str,
+    nonce: str,
+) -> dict[str, object]:
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+        raise ValueError("runner activation pointer generation is invalid")
+    previous_pointer_hash = _require_hash(previous_pointer_hash, "previous activation pointer")
+    if (generation == 1) != (previous_pointer_hash == _EMPTY_ACTIVATION_POINTER_HASH):
+        raise ValueError("runner activation pointer predecessor is invalid")
+    return {
+        "schema_version": 1,
+        "generation": generation,
+        "previous_pointer_hash": previous_pointer_hash,
+        "registry_root_hash": _require_hash(registry_root_hash, "registry root"),
+        "registry_identity_hash": _require_hash(registry_identity_hash, "registry identity"),
+        "nonce": _require_hash(nonce, "repair nonce"),
+        "request_hash": receipt.request_hash,
+        "receipt_hash": receipt.content_hash,
+        "run_id": receipt.run_id,
+        "expected_revision": receipt.expected_revision,
+        "expected_state_hash": receipt.expected_state_hash,
+        "failure_hash": receipt.failure_hash,
+        "old_runner_identity": receipt.old_runner_identity.model_dump(mode="json", round_trip=True),
+        "runner_identity": receipt.new_runner_identity.model_dump(mode="json", round_trip=True),
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class RunnerActivationPublication:
+    receipt: RunnerActivationReceipt
+    registry_root_hash: str
+    registry_identity_hash: str
+    pointer_generation: int
+    previous_pointer_hash: str
+    pointer_hash: str
+    nonce: str
+
+    def __post_init__(self) -> None:
+        for value, description in (
+            (self.registry_root_hash, "registry root"),
+            (self.registry_identity_hash, "registry identity"),
+            (self.previous_pointer_hash, "previous activation pointer"),
+            (self.pointer_hash, "activation pointer"),
+            (self.nonce, "repair nonce"),
+        ):
+            _require_hash(value, description)
+        if self.pointer_hash != hash_json(self.pointer_payload()):
+            raise ValueError("activation publication pointer hash is invalid")
+
+    def pointer_payload(self) -> dict[str, object]:
+        return activation_pointer_payload(
+            self.receipt,
+            generation=self.pointer_generation,
+            previous_pointer_hash=self.previous_pointer_hash,
+            registry_root_hash=self.registry_root_hash,
+            registry_identity_hash=self.registry_identity_hash,
+            nonce=self.nonce,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RunnerActivationSelectionProof:
+    registry_root_hash: str
+    registry_identity_hash: str
+    pointer_generation: int
+    previous_pointer_hash: str
+    pointer_hash: str
+    activation_receipt_hash: str
+    run_id: str
+    expected_revision: int
+    expected_state_hash: str
+    failure_hash: str
+    old_runner_identity: RunnerIdentity
+    new_runner_identity: RunnerIdentity
+    nonce: str
+    request_hash: str
+    activation_public_key_hash: str
+    signature: str
+
+    def __post_init__(self) -> None:
+        _require_identifier(self.run_id, "selection proof run ID")
+        if (
+            not isinstance(self.expected_revision, int)
+            or isinstance(self.expected_revision, bool)
+            or self.expected_revision < 1
+        ):
+            raise ValueError("selection proof revision is invalid")
+        for value, description in (
+            (self.registry_root_hash, "registry root"),
+            (self.registry_identity_hash, "registry identity"),
+            (self.previous_pointer_hash, "previous activation pointer"),
+            (self.pointer_hash, "activation pointer"),
+            (self.activation_receipt_hash, "activation receipt"),
+            (self.expected_state_hash, "expected state"),
+            (self.failure_hash, "repair failure"),
+            (self.nonce, "repair nonce"),
+            (self.request_hash, "repair request"),
+            (self.activation_public_key_hash, "activation public key"),
+        ):
+            _require_hash(value, description)
+        if (
+            not isinstance(self.signature, str)
+            or len(self.signature) != 128
+            or any(character not in "0123456789abcdef" for character in self.signature)
+        ):
+            raise ValueError("selection proof signature is invalid")
+        if self.pointer_hash != hash_json(self.pointer_payload()):
+            raise ValueError("selection proof pointer hash is invalid")
+
+    @classmethod
+    def unsigned(cls, publication: RunnerActivationPublication, public_key_hash: str) -> RunnerActivationSelectionProof:
+        receipt = publication.receipt
+        return cls(
+            registry_root_hash=publication.registry_root_hash,
+            registry_identity_hash=publication.registry_identity_hash,
+            pointer_generation=publication.pointer_generation,
+            previous_pointer_hash=publication.previous_pointer_hash,
+            pointer_hash=publication.pointer_hash,
+            activation_receipt_hash=receipt.content_hash,
+            run_id=receipt.run_id,
+            expected_revision=receipt.expected_revision,
+            expected_state_hash=receipt.expected_state_hash,
+            failure_hash=receipt.failure_hash,
+            old_runner_identity=receipt.old_runner_identity,
+            new_runner_identity=receipt.new_runner_identity,
+            nonce=publication.nonce,
+            request_hash=receipt.request_hash,
+            activation_public_key_hash=public_key_hash,
+            signature="0" * 128,
+        )
+
+    def pointer_payload(self) -> dict[str, object]:
+        return activation_pointer_payload(
+            _SelectionReceiptProjection(
+                request_hash=self.request_hash,
+                content_hash=self.activation_receipt_hash,
+                run_id=self.run_id,
+                expected_revision=self.expected_revision,
+                expected_state_hash=self.expected_state_hash,
+                failure_hash=self.failure_hash,
+                old_runner_identity=self.old_runner_identity,
+                new_runner_identity=self.new_runner_identity,
+            ),
+            generation=self.pointer_generation,
+            previous_pointer_hash=self.previous_pointer_hash,
+            registry_root_hash=self.registry_root_hash,
+            registry_identity_hash=self.registry_identity_hash,
+            nonce=self.nonce,
+        )
+
+    def signed_payload(self) -> dict[str, object]:
+        return {"domain": "auto-code-runner-registry-selection/v1", **self.payload(include_signature=False)}
+
+    def verify_signature(self, public_key: bytes) -> None:
+        if (
+            not isinstance(public_key, bytes)
+            or len(public_key) != 32
+            or hashlib.sha256(public_key).hexdigest() != self.activation_public_key_hash
+        ):
+            raise UnauthorizedRepairError("selection proof trust binding is invalid")
+        try:
+            Ed25519PublicKey.from_public_bytes(public_key).verify(
+                bytes.fromhex(self.signature),
+                canonical_json_bytes(self.signed_payload()),
+            )
+        except (InvalidSignature, ValueError):
+            raise UnauthorizedRepairError("selection proof signature is invalid") from None
+
+    def payload(self, *, include_signature: bool = True) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "registry_root_hash": self.registry_root_hash,
+            "registry_identity_hash": self.registry_identity_hash,
+            "pointer_generation": self.pointer_generation,
+            "previous_pointer_hash": self.previous_pointer_hash,
+            "pointer_hash": self.pointer_hash,
+            "activation_receipt_hash": self.activation_receipt_hash,
+            "run_id": self.run_id,
+            "expected_revision": self.expected_revision,
+            "expected_state_hash": self.expected_state_hash,
+            "failure_hash": self.failure_hash,
+            "old_runner_identity": self.old_runner_identity.model_dump(mode="json", round_trip=True),
+            "new_runner_identity": self.new_runner_identity.model_dump(mode="json", round_trip=True),
+            "nonce": self.nonce,
+            "request_hash": self.request_hash,
+            "activation_public_key_hash": self.activation_public_key_hash,
+        }
+        if include_signature:
+            payload["signature"] = self.signature
+        return payload
+
+    @classmethod
+    def from_payload(cls, payload: object) -> RunnerActivationSelectionProof:
+        expected = {
+            "registry_root_hash", "registry_identity_hash", "pointer_generation", "previous_pointer_hash",
+            "pointer_hash", "activation_receipt_hash", "run_id", "expected_revision", "expected_state_hash",
+            "failure_hash", "old_runner_identity", "new_runner_identity", "nonce", "request_hash",
+            "activation_public_key_hash", "signature",
+        }
+        if not isinstance(payload, dict) or set(payload) != expected:
+            raise ValueError("selection proof is invalid")
+        try:
+            return cls(
+                registry_root_hash=payload["registry_root_hash"],
+                registry_identity_hash=payload["registry_identity_hash"],
+                pointer_generation=payload["pointer_generation"],
+                previous_pointer_hash=payload["previous_pointer_hash"],
+                pointer_hash=payload["pointer_hash"],
+                activation_receipt_hash=payload["activation_receipt_hash"],
+                run_id=payload["run_id"],
+                expected_revision=payload["expected_revision"],
+                expected_state_hash=payload["expected_state_hash"],
+                failure_hash=payload["failure_hash"],
+                old_runner_identity=RunnerIdentity.model_validate(payload["old_runner_identity"]),
+                new_runner_identity=RunnerIdentity.model_validate(payload["new_runner_identity"]),
+                nonce=payload["nonce"],
+                request_hash=payload["request_hash"],
+                activation_public_key_hash=payload["activation_public_key_hash"],
+                signature=payload["signature"],
+            )
+        except (TypeError, ValueError):
+            raise ValueError("selection proof is invalid") from None
+
+
+@dataclass(frozen=True, slots=True)
+class _SelectionReceiptProjection:
+    request_hash: str
+    content_hash: str
+    run_id: str
+    expected_revision: int
+    expected_state_hash: str
+    failure_hash: str
+    old_runner_identity: RunnerIdentity
+    new_runner_identity: RunnerIdentity
+
+
 class RunnerRegistry:
     """Protected activation store with a serialized expected-old pointer CAS."""
 
@@ -778,6 +1032,17 @@ class RunnerRegistry:
         locks = _ensure_directory(self.root, self.root / "locks")
         self.pointer_path = self.root / "runner-activation-pointer.json"
         self.pointer_lock = locks / "runner-activation-pointer.lock"
+        root_stat = os.stat(self.root, follow_symlinks=False)
+        self.root_hash = hash_json({"domain": "auto-code-runner-registry-root/v1", "root": str(self.root)})
+        self.identity_hash = hash_json(
+            {
+                "domain": "auto-code-runner-registry/v1",
+                "root_hash": self.root_hash,
+                "device": root_stat.st_dev,
+                "inode": root_stat.st_ino,
+                "repair_runner_identity": repair_runner_identity.model_dump(mode="json", round_trip=True),
+            }
+        )
 
     def activation_path(self, request_hash: str) -> Path:
         return self.activations / f"{_require_hash(request_hash, 'repair request')}.json"
@@ -814,14 +1079,36 @@ class RunnerRegistry:
 
     def current_activation(self) -> RunnerActivationReceipt:
         pointer = _read_canonical_json(self.pointer_path, "runner activation pointer")
-        if not isinstance(pointer, dict) or set(pointer) != {"request_hash", "receipt_hash", "runner_identity"}:
+        expected = {
+            "schema_version", "generation", "previous_pointer_hash", "registry_root_hash", "registry_identity_hash",
+            "nonce", "request_hash", "receipt_hash", "run_id", "expected_revision", "expected_state_hash",
+            "failure_hash", "old_runner_identity", "runner_identity",
+        }
+        if not isinstance(pointer, dict) or set(pointer) != expected:
             raise UnauthorizedRepairError("runner activation pointer is invalid")
-        receipt = self.lookup_activation(pointer["request_hash"])
         try:
+            if pointer["schema_version"] != 1:
+                raise ValueError
+            generation = pointer["generation"]
+            previous_pointer_hash = _require_hash(pointer["previous_pointer_hash"], "previous activation pointer")
+            receipt = self.lookup_activation(_require_hash(pointer["request_hash"], "repair request"))
             pointer_identity = RunnerIdentity.model_validate(pointer["runner_identity"])
+            old_pointer_identity = RunnerIdentity.model_validate(pointer["old_runner_identity"])
+            expected_pointer = activation_pointer_payload(
+                receipt,
+                generation=generation,
+                previous_pointer_hash=previous_pointer_hash,
+                registry_root_hash=self.root_hash,
+                registry_identity_hash=self.identity_hash,
+                nonce=_require_hash(pointer["nonce"], "repair nonce"),
+            )
         except Exception:
             raise UnauthorizedRepairError("runner activation pointer is invalid") from None
-        if receipt.content_hash != pointer["receipt_hash"] or receipt.new_runner_identity != pointer_identity:
+        if (
+            pointer != expected_pointer
+            or receipt.new_runner_identity != pointer_identity
+            or receipt.old_runner_identity != old_pointer_identity
+        ):
             raise UnauthorizedRepairError("runner activation pointer does not match its receipt")
         return receipt
 
@@ -1186,7 +1473,17 @@ class TrustedLauncher:
             "source_manifest", "regression", "build", "old_runner_terminated", "new_runner_started",
             "identity_attested",
         )
-        receipt = self.repair_service.publish_activation(self.registry, pending, receipt, journal)
+        publication = self.repair_service.publish_activation(self.registry, pending, receipt, journal)
+        receipt = publication.receipt
+        unsigned_selection_proof = RunnerActivationSelectionProof.unsigned(publication, public_key_hash)
+        selection_proof = dataclass_replace(
+            unsigned_selection_proof,
+            signature=self.activation_signer.sign(
+                canonical_json_bytes(unsigned_selection_proof.signed_payload()),
+                public_key_hash,
+            ),
+        )
+        selection_proof.verify_signature(bytes.fromhex(public_key_hex))
         self._maybe_crash("activation_pointer")
         journal.record("activation", receipt.content_hash)
         checkpoints, outputs = self._compatible_checkpoints(
@@ -1202,6 +1499,8 @@ class TrustedLauncher:
                 "stage_outputs": outputs,
                 "restart_receipt_hash": receipt.content_hash,
                 "restart_receipt_request_hash": receipt.request_hash,
+                "repair_activation_receipt": canonical_json_bytes(receipt.payload()).decode("ascii"),
+                "repair_activation_selection_proof": canonical_json_bytes(selection_proof.payload()).decode("ascii"),
             }
         )
         self.repair_service.require_apply(request_hash)

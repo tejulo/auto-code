@@ -37,9 +37,12 @@ from .runner import (
     RepairJournal,
     RepairRegression,
     RepairRunner,
+    RunnerActivationPublication,
     RunnerActivationReceipt,
     RunnerRegistry,
     TrustedLauncher,
+    _EMPTY_ACTIVATION_POINTER_HASH,
+    activation_pointer_payload,
     capture_built_release_manifest,
     capture_runner_archive,
 )
@@ -592,7 +595,7 @@ class _ProtectedRepairService:
         pending: PendingRunnerActivation,
         receipt: RunnerActivationReceipt,
         journal: RepairJournal,
-    ) -> RunnerActivationReceipt:
+    ) -> RunnerActivationPublication:
         self.require_apply(receipt.request_hash)
         self._require_registry(registry)
         if receipt.request_hash != pending.request_hash or receipt.old_runner_identity != pending.old_runner_identity:
@@ -613,33 +616,55 @@ class _ProtectedRepairService:
             or generation.state.runner_identity != pending.old_runner_identity
         ):
             raise PermissionError("activation expected-old state changed")
-        pointer_published = False
         with _interprocess_lock(registry.pointer_lock):
+            pointer: dict[str, object] | None = None
             if _path_lstat(registry.pointer_path, "runner activation pointer") is not None:
-                pointer = _read_canonical_json(registry.pointer_path, "runner activation pointer")
-                if not isinstance(pointer, dict) or set(pointer) != {"request_hash", "receipt_hash", "runner_identity"}:
-                    raise PermissionError("runner activation pointer is invalid")
-                current_identity = RunnerIdentity.model_validate(pointer["runner_identity"])
-                if current_identity == receipt.new_runner_identity and registry.lookup_activation(receipt.request_hash) == receipt:
-                    pointer_published = True
-                elif current_identity != pending.old_runner_identity:
+                existing_pointer = _read_canonical_json(registry.pointer_path, "runner activation pointer")
+                current_receipt = registry.current_activation()
+                if current_receipt == receipt:
+                    pointer = existing_pointer
+                elif current_receipt.new_runner_identity != pending.old_runner_identity:
                     raise PermissionError("runner activation pointer does not match expected old runner")
-            if not pointer_published:
-                activation_path = registry.activation_path(receipt.request_hash)
-                if not _write_new_json(activation_path, receipt.payload()):
-                    existing = registry.lookup_activation(receipt.request_hash)
-                    if existing != receipt:
-                        raise PermissionError("activation replay conflicts with its request")
-                    receipt = existing
+            activation_path = registry.activation_path(receipt.request_hash)
+            if not _write_new_json(activation_path, receipt.payload()):
+                existing = registry.lookup_activation(receipt.request_hash)
+                if existing != receipt:
+                    raise PermissionError("activation replay conflicts with its request")
+                receipt = existing
+            if pointer is None:
+                if _path_lstat(registry.pointer_path, "runner activation pointer") is None:
+                    generation = 1
+                    previous_pointer_hash = _EMPTY_ACTIVATION_POINTER_HASH
+                else:
+                    existing_pointer = _read_canonical_json(registry.pointer_path, "runner activation pointer")
+                    if not isinstance(existing_pointer, dict):
+                        raise PermissionError("runner activation pointer is invalid")
+                    generation = existing_pointer.get("generation", 0) + 1
+                    previous_pointer_hash = hash_json(existing_pointer)
+                pointer = activation_pointer_payload(
+                    receipt,
+                    generation=generation,
+                    previous_pointer_hash=previous_pointer_hash,
+                    registry_root_hash=registry.root_hash,
+                    registry_identity_hash=registry.identity_hash,
+                    nonce=self.descriptor.nonce,
+                )
                 _atomic_replace_json(
                     registry.pointer_path,
-                    {
-                        "request_hash": receipt.request_hash,
-                        "receipt_hash": receipt.content_hash,
-                        "runner_identity": receipt.new_runner_identity.model_dump(mode="json", round_trip=True),
-                    },
+                    pointer,
                 )
-        return receipt
+            observed = _read_canonical_json(registry.pointer_path, "runner activation pointer")
+            if observed != pointer:
+                raise PermissionError("runner activation pointer publication was not observed")
+        return RunnerActivationPublication(
+            receipt=receipt,
+            registry_root_hash=registry.root_hash,
+            registry_identity_hash=registry.identity_hash,
+            pointer_generation=pointer["generation"],
+            previous_pointer_hash=pointer["previous_pointer_hash"],
+            pointer_hash=hash_json(pointer),
+            nonce=pointer["nonce"],
+        )
 
     def _require_registry(self, registry: RunnerRegistry) -> None:
         if (

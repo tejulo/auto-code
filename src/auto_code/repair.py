@@ -468,7 +468,16 @@ class RepairRequestCoordinator:
             product_manifest_hash=manifest.content_hash,
             project_policy_hash=state.project_policy_hash,
             old_runner_identity=state.runner_identity,
-            ticket_owned_paths=tuple(sorted(file.path for file in manifest.files)),
+            ticket_owned_paths=tuple(
+                sorted(
+                    {
+                        path
+                        for file in manifest.files
+                        for path in (file.path, file.old_path)
+                        if path is not None
+                    }
+                )
+            ),
             contract_hashes={stage: checkpoint.contract_hash for stage, checkpoint in state.checkpoints.items()},
         )
         request_dir = handle.path / ".repair-control" / "requests"

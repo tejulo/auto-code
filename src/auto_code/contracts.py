@@ -2673,6 +2673,8 @@ class RunState(ContractModel):
     repair_activation_public_key_hash: Sha256 | None = None
     restart_receipt_hash: RestartReceiptHash | None = None
     restart_receipt_request_hash: RestartReceiptHash | None = None
+    repair_activation_receipt: str | None = Field(default=None, max_length=16_777_216)
+    repair_activation_selection_proof: str | None = Field(default=None, max_length=65_536)
     pending_external_request: PendingExternalRequest | None = None
     prefinalization_ticket_projection: str | None = None
     commit_sha: str | None = None
