@@ -713,6 +713,8 @@ class ActiveRunIndex:
                 disposition=RunDisposition.HUMAN_REVIEW,
                 repair_activation_public_key=state.repair_activation_public_key,
                 repair_activation_public_key_hash=state.repair_activation_public_key_hash,
+                finalization_public_key=state.finalization_public_key,
+                finalization_public_key_hash=state.finalization_public_key_hash,
             )
             if state != expected:
                 raise ActivationStateMismatch("Human Review activation state is invalid")
@@ -853,6 +855,8 @@ class ActiveRunIndex:
                 runner_identity=binding.runner_identity,
                 repair_activation_public_key=claim.repair_activation_public_key,
                 repair_activation_public_key_hash=claim.repair_activation_public_key_hash,
+                finalization_public_key=claim.finalization_public_key,
+                finalization_public_key_hash=claim.finalization_public_key_hash,
             )
             context_hash = hash_json(context.model_dump(mode="json", round_trip=True))
             return ActivationRequest(
@@ -885,6 +889,8 @@ class ActiveRunIndex:
                 disposition=RunDisposition.HUMAN_REVIEW,
                 repair_activation_public_key=claim.repair_activation_public_key,
                 repair_activation_public_key_hash=claim.repair_activation_public_key_hash,
+                finalization_public_key=claim.finalization_public_key,
+                finalization_public_key_hash=claim.finalization_public_key_hash,
             )
             return ActivationRequest(
                 reservation_id=claim.reservation_id,

@@ -59,6 +59,10 @@ TEST_REPAIR_ACTIVATION_PUBLIC_KEY = Ed25519PrivateKey.generate().public_key().pu
     encoding=serialization.Encoding.Raw,
     format=serialization.PublicFormat.Raw,
 )
+TEST_FINALIZATION_PUBLIC_KEY = Ed25519PrivateKey.generate().public_key().public_bytes(
+    encoding=serialization.Encoding.Raw,
+    format=serialization.PublicFormat.Raw,
+)
 
 
 @pytest.fixture
@@ -466,6 +470,8 @@ def test_selected_activation_with_real_index_publishes_context_with_its_initial_
     assert state.preparation_phase is PreparationPhase.SELECTED
     assert state.repair_activation_public_key == repair_activation_public_key.hex()
     assert state.repair_activation_public_key_hash == hashlib.sha256(repair_activation_public_key).hexdigest()
+    assert state.finalization_public_key_hash == hashlib.sha256(bytes.fromhex(state.finalization_public_key)).hexdigest()
+    assert state.finalization_public_key != state.repair_activation_public_key
     assert PreparationContextAuthority(tmp_path).load_verified(result.run_id).ticket_snapshot_hash == state.ticket_snapshot_hash
 
     restarted = PrepareCoordinator(
@@ -716,6 +722,8 @@ def test_index_owned_preflight_complete_claim_allows_a_fresh_coordinator_to_publ
         original_external_revision="revision-1",
         repair_activation_public_key=TEST_REPAIR_ACTIVATION_PUBLIC_KEY.hex(),
         repair_activation_public_key_hash=hashlib.sha256(TEST_REPAIR_ACTIVATION_PUBLIC_KEY).hexdigest(),
+        finalization_public_key=TEST_FINALIZATION_PUBLIC_KEY.hex(),
+        finalization_public_key_hash=hashlib.sha256(TEST_FINALIZATION_PUBLIC_KEY).hexdigest(),
     )
 
     claim = index.claim_selected_activation(claim_request)
@@ -742,6 +750,7 @@ def test_index_owned_preflight_complete_claim_allows_a_fresh_coordinator_to_publ
         reservation_owner=lambda: ReservationOwner(host="other-host", pid=2),
         now=lambda: NOW.replace(day=12),
         repair_activation_public_key=TEST_REPAIR_ACTIVATION_PUBLIC_KEY,
+        finalization_public_key=TEST_FINALIZATION_PUBLIC_KEY,
     )
     result = restarted.activate_reservation(tmp_path / reference.relative_path, reference.input_hash, probe.challenge)
 
@@ -846,7 +855,7 @@ def test_concurrent_selected_activation_waits_without_a_second_compatibility_pre
     index = ActiveRunIndex(tmp_path, preparation_input_verifier=bridge)
     compatibility = BlockingCompatibility()
     def coordinator(owner: ReservationOwner) -> PrepareCoordinator:
-        return PrepareCoordinator(index=index, bridge=bridge, git=FakeGitGuard(repository), compatibility=compatibility, runtime_config="runtime-config", role_config="role-config", reservation_owner=lambda: owner, now=lambda: NOW, repair_activation_public_key=TEST_REPAIR_ACTIVATION_PUBLIC_KEY)
+        return PrepareCoordinator(index=index, bridge=bridge, git=FakeGitGuard(repository), compatibility=compatibility, runtime_config="runtime-config", role_config="role-config", reservation_owner=lambda: owner, now=lambda: NOW, repair_activation_public_key=TEST_REPAIR_ACTIVATION_PUBLIC_KEY, finalization_public_key=TEST_FINALIZATION_PUBLIC_KEY)
 
     first = coordinator(ReservationOwner(host="first-host", pid=1))
     probe = first.probe(repository)

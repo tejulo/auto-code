@@ -670,6 +670,8 @@ class RunStateStore:
             "max_crew_iterations",
             "repair_activation_public_key",
             "repair_activation_public_key_hash",
+            "finalization_public_key",
+            "finalization_public_key_hash",
         ):
             if getattr(previous, field) != getattr(state, field):
                 raise InvalidStateTransition(f"immutable field {field} cannot change")
@@ -817,6 +819,13 @@ class RunStateStore:
                 {
                     "repair_activation_public_key": state.repair_activation_public_key,
                     "repair_activation_public_key_hash": state.repair_activation_public_key_hash,
+                }
+            )
+        if state.finalization_public_key is not None:
+            values.update(
+                {
+                    "finalization_public_key": state.finalization_public_key,
+                    "finalization_public_key_hash": state.finalization_public_key_hash,
                 }
             )
         if state.preparation_phase is PreparationPhase.SELECTED and state.disposition is RunDisposition.HUMAN_REVIEW:

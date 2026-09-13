@@ -373,6 +373,9 @@ def _run_finalize(
         if revision < 1 or _CANONICAL_SHA256.fullmatch(args.expected_hash) is None:
             raise ValueError
         trusted_runtime = runtime if runtime is not None else load_launcher_runtime_from_protected_fd()
+        state = RunStateStore.load_read_only(trusted_runtime.state_root, args.run).state
+        if state.finalization_public_key_hash is None:
+            raise ValueError("finalization trust is unavailable")
         response = invoke_protected_capability(
             "finalize",
             args.run,
@@ -380,6 +383,7 @@ def _run_finalize(
             args.expected_hash,
             None,
             expected_state_root=trusted_runtime.state_root,
+            expected_finalization_key_hash=state.finalization_public_key_hash,
         )
         assert response.result is not None
         result = response.result
@@ -407,6 +411,9 @@ def _run_receipt(
         if str(uuid.UUID(args.request_id)) != args.request_id:
             raise ValueError
         trusted_runtime = runtime if runtime is not None else load_launcher_runtime_from_protected_fd()
+        state = RunStateStore.load_read_only(trusted_runtime.state_root, args.run).state
+        if state.finalization_public_key_hash is None:
+            raise ValueError("finalization trust is unavailable")
         invoke_protected_capability(
             "receipt",
             args.run,
@@ -414,6 +421,7 @@ def _run_receipt(
             args.expected_hash,
             args.request_id,
             expected_state_root=trusted_runtime.state_root,
+            expected_finalization_key_hash=state.finalization_public_key_hash,
         )
     except (FinalizationServiceError, ValueError):
         print("receipt: operation unavailable", file=sys.stderr)

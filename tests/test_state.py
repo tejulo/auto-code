@@ -745,6 +745,38 @@ def test_cas_rejects_immutable_budget_changes(tmp_path: Path) -> None:
         )
 
 
+def test_cas_rejects_finalization_trust_key_changes(tmp_path: Path) -> None:
+    """Removing finalization key immutability would let a later generation replace launcher trust."""
+
+    key = "0" * 64
+    replacement = "1" * 64
+    store = RunStateStore(tmp_path, "run-1")
+    first = store.compare_and_swap(
+        0,
+        EMPTY_STATE_HASH,
+        RunState(
+            run_id="run-1",
+            ticket_id="ENG-1",
+            repository_id="repo-1",
+            max_crew_iterations=3,
+            finalization_public_key=key,
+            finalization_public_key_hash=__import__("hashlib").sha256(bytes.fromhex(key)).hexdigest(),
+        ),
+    )
+
+    with pytest.raises(InvalidStateTransition, match="finalization_public_key"):
+        store.compare_and_swap(
+            first.revision,
+            first.state_hash,
+            first.state.model_copy(
+                update={
+                    "finalization_public_key": replacement,
+                    "finalization_public_key_hash": __import__("hashlib").sha256(bytes.fromhex(replacement)).hexdigest(),
+                }
+            ),
+        )
+
+
 def test_cas_rejects_rewritten_failure_history_prefix(tmp_path: Path) -> None:
     store = RunStateStore(tmp_path, "run-1")
     original = RunState(

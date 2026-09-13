@@ -40,6 +40,10 @@ class FinalizationServiceError(RuntimeError):
     pass
 
 
+class FinalizationCapabilityError(FinalizationServiceError):
+    pass
+
+
 @dataclass(frozen=True, slots=True)
 class _Deadline:
     expires_at: float
@@ -635,41 +639,56 @@ def load_finalization_trust_from_protected_fd() -> FinalizationTrustMaterial:
         raise FinalizationServiceError("launcher finalization trust is invalid") from error
 
 
+def validate_finalization_capability(
+    capability: FinalizationCapabilityDescriptor,
+    trust: FinalizationTrustMaterial,
+    expected_state_root: Path,
+    expected_finalization_key_hash: str,
+) -> None:
+    try:
+        capability.verify(trust.public_key)
+        expected_root = _normalize_state_root(expected_state_root)
+        expected_key_hash = _require_hash(expected_finalization_key_hash, "expected finalization key hash")
+        if (
+            trust.descriptor_hash != hashlib.sha256(capability.to_bytes()).hexdigest()
+            or trust.state_root != expected_root
+            or hashlib.sha256(bytes.fromhex(trust.public_key)).hexdigest() != expected_key_hash
+        ):
+            raise FinalizationCapabilityError("finalization trust binding is invalid")
+        from .state import RunStateStore
+
+        generation = RunStateStore.load_read_only(expected_root, capability.run_id)
+        state = generation.state
+        if (
+            generation.revision != capability.expected_revision
+            or generation.state_hash != capability.expected_state_hash
+            or state.finalization_public_key != trust.public_key
+            or state.finalization_public_key_hash != expected_key_hash
+        ):
+            raise FinalizationCapabilityError("finalization trust binding is invalid")
+        if capability.socket_uid != os.getuid() or _socket_identity(capability.socket_path) != (capability.socket_device, capability.socket_inode, capability.socket_uid, capability.socket_mode, capability.socket_ctime_ns):
+            raise FinalizationCapabilityError("launcher socket identity is invalid")
+    except (TypeError, ValueError, FinalizationServiceError) as error:
+        raise FinalizationCapabilityError("launcher finalization trust binding is invalid") from error
+
+
 def load_capability_from_protected_fd(
     trust: FinalizationTrustMaterial,
     *,
-    expected_state_root: Path | None = None,
+    expected_state_root: Path,
+    expected_finalization_key_hash: str,
 ) -> FinalizationCapabilityDescriptor:
     try:
         capability = FinalizationCapabilityDescriptor.from_payload(_load_protected_json(_LAUNCHER_FINALIZATION_FD, "capability"))
-        capability.verify(trust.public_key)
-        if expected_state_root is not None:
-            if (
-                trust.descriptor_hash != hashlib.sha256(capability.to_bytes()).hexdigest()
-                or _normalize_state_root(expected_state_root) != trust.state_root
-            ):
-                raise FinalizationServiceError("launcher finalization trust binding is invalid")
-            from .state import RunStateStore
-
-            generation = RunStateStore.load_read_only(trust.state_root, capability.run_id)
-            state = generation.state
-            if (
-                generation.revision != capability.expected_revision
-                or generation.state_hash != capability.expected_state_hash
-                or (
-                    state.repair_activation_public_key is not None
-                    and (
-                        state.repair_activation_public_key != trust.public_key
-                        or state.repair_activation_public_key_hash != hashlib.sha256(bytes.fromhex(trust.public_key)).hexdigest()
-                    )
-                )
-            ):
-                raise FinalizationServiceError("launcher finalization trust binding is invalid")
-        if capability.socket_uid != os.getuid() or _socket_identity(capability.socket_path) != (capability.socket_device, capability.socket_inode, capability.socket_uid, capability.socket_mode, capability.socket_ctime_ns):
-            raise FinalizationServiceError("launcher socket identity is invalid")
+        validate_finalization_capability(
+            capability,
+            trust,
+            expected_state_root,
+            expected_finalization_key_hash,
+        )
         return capability
     except (TypeError, ValueError, FinalizationServiceError) as error:
-        raise FinalizationServiceError("launcher finalization trust binding is invalid") from error
+        raise FinalizationCapabilityError("launcher finalization trust binding is invalid") from error
 
 
 def invoke_descriptor(descriptor: FinalizationCapabilityDescriptor, *, trust: FinalizationTrustMaterial) -> FinalizationResponse:
@@ -702,10 +721,15 @@ def invoke_protected_capability(
     expected_state_hash: str,
     request_id: str | None,
     *,
-    expected_state_root: Path | None = None,
+    expected_state_root: Path,
+    expected_finalization_key_hash: str,
 ) -> FinalizationResponse:
     trust = load_finalization_trust_from_protected_fd()
-    descriptor = load_capability_from_protected_fd(trust, expected_state_root=expected_state_root)
+    descriptor = load_capability_from_protected_fd(
+        trust,
+        expected_state_root=expected_state_root,
+        expected_finalization_key_hash=expected_finalization_key_hash,
+    )
     request = FinalizationRequest(
         operation=operation,
         run_id=run_id,
@@ -744,6 +768,7 @@ def _read_frame(connection: socket.socket, deadline: _Deadline) -> object:
 
 __all__ = [
     "FinalizationCapabilityDescriptor",
+    "FinalizationCapabilityError",
     "FinalizationRequest",
     "FinalizationResponse",
     "FinalizationServiceError",
@@ -752,4 +777,5 @@ __all__ = [
     "invoke_protected_capability",
     "load_capability_from_protected_fd",
     "load_finalization_trust_from_protected_fd",
+    "validate_finalization_capability",
 ]

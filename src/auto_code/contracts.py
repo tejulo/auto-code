@@ -2672,6 +2672,8 @@ class RunState(ContractModel):
     repair_runner_identity: RepairRunnerIdentity | None = None
     repair_activation_public_key: Sha256 | None = None
     repair_activation_public_key_hash: Sha256 | None = None
+    finalization_public_key: Sha256 | None = None
+    finalization_public_key_hash: Sha256 | None = None
     restart_receipt_hash: RestartReceiptHash | None = None
     restart_receipt_request_hash: RestartReceiptHash | None = None
     repair_activation_receipt: str | None = Field(default=None, max_length=16_777_216)
@@ -2704,6 +2706,8 @@ class RunState(ContractModel):
         "product_change_manifest_hash",
         "repair_activation_public_key",
         "repair_activation_public_key_hash",
+        "finalization_public_key",
+        "finalization_public_key_hash",
         "restart_receipt_request_hash",
         "finalization_index_release_binding",
     )
@@ -2757,6 +2761,15 @@ class RunState(ContractModel):
             != self.repair_activation_public_key_hash
         ):
             raise ValueError("Repair activation public key hash does not match")
+        if (self.finalization_public_key is None) != (self.finalization_public_key_hash is None):
+            raise ValueError("Finalization trust binding must be complete")
+        if self.finalization_public_key is not None and (
+            hashlib.sha256(bytes.fromhex(self.finalization_public_key)).hexdigest()
+            != self.finalization_public_key_hash
+        ):
+            raise ValueError("Finalization public key hash does not match")
+        if self.finalization_public_key == self.repair_activation_public_key and self.finalization_public_key is not None:
+            raise ValueError("Finalization public key must be dedicated")
         if (self.product_change_manifest is None) != (self.product_change_manifest_hash is None):
             raise ValueError("Product Change Manifest reference and hash must be bound together")
         if (self.restart_receipt_hash is None) != (self.restart_receipt_request_hash is None):
@@ -2965,6 +2978,8 @@ class SelectedActivationClaimRequest(ContractModel):
     original_external_revision: str
     repair_activation_public_key: Sha256
     repair_activation_public_key_hash: Sha256
+    finalization_public_key: Sha256
+    finalization_public_key_hash: Sha256
 
     @field_validator("expected_index_hash")
     @classmethod
@@ -2996,6 +3011,12 @@ class SelectedActivationClaimRequest(ContractModel):
             != self.repair_activation_public_key_hash
         ):
             raise ValueError("Selected activation repair trust binding is invalid")
+        if (
+            self.finalization_public_key == self.repair_activation_public_key
+            or hashlib.sha256(bytes.fromhex(self.finalization_public_key)).hexdigest()
+            != self.finalization_public_key_hash
+        ):
+            raise ValueError("Selected activation finalization trust binding is invalid")
         return self
 
 

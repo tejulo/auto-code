@@ -15,6 +15,7 @@ from auto_code.cli import main
 from auto_code.contracts import RunState, StepKind, StepResult
 from auto_code.finalization_service import (
     FinalizationCapabilityDescriptor,
+    FinalizationCapabilityError,
     FinalizationServiceError,
     FinalizationTrustMaterial,
     _FinalizationHandlers as FinalizationHandlers,
@@ -22,6 +23,7 @@ from auto_code.finalization_service import (
     invoke_descriptor,
     invoke_protected_capability,
     load_capability_from_protected_fd,
+    validate_finalization_capability,
 )
 from auto_code import finalization_service
 from auto_code.hashing import canonical_json_bytes
@@ -114,13 +116,44 @@ def test_capability_descriptor_requires_a_signed_fixed_fd(
 ) -> None:
     """Replacing the inherited descriptor must fail before any socket request is sent."""
 
-    issued = descriptor(service, tmp_path / "launcher.sock")
+    generation = RunStateStore(service.state_root, "run-1").compare_and_swap(
+        0,
+        EMPTY_STATE_HASH,
+        RunState(
+            run_id="run-1",
+            ticket_id="ENG-1",
+            repository_id="repo-1",
+            max_crew_iterations=1,
+            finalization_public_key=service.public_key,
+            finalization_public_key_hash=__import__("hashlib").sha256(bytes.fromhex(service.public_key)).hexdigest(),
+        ),
+    )
+    socket_path = tmp_path / "launcher.sock"
+    ensure_socket_node(socket_path)
+    issued = service.issue_descriptor(
+        operation="finalize",
+        run_id="run-1",
+        expected_revision=generation.revision,
+        expected_state_hash=generation.state_hash,
+        request_id=None,
+        socket_path=socket_path,
+        expires_at=datetime.now(UTC) + timedelta(minutes=1),
+        timeout_seconds=1.0,
+    )
     descriptor_path = tmp_path / "capability.json"
     descriptor_path.write_bytes(issued.to_bytes())
     fd = os.open(descriptor_path, os.O_RDONLY)
     try:
         monkeypatch.setattr(finalization_service, "_LAUNCHER_FINALIZATION_FD", fd)
-        assert load_capability_from_protected_fd(trust(service)) == issued
+        assert load_capability_from_protected_fd(
+            FinalizationTrustMaterial(
+                public_key=service.public_key,
+                state_root=service.state_root,
+                descriptor_hash=__import__("hashlib").sha256(issued.to_bytes()).hexdigest(),
+            ),
+            expected_state_root=service.state_root,
+            expected_finalization_key_hash=generation.state.finalization_public_key_hash,
+        ) == issued
     finally:
         os.close(fd)
 
@@ -273,7 +306,14 @@ def test_installed_finalize_cli_uses_only_the_fixed_fd_capability(
     generation = RunStateStore(service.state_root, "run-1").compare_and_swap(
         0,
         EMPTY_STATE_HASH,
-        RunState(run_id="run-1", ticket_id="ENG-1", repository_id="repo-1", max_crew_iterations=1),
+        RunState(
+            run_id="run-1",
+            ticket_id="ENG-1",
+            repository_id="repo-1",
+            max_crew_iterations=1,
+            finalization_public_key=service.public_key,
+            finalization_public_key_hash=__import__("hashlib").sha256(bytes.fromhex(service.public_key)).hexdigest(),
+        ),
     )
     issued = service.issue_descriptor(
         operation="finalize",
@@ -345,7 +385,15 @@ def test_trusted_fd_rejects_attacker_descriptor_before_connect(
         monkeypatch.setattr(finalization_service, "_LAUNCHER_FINALIZATION_FD", descriptor_fd)
         monkeypatch.setattr(finalization_service, "_LAUNCHER_FINALIZATION_TRUST_FD", trust_fd)
         with pytest.raises(FinalizationServiceError, match="trust"):
-            invoke_protected_capability("finalize", "run-1", 3, "a" * 64, None)
+            invoke_protected_capability(
+                "finalize",
+                "run-1",
+                3,
+                "a" * 64,
+                None,
+                expected_state_root=service.state_root,
+                expected_finalization_key_hash="f" * 64,
+            )
         with pytest.raises(TimeoutError):
             listener.accept()
     finally:
@@ -363,6 +411,10 @@ def test_protected_capability_rejects_an_attacker_fd4_fd5_key_pair(
     state_root = tmp_path / "state"
     key = Ed25519PrivateKey.generate()
     public_key = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
+    finalization_key = Ed25519PrivateKey.generate().public_key().public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    ).hex()
     store = RunStateStore(state_root, "run-1")
     generation = store.compare_and_swap(
         0,
@@ -374,6 +426,8 @@ def test_protected_capability_rejects_an_attacker_fd4_fd5_key_pair(
             max_crew_iterations=1,
             repair_activation_public_key=public_key,
             repair_activation_public_key_hash=__import__("hashlib").sha256(bytes.fromhex(public_key)).hexdigest(),
+            finalization_public_key=finalization_key,
+            finalization_public_key_hash=__import__("hashlib").sha256(bytes.fromhex(finalization_key)).hexdigest(),
         ),
     )
     socket_path = tmp_path / "attacker.sock"
@@ -432,6 +486,7 @@ def test_protected_capability_rejects_an_attacker_fd4_fd5_key_pair(
                 generation.state_hash,
                 None,
                 expected_state_root=state_root,
+                expected_finalization_key_hash=generation.state.finalization_public_key_hash,
             )
         with pytest.raises(TimeoutError):
             listener.accept()
@@ -439,6 +494,76 @@ def test_protected_capability_rejects_an_attacker_fd4_fd5_key_pair(
         listener.close()
         os.close(descriptor_fd)
         os.close(trust_fd)
+
+
+def test_capability_rejects_replaced_descriptor_and_trust_fds(tmp_path: Path) -> None:
+    """Removing the dedicated state trust binding would authorize attacker-controlled FD contents."""
+
+    state_root = tmp_path / "state"
+    finalization_key = Ed25519PrivateKey.generate().public_key().public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    ).hex()
+    generation = RunStateStore(state_root, "run-1").compare_and_swap(
+        0,
+        EMPTY_STATE_HASH,
+        RunState(
+            run_id="run-1",
+            ticket_id="ENG-1",
+            repository_id="repo-1",
+            max_crew_iterations=1,
+            finalization_public_key=finalization_key,
+            finalization_public_key_hash=__import__("hashlib").sha256(bytes.fromhex(finalization_key)).hexdigest(),
+        ),
+    )
+    attacker_socket = tmp_path / "attacker.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(attacker_socket))
+    listener.listen(1)
+    attacker = FinalizationService(
+        signing_key=Ed25519PrivateKey.generate(),
+        state_root=state_root,
+        handlers=FinalizationHandlers(
+            finalize=lambda _: StepResult(
+                kind=StepKind.READY_TO_FINALIZE,
+                run_id="run-1",
+                state_revision=generation.revision,
+                state_hash=generation.state_hash,
+            ),
+            receipt=lambda _: StepResult(
+                kind=StepKind.READY_TO_FINALIZE,
+                run_id="run-1",
+                state_revision=generation.revision,
+                state_hash=generation.state_hash,
+            ),
+        ),
+    )
+    try:
+        attacker_descriptor = attacker.issue_descriptor(
+            operation="finalize",
+            run_id="run-1",
+            expected_revision=generation.revision,
+            expected_state_hash=generation.state_hash,
+            request_id=None,
+            socket_path=attacker_socket,
+            expires_at=datetime.now(UTC) + timedelta(minutes=1),
+            timeout_seconds=1.0,
+        )
+        attacker_trust = FinalizationTrustMaterial(
+            public_key=attacker.public_key,
+            state_root=state_root,
+            descriptor_hash=__import__("hashlib").sha256(attacker_descriptor.to_bytes()).hexdigest(),
+        )
+
+        with pytest.raises(FinalizationCapabilityError, match="finalization trust"):
+            validate_finalization_capability(
+                attacker_descriptor,
+                attacker_trust,
+                state_root,
+                generation.state.finalization_public_key_hash,
+            )
+    finally:
+        listener.close()
 
 
 def test_restart_replays_the_exact_durable_response_without_reinvoking_handler(tmp_path: Path) -> None:
