@@ -2,10 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+import hashlib
 import os
 from pathlib import Path
 import socket
+import subprocess
+import tempfile
 from typing import Protocol
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from auto_code.contracts import (
     BrowserResult,
@@ -22,13 +27,13 @@ from auto_code.contracts import (
 )
 from auto_code.finalization_service import (
     FinalizationCapabilityDescriptor,
-    _FinalizationKeyAuthority,
     FinalizationRequest,
     _FinalizationHandlersInternal,
     _LauncherFinalizationServiceInternal,
 )
 from auto_code.finalizer import _FinalizationArtifacts, _Finalizer, _FinalizerDependencies
 from auto_code.hashing import hash_json
+from auto_code.hashing import canonical_json_bytes
 from auto_code.linear import LinearGateway
 from auto_code.prepare import PreparationContextAuthority
 from auto_code.project_config import ProjectConfig
@@ -149,6 +154,7 @@ class _LauncherRuntime:
     git_guard: object | None = None
     active_run_index: object | None = None
     artifact_authority: FinalizationArtifactAuthority | None = None
+    signing_key: Ed25519PrivateKey | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "state_root", Path(self.state_root))
@@ -162,7 +168,6 @@ class FinalizationLauncher:
             raise ValueError("finalization launcher runtime is invalid")
         self._runtime = runtime
         self._state_root = runtime.state_root
-        self._keys = _FinalizationKeyAuthority(self._state_root)
         self._artifacts = runtime.artifact_authority or FinalizationArtifactAuthority(self._state_root)
         self._services: dict[str, _LauncherFinalizationServiceInternal] = {}
 
@@ -189,12 +194,82 @@ class FinalizationLauncher:
         self._services[descriptor.nonce] = service
         return descriptor
 
+    def serve_ticket_process(
+        self,
+        run_id: str,
+        expected_revision: int,
+        expected_generation_hash: str,
+        ticket_argv: tuple[str, ...],
+    ) -> int:
+        """Run one ticket command against one launcher-owned IPC capability."""
+
+        if not ticket_argv or any(not isinstance(argument, str) or not argument for argument in ticket_argv):
+            raise FinalizationLauncherError("ticket command is invalid")
+        socket_path = self._state_root / f"finalization-{os.urandom(12).hex()}.sock"
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        descriptors: list[int] = []
+        process: subprocess.Popen[str] | None = None
+        try:
+            listener.bind(str(socket_path))
+            listener.listen(1)
+            descriptor = self.serve_descriptor(
+                run_id,
+                expected_revision,
+                expected_generation_hash,
+                socket_path=socket_path,
+            )
+            service = self._services[descriptor.nonce]
+            descriptors = [
+                _sealed_descriptor(descriptor.to_bytes()),
+                _sealed_descriptor(
+                    canonical_json_bytes(
+                        {
+                            "domain": "auto-code-finalization-trust/v1",
+                            "public_key": service.public_key,
+                            "descriptor_hash": hashlib.sha256(descriptor.to_bytes()).hexdigest(),
+                        }
+                    )
+                ),
+                _sealed_descriptor(
+                    canonical_json_bytes(
+                        {
+                            "domain": "auto-code-finalization-binding/v1",
+                            "public_key_hash": generation_key_hash(self._load_exact(run_id, expected_revision, expected_generation_hash)),
+                        }
+                    )
+                ),
+            ]
+            process = subprocess.Popen(
+                ticket_argv,
+                pass_fds=tuple(descriptors),
+                preexec_fn=lambda: (_dup_to(descriptors[0], 4), _dup_to(descriptors[1], 5), _dup_to(descriptors[2], 6)),
+                text=True,
+            )
+            service._peer_pid = process.pid
+            service.serve_once(listener)
+            return process.wait(timeout=2)
+        except Exception as error:
+            if process is not None:
+                process.kill()
+                process.wait()
+            raise FinalizationLauncherError("finalization launcher lifecycle failed") from error
+        finally:
+            for descriptor_fd in descriptors:
+                os.close(descriptor_fd)
+            listener.close()
+            try:
+                socket_path.unlink()
+            except FileNotFoundError:
+                pass
+
     def _service_for(self, generation: StateGeneration) -> _LauncherFinalizationServiceInternal:
         self._require_active_run(generation)
         key_hash = generation.state.finalization_public_key_hash
         if key_hash is None or generation.state.finalization_public_key is None:
             raise FinalizationLauncherError("finalization trust is unavailable")
-        key = self._keys.load_private_key(key_hash)
+        key = self._runtime.signing_key
+        if not isinstance(key, Ed25519PrivateKey):
+            raise FinalizationLauncherError("finalization signing credential is unavailable")
         public_key = key.public_key().public_bytes_raw().hex()
         if public_key != generation.state.finalization_public_key:
             raise FinalizationLauncherError("finalization trust is invalid")
@@ -279,6 +354,28 @@ class FinalizationLauncher:
             return generation
         except Exception:
             raise FinalizationLauncherError("finalization state does not match the Active Run") from None
+
+
+def generation_key_hash(generation: StateGeneration) -> str:
+    key_hash = generation.state.finalization_public_key_hash
+    if not isinstance(key_hash, str):
+        raise FinalizationLauncherError("finalization trust is unavailable")
+    return key_hash
+
+
+def _sealed_descriptor(payload: bytes) -> int:
+    temporary, path = tempfile.mkstemp(prefix="auto-code-finalization-")
+    try:
+        os.write(temporary, payload)
+    finally:
+        os.close(temporary)
+    descriptor = os.open(path, os.O_RDONLY)
+    os.unlink(path)
+    return descriptor
+
+
+def _dup_to(source: int, target: int) -> None:
+    os.dup2(source, target, inheritable=True)
 
 
 __all__ = [

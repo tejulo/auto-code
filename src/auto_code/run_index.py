@@ -11,6 +11,8 @@ import socket
 from typing import Literal, Protocol
 import uuid
 
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
 from .contracts import (
     ActivationRequest,
     AuthorizationVerifier,
@@ -179,15 +181,21 @@ class ActiveRunIndex:
         *,
         authorization_verifier: AuthorizationVerifier | None = None,
         preparation_input_verifier: PreparationInputVerifier | None = None,
+        finalization_signing_key: Ed25519PrivateKey | None = None,
     ) -> None:
         self.root = _normalize_state_root(root)
         self.authorization_verifier = authorization_verifier
         self.preparation_input_verifier = preparation_input_verifier
+        self._finalization_signing_key = finalization_signing_key or Ed25519PrivateKey.generate()
         self.index_dir = _ensure_directory(self.root, self.root / "active-run-index")
         self.release_dir = _ensure_directory(self.root, self.root / "active-run-index-releases")
         self.journal_dir = _ensure_directory(self.root, self.root / "preparation-journal")
         _ensure_directory(self.root, self.root / "active-run-bindings")
         self.locks_dir = _ensure_directory(self.root, self.root / "locks")
+
+    @property
+    def finalization_public_key(self) -> str:
+        return self._finalization_signing_key.public_key().public_bytes_raw().hex()
 
     def lookup(self, repository_id: str) -> ActivationResult | None:
         repository_id = _require_identifier(repository_id, "repository ID")
@@ -578,9 +586,7 @@ class ActiveRunIndex:
         try:
             if state.finalization_public_key is None or state.finalization_public_key_hash is None:
                 raise ValueError
-            from .finalization_service import _FinalizationKeyAuthority
-
-            key = _FinalizationKeyAuthority(self.root).load_private_key(state.finalization_public_key_hash)
+            key = self._finalization_signing_key
             if key.public_key().public_bytes_raw().hex() != state.finalization_public_key:
                 raise ValueError
             return receipt.with_signature(key.sign(canonical_json_bytes(receipt.signing_payload())).hex())

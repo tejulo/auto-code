@@ -23,21 +23,12 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey,
 
 from .contracts import StepResult
 from .hashing import canonical_json_bytes
-from .state import (
-    AuthoritativeStateCorrupt,
-    _atomic_replace_json,
-    _ensure_directory,
-    _interprocess_lock,
-    _normalize_state_root,
-    _path_lstat,
-    _read_canonical_json,
-    _require_identifier,
-    _write_new_json,
-)
+from .state import _atomic_replace_json, _ensure_directory, _interprocess_lock, _normalize_state_root, _read_canonical_json, _write_new_json
 
 
 _LAUNCHER_FINALIZATION_FD = 4
 _LAUNCHER_FINALIZATION_TRUST_FD = 5
+_LAUNCHER_FINALIZATION_BINDING_FD = 6
 _MAX_DESCRIPTOR_BYTES = 8192
 _MAX_MESSAGE_BYTES = 65_536
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,254}\Z")
@@ -52,124 +43,6 @@ class FinalizationServiceError(RuntimeError):
 
 class FinalizationCapabilityError(FinalizationServiceError):
     pass
-
-
-@dataclass(frozen=True, slots=True)
-class FinalizationTrustBinding:
-    public_key: str
-    public_key_hash: str
-
-    def __post_init__(self) -> None:
-        public_key = _require_public_key(self.public_key)
-        public_key_hash = _require_hash(self.public_key_hash, "finalization public key hash")
-        if hashlib.sha256(bytes.fromhex(public_key)).hexdigest() != public_key_hash:
-            raise ValueError("finalization public key hash is invalid")
-
-
-class _FinalizationKeyAuthority:
-    """Persist finalization private keys exclusively below the launcher-owned state root."""
-
-    def __init__(self, state_root: Path) -> None:
-        self.state_root = _normalize_state_root(state_root)
-        self._key_root = _ensure_directory(self.state_root, self.state_root / "finalization-keys")
-        self._reservation_root = _ensure_directory(
-            self.state_root,
-            self.state_root / "finalization-key-reservations",
-        )
-
-    def provision(self, reservation_id: str) -> FinalizationTrustBinding:
-        reservation_path = self._reservation_path(reservation_id)
-        if _path_lstat(reservation_path, "finalization key reservation") is not None:
-            return self._load_binding(self._load_reservation(reservation_id))
-        private_key = Ed25519PrivateKey.generate()
-        private_bytes = private_key.private_bytes(
-            serialization.Encoding.Raw,
-            serialization.PrivateFormat.Raw,
-            serialization.NoEncryption(),
-        )
-        public_key = private_key.public_key().public_bytes(
-            serialization.Encoding.Raw,
-            serialization.PublicFormat.Raw,
-        ).hex()
-        binding = FinalizationTrustBinding(
-            public_key=public_key,
-            public_key_hash=hashlib.sha256(bytes.fromhex(public_key)).hexdigest(),
-        )
-        payload = {
-            "public_key": binding.public_key,
-            "public_key_hash": binding.public_key_hash,
-            "private_key": private_bytes.hex(),
-        }
-        if not _write_new_json(self._key_path(binding.public_key_hash), payload):
-            return self._load_binding(binding.public_key_hash)
-        reservation = {"reservation_id": reservation_id, "public_key_hash": binding.public_key_hash}
-        if not _write_new_json(reservation_path, reservation):
-            return self._load_binding(self._load_reservation(reservation_id))
-        return binding
-
-    def load_private_key(self, expected_public_key_hash: str) -> Ed25519PrivateKey:
-        expected_hash = _require_hash(expected_public_key_hash, "expected finalization public key hash")
-        payload = self._load_payload(expected_hash)
-        if payload["public_key_hash"] != expected_hash:
-            raise FinalizationCapabilityError("finalization private key binding is invalid")
-        try:
-            private_key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(payload["private_key"]))
-        except ValueError:
-            raise FinalizationCapabilityError("finalization private key is invalid") from None
-        public_key = private_key.public_key().public_bytes(
-            serialization.Encoding.Raw,
-            serialization.PublicFormat.Raw,
-        ).hex()
-        if public_key != payload["public_key"]:
-            raise FinalizationCapabilityError("finalization private key binding is invalid")
-        return private_key
-
-    def _load_binding(self, public_key_hash: str) -> FinalizationTrustBinding:
-        payload = self._load_payload(public_key_hash)
-        return FinalizationTrustBinding(
-            public_key=payload["public_key"],
-            public_key_hash=payload["public_key_hash"],
-        )
-
-    def _load_payload(self, public_key_hash: str) -> dict[str, str]:
-        try:
-            payload = _read_canonical_json(self._key_path(public_key_hash), "finalization private key")
-            if not isinstance(payload, dict) or set(payload) != {
-                "public_key",
-                "public_key_hash",
-                "private_key",
-            }:
-                raise ValueError
-            if any(not isinstance(value, str) for value in payload.values()):
-                raise ValueError
-            FinalizationTrustBinding(
-                public_key=payload["public_key"],
-                public_key_hash=payload["public_key_hash"],
-            )
-            if payload["public_key_hash"] != _require_hash(public_key_hash, "finalization public key hash") or len(bytes.fromhex(payload["private_key"])) != 32:
-                raise ValueError
-            return payload
-        except (AuthoritativeStateCorrupt, TypeError, ValueError):
-            raise FinalizationCapabilityError("finalization private key is invalid") from None
-
-    def _load_reservation(self, reservation_id: str) -> str:
-        try:
-            payload = _read_canonical_json(self._reservation_path(reservation_id), "finalization key reservation")
-            if (
-                not isinstance(payload, dict)
-                or set(payload) != {"reservation_id", "public_key_hash"}
-                or payload["reservation_id"] != reservation_id
-            ):
-                raise ValueError
-            return _require_hash(payload["public_key_hash"], "finalization public key hash")
-        except (AuthoritativeStateCorrupt, TypeError, ValueError):
-            raise FinalizationCapabilityError("finalization key reservation is invalid") from None
-
-    def _key_path(self, public_key_hash: str) -> Path:
-        return self._key_root / f"{_require_hash(public_key_hash, 'finalization public key hash')}.json"
-
-    def _reservation_path(self, reservation_id: str) -> Path:
-        return self._reservation_root / f"{_require_identifier(reservation_id, 'reservation ID')}.json"
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,13 +63,11 @@ class _Deadline:
 @dataclass(frozen=True, slots=True)
 class FinalizationTrustMaterial:
     public_key: str
-    state_root: Path
     descriptor_hash: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.public_key, str) or re.fullmatch(r"[0-9a-f]{64}", self.public_key) is None:
             raise ValueError("finalization trust public key is invalid")
-        object.__setattr__(self, "state_root", _normalize_state_root(self.state_root))
         if self.descriptor_hash is not None:
             _require_hash(self.descriptor_hash, "finalization descriptor hash")
 
@@ -204,7 +75,6 @@ class FinalizationTrustMaterial:
         return {
             "domain": "auto-code-finalization-trust/v1",
             "public_key": self.public_key,
-            "state_root": str(self.state_root),
             "descriptor_hash": self.descriptor_hash,
         }
 
@@ -213,11 +83,10 @@ class FinalizationTrustMaterial:
 
     @classmethod
     def from_payload(cls, value: object) -> FinalizationTrustMaterial:
-        if not isinstance(value, dict) or set(value) != {"domain", "public_key", "state_root", "descriptor_hash"} or value["domain"] != "auto-code-finalization-trust/v1":
+        if not isinstance(value, dict) or set(value) != {"domain", "public_key", "descriptor_hash"} or value["domain"] != "auto-code-finalization-trust/v1":
             raise ValueError("finalization trust material is invalid")
         return cls(
             public_key=value["public_key"],
-            state_root=Path(value["state_root"]),
             descriptor_hash=value["descriptor_hash"],
         )
 
@@ -649,7 +518,13 @@ class _LauncherFinalizationServiceInternal:
                 raise FinalizationServiceError("capability is expired")
             if record["status"] == "completed":
                 response = FinalizationResponse.from_payload(record["response"])
-                response.verify(descriptor, FinalizationTrustMaterial(public_key=self.public_key, state_root=self.state_root))
+                response.verify(
+                    descriptor,
+                    FinalizationTrustMaterial(
+                        public_key=self.public_key,
+                        descriptor_hash=hashlib.sha256(descriptor.to_bytes()).hexdigest(),
+                    ),
+                )
                 return response
             if record["status"] != "issued":
                 raise FinalizationServiceError("capability is replayed")
@@ -778,29 +653,31 @@ def load_finalization_trust_from_protected_fd() -> FinalizationTrustMaterial:
         raise FinalizationServiceError("launcher finalization trust is invalid") from error
 
 
+def _load_finalization_binding_from_protected_fd() -> str:
+    try:
+        payload = _load_protected_json(_LAUNCHER_FINALIZATION_BINDING_FD, "binding")
+        if not isinstance(payload, dict) or set(payload) != {"domain", "public_key_hash"}:
+            raise ValueError
+        if payload["domain"] != "auto-code-finalization-binding/v1":
+            raise ValueError
+        return _require_hash(payload["public_key_hash"], "finalization public key hash")
+    except (TypeError, ValueError, FinalizationServiceError) as error:
+        raise FinalizationCapabilityError("launcher finalization binding is invalid") from error
+
+
 def validate_finalization_capability(
     capability: FinalizationCapabilityDescriptor,
     trust: FinalizationTrustMaterial,
+    expected_public_key_hash: str,
 ) -> None:
     try:
         capability.verify(trust.public_key)
-        expected_root = trust.state_root
-        if (
-            trust.descriptor_hash != hashlib.sha256(capability.to_bytes()).hexdigest()
+        if hashlib.sha256(bytes.fromhex(trust.public_key)).hexdigest() != _require_hash(
+            expected_public_key_hash,
+            "finalization public key hash",
         ):
             raise FinalizationCapabilityError("finalization trust binding is invalid")
-        from .state import RunStateStore
-
-        generation = RunStateStore.load_read_only(expected_root, capability.run_id)
-        state = generation.state
-        expected_key_hash = state.finalization_public_key_hash
-        if (
-            expected_key_hash is None
-            or hashlib.sha256(bytes.fromhex(trust.public_key)).hexdigest() != expected_key_hash
-            or generation.revision != capability.expected_revision
-            or generation.state_hash != capability.expected_state_hash
-            or state.finalization_public_key != trust.public_key
-        ):
+        if trust.descriptor_hash != hashlib.sha256(capability.to_bytes()).hexdigest():
             raise FinalizationCapabilityError("finalization trust binding is invalid")
         if capability.socket_uid != os.getuid() or _socket_identity(capability.socket_path) != (capability.socket_device, capability.socket_inode, capability.socket_uid, capability.socket_mode, capability.socket_ctime_ns):
             raise FinalizationCapabilityError("launcher socket identity is invalid")
@@ -810,12 +687,14 @@ def validate_finalization_capability(
 
 def load_capability_from_protected_fd(
     trust: FinalizationTrustMaterial,
+    expected_public_key_hash: str,
 ) -> FinalizationCapabilityDescriptor:
     try:
         capability = FinalizationCapabilityDescriptor.from_payload(_load_protected_json(_LAUNCHER_FINALIZATION_FD, "capability"))
         validate_finalization_capability(
             capability,
             trust,
+            expected_public_key_hash,
         )
         return capability
     except (TypeError, ValueError, FinalizationServiceError) as error:
@@ -853,7 +732,7 @@ def invoke_protected_capability(
     request_id: str | None,
 ) -> FinalizationResponse:
     trust = load_finalization_trust_from_protected_fd()
-    descriptor = load_capability_from_protected_fd(trust)
+    descriptor = load_capability_from_protected_fd(trust, _load_finalization_binding_from_protected_fd())
     request = FinalizationRequest(
         operation=operation,
         run_id=run_id,

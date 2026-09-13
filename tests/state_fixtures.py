@@ -26,7 +26,6 @@ from auto_code.contracts import (
     RunState,
     TrustedPreparationInputRef,
 )
-from auto_code.finalization_service import _FinalizationKeyAuthority as FinalizationKeyAuthority
 from auto_code.hashing import hash_json
 from auto_code.run_index import ActivationResult, ActiveRunIndex, PreparationReservation
 from auto_code.state import EMPTY_STATE_HASH, CompareAndSwapConflict, RunStateStore, StateGeneration
@@ -334,11 +333,11 @@ def activated_index(
     reservation = index.reserve("repo-1")
     request = activation_request(reservation)
     assert request.initial_state is not None
-    trust = FinalizationKeyAuthority(tmp_path).provision(f"fixture-{reservation.reservation_id}")
+    public_key = index.finalization_public_key
     initial = request.initial_state.model_copy(
         update={
-            "finalization_public_key": trust.public_key,
-            "finalization_public_key_hash": trust.public_key_hash,
+            "finalization_public_key": public_key,
+            "finalization_public_key_hash": hashlib.sha256(bytes.fromhex(public_key)).hexdigest(),
         }
     )
     return index, index.activate_reservation(

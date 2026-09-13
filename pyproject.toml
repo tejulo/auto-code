@@ -17,6 +17,7 @@ dependencies = [
 
 [project.scripts]
 auto-code = "auto_code.cli:entrypoint"
+auto-code-launcher = "auto_code.launcher:entrypoint"
 auto-code-repair = "auto_code.repair_entrypoint:entrypoint"
 
 [project.optional-dependencies]
@@ -24,6 +25,7 @@ test = ["pytest>=8,<9", "respx"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+py-modules = ["launcher_finalization"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -3,9 +3,11 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 import socket
+import sys
 from types import SimpleNamespace
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from auto_code.contracts import (
     EvidenceRef,
@@ -24,7 +26,7 @@ from launcher_finalization import (
     FinalizationLauncherError,
     _LauncherRuntime as FinalizationLauncherRuntime,
 )
-from auto_code.finalization_service import FinalizationCapabilityError, _FinalizationKeyAuthority as FinalizationKeyAuthority
+from auto_code.finalization_service import FinalizationCapabilityError
 from auto_code.prepare import PreparationContext, PreparationContextAuthority
 from auto_code.state import EMPTY_STATE_HASH, RunStateStore
 
@@ -72,8 +74,13 @@ def _preparation_ref() -> TrustedPreparationInputRef:
     )
 
 
+_SIGNING_KEYS: dict[Path, Ed25519PrivateKey] = {}
+
+
 def _persisted_run(state_root: Path) -> tuple[RunStateStore, object]:
-    binding = FinalizationKeyAuthority(state_root).provision("reservation-1")
+    signing_key = Ed25519PrivateKey.generate()
+    public_key = signing_key.public_key().public_bytes_raw().hex()
+    _SIGNING_KEYS[state_root] = signing_key
     store = RunStateStore(state_root, "run-1")
     generation = store.compare_and_swap(
         0,
@@ -83,11 +90,15 @@ def _persisted_run(state_root: Path) -> tuple[RunStateStore, object]:
             ticket_id="ENG-1",
             repository_id="repo-1",
             max_crew_iterations=1,
-            finalization_public_key=binding.public_key,
-            finalization_public_key_hash=binding.public_key_hash,
+            finalization_public_key=public_key,
+            finalization_public_key_hash=__import__("hashlib").sha256(bytes.fromhex(public_key)).hexdigest(),
         ),
     )
     return store, generation
+
+
+def _runtime(state_root: Path, index: object) -> FinalizationLauncherRuntime:
+    return FinalizationLauncherRuntime(state_root=state_root, active_run_index=index, signing_key=_SIGNING_KEYS.get(state_root))
 
 
 class ActiveIndexHarness:
@@ -127,7 +138,7 @@ def test_launcher_issues_a_finalize_descriptor_from_the_exact_active_run(tmp_pat
     listener.bind(str(socket_path))
     try:
         launcher = FinalizationLauncher(
-            FinalizationLauncherRuntime(state_root=tmp_path, active_run_index=ActiveIndexHarness(tmp_path))
+            _runtime(tmp_path, ActiveIndexHarness(tmp_path))
         )
 
         descriptor = launcher.serve_descriptor(
@@ -154,7 +165,7 @@ def test_launcher_rejects_descriptor_issuance_after_the_active_run_index_is_rele
     listener.bind(str(socket_path))
     try:
         launcher = FinalizationLauncher(
-            FinalizationLauncherRuntime(state_root=tmp_path, active_run_index=ActiveIndexHarness(tmp_path, active=False))
+            _runtime(tmp_path, ActiveIndexHarness(tmp_path, active=False))
         )
 
         with pytest.raises(FinalizationLauncherError, match="Active Run Index"):
@@ -167,10 +178,31 @@ def test_launcher_exposes_no_direct_finalizer_invocation(tmp_path: Path) -> None
     """All launcher execution enters through an issued descriptor and durable nonce lifecycle."""
 
     launcher = FinalizationLauncher(
-        FinalizationLauncherRuntime(state_root=tmp_path, active_run_index=ActiveIndexHarness(tmp_path))
+        _runtime(tmp_path, ActiveIndexHarness(tmp_path))
     )
 
     assert not hasattr(launcher, "serve")
+
+
+def test_launcher_serves_one_ticket_process_over_protected_fds(tmp_path: Path) -> None:
+    """The ticket receives only inherited capability material, not launcher state paths."""
+
+    _, generation = _persisted_run(tmp_path)
+    launcher = FinalizationLauncher(_runtime(tmp_path, ActiveIndexHarness(tmp_path)))
+    ticket = (
+        sys.executable,
+        "-c",
+        (
+            "from auto_code.finalization_service import invoke_protected_capability; "
+            "invoke_protected_capability('finalize', 'run-1', "
+            f"{generation.revision}, '{generation.state_hash}', None)"
+        ),
+    )
+
+    # The deliberately incomplete harness rejects finalization after the IPC exchange;
+    # a nonzero child result proves the launcher accepted and answered the one request.
+    assert launcher.serve_ticket_process("run-1", generation.revision, generation.state_hash, ticket) == 1
+    assert not list(tmp_path.glob("finalization-*.sock"))
 
 
 @pytest.mark.parametrize(
@@ -193,7 +225,7 @@ def test_launcher_rejects_nonexact_active_run_index_bindings(
     listener.bind(str(socket_path))
     try:
         launcher = FinalizationLauncher(
-            FinalizationLauncherRuntime(state_root=tmp_path, active_run_index=index(tmp_path))
+            _runtime(tmp_path, index(tmp_path))
         )
 
         with pytest.raises(FinalizationLauncherError, match="Active Run Index"):

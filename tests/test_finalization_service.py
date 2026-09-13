@@ -29,7 +29,6 @@ from auto_code.finalization_service import (
     load_capability_from_protected_fd,
     validate_finalization_capability,
 )
-from auto_code.finalization_service import _FinalizationKeyAuthority as FinalizationKeyAuthority
 from auto_code import finalization_service
 from auto_code.hashing import canonical_json_bytes
 from auto_code.state import EMPTY_STATE_HASH, RunStateStore
@@ -100,24 +99,20 @@ def descriptor(
 
 
 def trust(service: FinalizationService) -> FinalizationTrustMaterial:
-    return FinalizationTrustMaterial(public_key=service.public_key, state_root=service.state_root)
+    return FinalizationTrustMaterial(public_key=service.public_key)
 
 
-def test_finalization_key_authority_persists_a_reloadable_private_key_outside_ticket_workspace(tmp_path: Path) -> None:
-    """Discarding the private key or writing it below the ticket workspace leaves no launcher signing authority."""
+def test_finalization_service_never_persists_its_in_memory_private_key(tmp_path: Path) -> None:
+    """Writing a private key below the state root would let a ticket process recover launcher authority."""
 
     state_root = tmp_path / "launcher-state"
-    ticket_workspace = tmp_path / "ticket-workspace"
-    ticket_workspace.mkdir()
-    authority = FinalizationKeyAuthority(state_root)
+    FinalizationService(
+        signing_key=Ed25519PrivateKey.generate(),
+        state_root=state_root,
+        handlers=FinalizationHandlers(finalize=lambda _: StepResult(kind=StepKind.READY_TO_FINALIZE, run_id="run-1", state_revision=1, state_hash="a" * 64), receipt=lambda _: StepResult(kind=StepKind.READY_TO_FINALIZE, run_id="run-1", state_revision=1, state_hash="a" * 64)),
+    )
 
-    binding = authority.provision("reservation-1")
-    private_key = authority.load_private_key(binding.public_key_hash)
-    key_path = state_root / "finalization-keys" / f"{binding.public_key_hash}.json"
-
-    assert private_key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex() == binding.public_key
-    assert stat.S_IMODE(key_path.stat().st_mode) == 0o600
-    assert not tuple(ticket_workspace.iterdir())
+    assert not (state_root / "finalization-keys").exists()
 
 
 def test_forged_descriptor_signature_is_rejected(service: FinalizationService, tmp_path: Path) -> None:
@@ -170,9 +165,9 @@ def test_capability_descriptor_requires_a_signed_fixed_fd(
         assert load_capability_from_protected_fd(
             FinalizationTrustMaterial(
                 public_key=service.public_key,
-                state_root=service.state_root,
                 descriptor_hash=__import__("hashlib").sha256(issued.to_bytes()).hexdigest(),
             ),
+            __import__("hashlib").sha256(bytes.fromhex(service.public_key)).hexdigest(),
         ) == issued
     finally:
         os.close(fd)
@@ -351,14 +346,24 @@ def test_installed_finalize_cli_uses_only_the_fixed_fd_capability(
     trust_path.write_bytes(
         FinalizationTrustMaterial(
             public_key=service.public_key,
-            state_root=service.state_root,
             descriptor_hash=__import__("hashlib").sha256(issued.to_bytes()).hexdigest(),
         ).to_bytes()
     )
+    binding_path = tmp_path / "binding.json"
+    binding_path.write_bytes(
+        canonical_json_bytes(
+            {
+                "domain": "auto-code-finalization-binding/v1",
+                "public_key_hash": __import__("hashlib").sha256(bytes.fromhex(service.public_key)).hexdigest(),
+            }
+        )
+    )
     fd = os.open(descriptor_path, os.O_RDONLY)
     trust_fd = os.open(trust_path, os.O_RDONLY)
+    binding_fd = os.open(binding_path, os.O_RDONLY)
     monkeypatch.setattr(finalization_service, "_LAUNCHER_FINALIZATION_FD", fd)
     monkeypatch.setattr(finalization_service, "_LAUNCHER_FINALIZATION_TRUST_FD", trust_fd)
+    monkeypatch.setattr(finalization_service, "_LAUNCHER_FINALIZATION_BINDING_FD", binding_fd)
     worker = threading.Thread(target=service.serve_once, args=(listener,), daemon=True)
     worker.start()
     try:
@@ -371,6 +376,7 @@ def test_installed_finalize_cli_uses_only_the_fixed_fd_capability(
         worker.join(timeout=2)
         os.close(fd)
         os.close(trust_fd)
+        os.close(binding_fd)
 
     assert not worker.is_alive()
     assert '"kind":"ready_to_finalize"' in capsys.readouterr().out
@@ -398,12 +404,23 @@ def test_trusted_fd_rejects_attacker_descriptor_before_connect(
     descriptor_path = tmp_path / "attacker-capability.json"
     descriptor_path.write_bytes(attacker_descriptor.to_bytes())
     trust_path = tmp_path / "trusted-material.json"
-    trust_path.write_bytes(FinalizationTrustMaterial(public_key=service.public_key, state_root=service.state_root).to_bytes())
+    trust_path.write_bytes(FinalizationTrustMaterial(public_key=service.public_key).to_bytes())
+    binding_path = tmp_path / "trusted-binding.json"
+    binding_path.write_bytes(
+        canonical_json_bytes(
+            {
+                "domain": "auto-code-finalization-binding/v1",
+                "public_key_hash": __import__("hashlib").sha256(bytes.fromhex(service.public_key)).hexdigest(),
+            }
+        )
+    )
     descriptor_fd = os.open(descriptor_path, os.O_RDONLY)
     trust_fd = os.open(trust_path, os.O_RDONLY)
+    binding_fd = os.open(binding_path, os.O_RDONLY)
     try:
         monkeypatch.setattr(finalization_service, "_LAUNCHER_FINALIZATION_FD", descriptor_fd)
         monkeypatch.setattr(finalization_service, "_LAUNCHER_FINALIZATION_TRUST_FD", trust_fd)
+        monkeypatch.setattr(finalization_service, "_LAUNCHER_FINALIZATION_BINDING_FD", binding_fd)
         with pytest.raises(FinalizationServiceError, match="trust"):
             invoke_protected_capability(
                 "finalize",
@@ -418,6 +435,7 @@ def test_trusted_fd_rejects_attacker_descriptor_before_connect(
         listener.close()
         os.close(descriptor_fd)
         os.close(trust_fd)
+        os.close(binding_fd)
 
 
 def test_attacker_cannot_finalize_with_replaced_fd4_and_fd5(
@@ -486,7 +504,6 @@ def test_attacker_cannot_finalize_with_replaced_fd4_and_fd5(
     trust_path.write_bytes(
         FinalizationTrustMaterial(
             public_key=attacker.public_key,
-            state_root=state_root,
             descriptor_hash=__import__("hashlib").sha256(issued.to_bytes()).hexdigest(),
         ).to_bytes()
     )
@@ -594,7 +611,6 @@ def test_capability_rejects_replaced_descriptor_and_trust_fds(tmp_path: Path) ->
         )
         attacker_trust = FinalizationTrustMaterial(
             public_key=attacker.public_key,
-            state_root=state_root,
             descriptor_hash=__import__("hashlib").sha256(attacker_descriptor.to_bytes()).hexdigest(),
         )
 
@@ -602,6 +618,7 @@ def test_capability_rejects_replaced_descriptor_and_trust_fds(tmp_path: Path) ->
             validate_finalization_capability(
                 attacker_descriptor,
                 attacker_trust,
+                generation.state.finalization_public_key_hash,
             )
     finally:
         listener.close()
@@ -649,7 +666,7 @@ def test_socket_path_replacement_is_rejected_before_connect(service: Finalizatio
     replacement.settimeout(0.05)
     try:
         with pytest.raises(FinalizationServiceError, match="identity"):
-            invoke_descriptor(issued, trust=FinalizationTrustMaterial(public_key=service.public_key, state_root=service.state_root))
+            invoke_descriptor(issued, trust=FinalizationTrustMaterial(public_key=service.public_key))
         with pytest.raises(TimeoutError):
             replacement.accept()
     finally:
@@ -680,7 +697,7 @@ def test_socket_eof_without_a_newline_fails_closed(
     worker.start()
     try:
         with pytest.raises(FinalizationServiceError, match="socket"):
-            invoke_descriptor(issued, trust=FinalizationTrustMaterial(public_key=service.public_key, state_root=service.state_root))
+            invoke_descriptor(issued, trust=FinalizationTrustMaterial(public_key=service.public_key))
     finally:
         listener.close()
         worker.join(timeout=2)
@@ -707,7 +724,7 @@ def test_socket_read_deadline_fails_closed(service: FinalizationService, tmp_pat
     worker.start()
     try:
         with pytest.raises(FinalizationServiceError, match="socket"):
-            invoke_descriptor(issued, trust=FinalizationTrustMaterial(public_key=service.public_key, state_root=service.state_root))
+            invoke_descriptor(issued, trust=FinalizationTrustMaterial(public_key=service.public_key))
     finally:
         listener.close()
         worker.join(timeout=2)

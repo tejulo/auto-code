@@ -128,10 +128,6 @@ class _CompatibilityVerifier(Protocol):
     def verify(self, runtime_config: object, role_config: object) -> object: ...
 
 
-class _FinalizationKeyProvisioner(Protocol):
-    def provision(self, reservation_id: str) -> object: ...
-
-
 @dataclass(frozen=True)
 class PrepareProbeResult:
     kind: Literal["RESUME", "BLOCKED", "INPUT_REQUIRED"]
@@ -187,7 +183,7 @@ class PrepareCoordinator:
         reservation_owner: Callable[[], ReservationOwner],
         now: Callable[[], datetime],
         repair_activation_public_key: bytes,
-        finalization_keys: _FinalizationKeyProvisioner,
+        finalization_public_key: bytes,
         linear: LinearGateway | None = None,
         context: PreparationContextAuthority | None = None,
     ) -> None:
@@ -202,9 +198,10 @@ class PrepareCoordinator:
         if not isinstance(repair_activation_public_key, bytes) or len(repair_activation_public_key) != 32:
             raise ValueError("repair activation public key is invalid")
         self.repair_activation_public_key = bytes(repair_activation_public_key)
-        if not callable(getattr(finalization_keys, "provision", None)):
-            raise ValueError("finalization key authority is invalid")
-        self.finalization_keys = finalization_keys
+        if not isinstance(finalization_public_key, bytes) or len(finalization_public_key) != 32:
+            raise ValueError("finalization public key is invalid")
+        self.finalization_public_key = finalization_public_key.hex()
+        self.finalization_public_key_hash = hashlib.sha256(finalization_public_key).hexdigest()
         self.linear = linear
         self.context = context
 
@@ -248,8 +245,7 @@ class PrepareCoordinator:
             pagination_complete=True,
             source_page_hashes=reference.source_page_hashes,
         )
-        finalization_binding = self.finalization_keys.provision(reservation.reservation_id)
-        if finalization_binding.public_key == self.repair_activation_public_key.hex():
+        if self.finalization_public_key == self.repair_activation_public_key.hex():
             raise PrepareError("finalization public key is invalid")
         claim = self.index.claim_selected_activation(
             SelectedActivationClaimRequest(
@@ -263,8 +259,8 @@ class PrepareCoordinator:
                 original_external_revision=original_external_revision,
                 repair_activation_public_key=self.repair_activation_public_key.hex(),
                 repair_activation_public_key_hash=hashlib.sha256(self.repair_activation_public_key).hexdigest(),
-                finalization_public_key=finalization_binding.public_key,
-                finalization_public_key_hash=finalization_binding.public_key_hash,
+                finalization_public_key=self.finalization_public_key,
+                finalization_public_key_hash=self.finalization_public_key_hash,
             )
         )
         if claim.outcome == "wait":

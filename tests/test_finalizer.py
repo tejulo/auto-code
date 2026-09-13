@@ -53,7 +53,6 @@ from auto_code.finalization_service import (
     _LauncherFinalizationServiceInternal as FinalizationService,
     invoke_descriptor,
 )
-from auto_code.finalization_service import _FinalizationKeyAuthority as FinalizationKeyAuthority
 from launcher_finalization import FinalizationLauncher, _LauncherRuntime as FinalizationLauncherRuntime
 from auto_code.hashing import canonical_json_bytes, hash_json
 from auto_code.linear import LinearGateway
@@ -428,6 +427,7 @@ class FinalizerHarness:
     index: FakeActiveRunIndex
     artifacts: FinalizationArtifacts
     generation: StateGeneration
+    signing_key: Ed25519PrivateKey
 
     def accept(self, result: object) -> StateGeneration:
         action = getattr(result, "action")
@@ -458,7 +458,8 @@ def harness(tmp_path: Path) -> FinalizerHarness:
         client=client,
     )
     store = RunStateStore(tmp_path, "run-1", receipt_authority=bridge.receipt_authority)
-    finalization_binding = FinalizationKeyAuthority(tmp_path).provision("finalization-test-reservation")
+    finalization_key = Ed25519PrivateKey.generate()
+    finalization_public_key = finalization_key.public_key().public_bytes_raw().hex()
     initial = store.compare_and_swap(
         0,
         EMPTY_STATE_HASH,
@@ -467,8 +468,8 @@ def harness(tmp_path: Path) -> FinalizerHarness:
             ticket_id="ENG-1",
             repository_id="repo-1",
             max_crew_iterations=3,
-            finalization_public_key=finalization_binding.public_key,
-            finalization_public_key_hash=finalization_binding.public_key_hash,
+            finalization_public_key=finalization_public_key,
+            finalization_public_key_hash=sha256(bytes.fromhex(finalization_public_key)).hexdigest(),
         ),
     )
     definitions = store.compare_and_swap(
@@ -526,7 +527,7 @@ def harness(tmp_path: Path) -> FinalizerHarness:
     generation = store.compare_and_swap(statuses.revision, statuses.state_hash, state)
     git = FakeGitGuard(approved.product_manifest.baseline_sha)
     index = FakeActiveRunIndex(
-        signing_key=FinalizationKeyAuthority(tmp_path).load_private_key(finalization_binding.public_key_hash)
+        signing_key=finalization_key
     )
     finalizer = Finalizer(
         FinalizerDependencies(
@@ -538,7 +539,7 @@ def harness(tmp_path: Path) -> FinalizerHarness:
             artifacts=approved,
         )
     )
-    return FinalizerHarness(store, finalizer, bridge, git, client, index, approved, generation)
+    return FinalizerHarness(store, finalizer, bridge, git, client, index, approved, generation, finalization_key)
 
 
 def test_linear_failure_after_push_never_creates_second_commit(harness: FinalizerHarness) -> None:
@@ -789,6 +790,7 @@ def test_launcher_replays_completed_nonce_without_second_git_effect(harness: Fin
             git_guard=harness.git,
             active_run_index=harness.index,
             artifact_authority=SimpleNamespace(load_for=lambda _: harness.artifacts),
+            signing_key=harness.signing_key,
         )
     )
     socket_path = harness.store.root / "launcher.sock"
@@ -803,7 +805,6 @@ def test_launcher_replays_completed_nonce_without_second_git_effect(harness: Fin
     )
     trust = FinalizationTrustMaterial(
         public_key=generation.state.finalization_public_key,
-        state_root=harness.store.root,
         descriptor_hash=sha256(descriptor.to_bytes()).hexdigest(),
     )
 
@@ -825,6 +826,7 @@ def test_launcher_replays_completed_nonce_without_second_git_effect(harness: Fin
                 git_guard=harness.git,
                 active_run_index=harness.index,
                 artifact_authority=SimpleNamespace(load_for=lambda _: harness.artifacts),
+                signing_key=harness.signing_key,
             )
         )
         assert restarted._services == {}
@@ -963,9 +965,7 @@ def test_finalize_and_receipt_cli_dispatch_only_through_the_launcher_socket(
     listener.bind(str(socket_path))
     listener.listen(2)
     service = FinalizationService(
-        signing_key=FinalizationKeyAuthority(harness.store.root).load_private_key(
-            harness.store.load().state.finalization_public_key_hash
-        ),
+        signing_key=Ed25519PrivateKey.generate(),
         state_root=harness.store.root,
         handlers=FinalizationHandlers(
             finalize=lambda _: harness.finalizer.advance(harness.store.load()),
@@ -981,14 +981,24 @@ def test_finalize_and_receipt_cli_dispatch_only_through_the_launcher_socket(
         trust_path.write_bytes(
             FinalizationTrustMaterial(
                 public_key=service.public_key,
-                state_root=harness.store.root,
                 descriptor_hash=sha256(descriptor.to_bytes()).hexdigest(),
             ).to_bytes()
         )
         capability_fd = os.open(capability_path, os.O_RDONLY)
         trust_fd = os.open(trust_path, os.O_RDONLY)
+        binding_path = harness.store.root / "finalization-binding.json"
+        binding_path.write_bytes(
+            canonical_json_bytes(
+                {
+                    "domain": "auto-code-finalization-binding/v1",
+                    "public_key_hash": sha256(bytes.fromhex(service.public_key)).hexdigest(),
+                }
+            )
+        )
+        binding_fd = os.open(binding_path, os.O_RDONLY)
         monkeypatch.setattr(finalization_service, "_LAUNCHER_FINALIZATION_FD", capability_fd)
         monkeypatch.setattr(finalization_service, "_LAUNCHER_FINALIZATION_TRUST_FD", trust_fd)
+        monkeypatch.setattr(finalization_service, "_LAUNCHER_FINALIZATION_BINDING_FD", binding_fd)
         worker = threading.Thread(target=service.serve_once, args=(listener,), daemon=True)
         worker.start()
         try:
@@ -1000,6 +1010,7 @@ def test_finalize_and_receipt_cli_dispatch_only_through_the_launcher_socket(
             worker.join(timeout=2)
             os.close(capability_fd)
             os.close(trust_fd)
+            os.close(binding_fd)
 
     try:
         assert invoke("finalize", harness.generation.revision, harness.generation.state_hash) == 0
