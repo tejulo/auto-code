@@ -1756,14 +1756,19 @@ def test_installed_protected_prepare_composes_pinned_process_git_and_sandbox(
     descriptor = signed_descriptor(tmp_path / "descriptor.json", payload, private_key)
     try:
         monkeypatch.setattr(repair_entrypoint, "_REPAIR_DESCRIPTOR_FD", descriptor)
-        runtime = repair_entrypoint.load_protected_runtime(verification_key=public_key)
-        result = repair_entrypoint.main(
+        monkeypatch.setattr(repair_entrypoint, "_REPAIR_DESCRIPTOR_VERIFICATION_KEY", public_key)
+        monkeypatch.setattr(
+            sys,
+            "argv",
             [
+                "auto-code-repair",
                 "prepare", "--run", "run-1", "--expected-revision", str(harness.generation.revision),
                 "--expected-hash", harness.generation.state_hash, "--failure", harness.failure_hash,
             ],
-            runtime=runtime,
         )
+        with pytest.raises(SystemExit) as exit_status:
+            repair_entrypoint.entrypoint()
+        runtime = repair_entrypoint.load_protected_runtime(verification_key=public_key)
         requests_before_recovery = len(server.requests)
         recovered = runtime.prepare(
             "run-1",
@@ -1775,7 +1780,7 @@ def test_installed_protected_prepare_composes_pinned_process_git_and_sandbox(
         os.close(descriptor)
         server.close()
 
-    assert result == 0
+    assert exit_status.value.code == 0
     output = json.loads(capsys.readouterr().out)
     assert preparation_observation == {"journal_exists": True}
     assert recovered.id == output["workspace"]["id"]
@@ -1934,18 +1939,22 @@ def test_installed_protected_apply_builds_reconciles_and_activates_from_descript
     apply_descriptor = signed_descriptor(tmp_path / "apply.json", apply_payload, private_key)
     try:
         monkeypatch.setattr(repair_entrypoint, "_REPAIR_DESCRIPTOR_FD", apply_descriptor)
-        runtime = repair_entrypoint.load_protected_runtime(verification_key=public_key)
-        result = repair_entrypoint.main(
-            ["apply", "--workspace", str(handle.path), "--request", request_hash],
-            runtime=runtime,
+        monkeypatch.setattr(repair_entrypoint, "_REPAIR_DESCRIPTOR_VERIFICATION_KEY", public_key)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["auto-code-repair", "apply", "--workspace", str(handle.path), "--request", request_hash],
         )
+        with pytest.raises(SystemExit) as exit_status:
+            repair_entrypoint.entrypoint()
+        runtime = repair_entrypoint.load_protected_runtime(verification_key=public_key)
         sandbox_requests = len(server.requests)
         recovered = runtime.apply(str(handle.path), request_hash)
     finally:
         os.close(apply_descriptor)
         server.close()
 
-    assert result == 0
+    assert exit_status.value.code == 0
     generation = harness.store.load()
     assert generation.state.disposition is RunDisposition.ACTIVE
     assert recovered == generation
