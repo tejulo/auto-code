@@ -722,6 +722,50 @@ class GitGuard:
             raise PushNotAuthorizedError("Remote ticket branch does not match the approved commit")
         return self._approved_commit
 
+    def refresh_finalization(self, branch: str, baseline_sha: str) -> bool:
+        """Fetch and bind the exact ticket branch and approved remote base for finalization."""
+
+        _validate_branch_name(branch)
+        _validate_sha(baseline_sha)
+        self._run("fetch", "--no-tags", self.remote, redact_output=True)
+        snapshot = self._remote_snapshot()
+        if snapshot.base_sha != baseline_sha or self._current_branch() != branch:
+            return False
+        self._ticket_branch = branch
+        self._prepared_remote = snapshot
+        return True
+
+    def commit_product_manifest(self, manifest: object, message: str) -> str:
+        return self.commit_manifest(_product_manifest_inputs(manifest), message)
+
+    def push_product_commit(self, commit_sha: str) -> str:
+        _validate_sha(commit_sha)
+        if self._approved_commit != commit_sha:
+            raise PushNotAuthorizedError("Push commit does not match the approved product commit")
+        return self.push()
+
+    def reconcile_product_commit(self, manifest: object, commit_sha: str | None) -> str | None:
+        inputs = _product_manifest_inputs(manifest)
+        candidate = self._rev_parse("HEAD") if commit_sha is None else _validate_sha(commit_sha)
+        if self._rev_parse("HEAD") != candidate:
+            return None
+        try:
+            self._verify_commit(inputs, candidate)
+        except ManifestMismatchError:
+            return None
+        self._approved_commit = candidate
+        return candidate
+
+    def reconcile_product_push(self, branch: str, commit_sha: str) -> str | None:
+        _validate_branch_name(branch)
+        _validate_sha(commit_sha)
+        reference = f"refs/heads/{branch}"
+        remote = self._stdout(self._run("ls-remote", "--heads", self.remote, reference, redact_output=True)).splitlines()
+        if len(remote) != 1:
+            return None
+        remote_sha = remote[0].split(maxsplit=1)[0].lower()
+        return commit_sha if remote_sha == commit_sha else None
+
     def _run(self, *argv: str, allow_failure: bool = False, redact_output: bool = False) -> CommandResult:
         if self.executor is None:
             raise GitExecutorUnavailableError("Git requires an explicit trusted executor")
@@ -1117,6 +1161,32 @@ def _bounded_worktree_hash(
         raise
     except OSError as error:
         raise GitGuardError("Worktree path cannot be read safely") from error
+
+
+def _product_manifest_inputs(manifest: object) -> GitManifestInputs:
+    """Translate the reviewed product manifest at the Git boundary, not in callers."""
+
+    from .contracts import ProductChangeManifest
+
+    if not isinstance(manifest, ProductChangeManifest):
+        raise ManifestMismatchError("Approved product manifest is invalid")
+    return GitManifestInputs(
+        baseline_sha=manifest.baseline_sha,
+        files=tuple(
+            GitManifestFile(
+                path=file.path,
+                status=file.status,
+                old_path=file.old_path,
+                old_mode=file.old_mode,
+                new_mode=file.mode,
+                old_object_id=file.old_object_id,
+                object_id=file.object_id,
+                binary=file.binary,
+                untracked=file.untracked,
+            )
+            for file in manifest.files
+        ),
+    )
 
 
 def _manifest_stage_paths(manifest: GitManifestInputs) -> set[str]:

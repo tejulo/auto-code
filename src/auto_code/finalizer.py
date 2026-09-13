@@ -107,7 +107,6 @@ class Finalizer:
                 return self._gated_result(generation)
             try:
                 artifacts = self._verify_approval(state)
-                self._verify_git_position(state, artifacts)
             except Exception:
                 return self._human_review(generation)
 
@@ -116,14 +115,19 @@ class Finalizer:
                     generation,
                     state.ticket_id,
                     expected_external_revision=artifacts.original_external_revision,
+                    expected_state_id=artifacts.original_state_id,
                 )
                 persisted = self.dependencies.linear.persist_pending(generation, request)
                 return self._action_result(persisted, request)
             if state.prefinalization_ticket_projection != self._projection_hash(artifacts.ticket_snapshot):
                 return self._human_review(generation)
+            try:
+                self._verify_git_position(state, artifacts)
+            except Exception:
+                return self._human_review(generation)
 
             if state.commit_sha is None:
-                reconciled = self._reconcile_local_effect(generation, "commit")
+                reconciled = self._reconcile_local_effect(generation, "commit", artifacts)
                 if reconciled is not generation:
                     generation = reconciled
                     continue
@@ -135,7 +139,7 @@ class Finalizer:
                 continue
 
             if state.pushed_sha is None:
-                reconciled = self._reconcile_local_effect(generation, "push")
+                reconciled = self._reconcile_local_effect(generation, "push", artifacts)
                 if reconciled is not generation:
                     generation = reconciled
                     continue
@@ -182,8 +186,11 @@ class Finalizer:
                     }
                 ),
             )
-            self._release_active_run(done)
-            return self._result(StepKind.DONE, done)
+            try:
+                released = self._release_active_run(done)
+            except Exception:
+                return self._human_review(done)
+            return self._result(StepKind.DONE, released)
 
     def accept_trusted_receipt(self, generation: StateGeneration, receipt: TrustedMcpReceipt) -> StateGeneration:
         """Consume only bridge-authenticated receipts matched by the pending request."""
@@ -196,10 +203,17 @@ class Finalizer:
 
         def update(state: RunState, accepted: TrustedMcpReceipt) -> RunState:
             if pending.operation == "query_ticket_projection":
-                if accepted.outcome is not EffectOutcome.SUCCESS or accepted.result_hash != self._projection_hash(artifacts.ticket_snapshot):
+                if (
+                    accepted.outcome is not EffectOutcome.SUCCESS
+                    or accepted.external_revision != artifacts.original_external_revision
+                    or accepted.observed_state_id != artifacts.original_state_id
+                    or accepted.result_hash != self._projection_hash(artifacts.ticket_snapshot)
+                ):
                     return self._failed_state(state)
                 return state.model_copy(update={"prefinalization_ticket_projection": accepted.result_hash})
             if pending.operation == "compare_and_complete_ticket" and accepted.outcome is EffectOutcome.SUCCESS:
+                if accepted.observed_state_id != artifacts.project_policy.linear.completed_state_id:
+                    return self._failed_state(state)
                 return state.model_copy(update={"linear_done_receipt": accepted.content_hash})
             return state
 
@@ -263,13 +277,11 @@ class Finalizer:
 
     def _verify_git_position(self, state: RunState, artifacts: FinalizationArtifacts) -> None:
         git = self.dependencies.git_guard
-        if not state.branch or self._call(git, "current_branch") != state.branch:
-            raise FinalizationError("ticket branch changed")
-        if self._call(git, "remote_base_sha") != artifacts.product_manifest.baseline_sha:
-            raise FinalizationError("remote base advanced")
-        if state.commit_sha is not None and self._call(git, "observe_commit") != state.commit_sha:
+        if not state.branch or self._call(git, "refresh_finalization", state.branch, artifacts.product_manifest.baseline_sha) is not True:
+            raise FinalizationError("ticket branch or remote base changed")
+        if state.commit_sha is not None and self._call(git, "reconcile_product_commit", artifacts.product_manifest, state.commit_sha) != state.commit_sha:
             raise FinalizationError("local commit changed")
-        if state.pushed_sha is not None and self._call(git, "observe_push") != state.pushed_sha:
+        if state.pushed_sha is not None and self._call(git, "reconcile_product_push", state.branch, state.pushed_sha) != state.pushed_sha:
             raise FinalizationError("remote ticket branch changed")
 
     def _invoke_commit(self, generation: StateGeneration, artifacts: FinalizationArtifacts) -> StateGeneration:
@@ -277,7 +289,7 @@ class Finalizer:
         try:
             commit = self._call(
                 self.dependencies.git_guard,
-                "commit_manifest",
+                "commit_product_manifest",
                 artifacts.product_manifest,
                 f"{generation.state.ticket_id}: {artifacts.ticket_snapshot.title}",
             )
@@ -291,14 +303,19 @@ class Finalizer:
         del artifacts
         intended, effect_id = self._intend(generation, "push", generation.state.ticket_id)
         try:
-            pushed = self._call(self.dependencies.git_guard, "push", generation.state.commit_sha)
+            pushed = self._call(self.dependencies.git_guard, "push_product_commit", generation.state.commit_sha)
             if pushed != generation.state.commit_sha:
                 raise FinalizationError("Git push result is invalid")
             return self._record_local_result(intended, effect_id, "push", EffectOutcome.SUCCESS, pushed, {"pushed_sha": pushed})
         except Exception:
             return self._record_local_result(intended, effect_id, "push", EffectOutcome.FAILURE, None, {})
 
-    def _reconcile_local_effect(self, generation: StateGeneration, operation: str) -> StateGeneration:
+    def _reconcile_local_effect(
+        self,
+        generation: StateGeneration,
+        operation: str,
+        artifacts: FinalizationArtifacts,
+    ) -> StateGeneration:
         intentions, phases = generation.state.validate_effect_ledger()
         unresolved = [
             (effect_id, intention)
@@ -308,9 +325,18 @@ class Finalizer:
         if not unresolved:
             return generation
         effect_id, _ = unresolved[-1]
-        observed = self._call(self.dependencies.git_guard, "observe_commit" if operation == "commit" else "observe_push")
-        expected = generation.state.commit_sha if operation == "push" else observed
-        if observed is not None and (operation != "push" or observed == expected):
+        observed = (
+            self._call(self.dependencies.git_guard, "reconcile_product_commit", artifacts.product_manifest, generation.state.commit_sha)
+            if operation == "commit"
+            else self._call(
+                self.dependencies.git_guard,
+                "reconcile_product_push",
+                generation.state.branch,
+                generation.state.commit_sha,
+            )
+        )
+        expected = generation.state.commit_sha
+        if observed is not None and (operation == "commit" or observed == expected):
             updates = {"commit_sha": observed} if operation == "commit" else {"pushed_sha": observed}
             return self._record_local_result(generation, effect_id, operation, EffectOutcome.SUCCESS, observed, updates)
         return self._record_local_result(generation, effect_id, operation, EffectOutcome.UNKNOWN, None, {})
@@ -415,6 +441,11 @@ class Finalizer:
 
     def _gated_result(self, generation: StateGeneration) -> StepResult:
         if generation.state.disposition is RunDisposition.DONE:
+            if not generation.state.finalization_index_released:
+                try:
+                    generation = self._release_active_run(generation)
+                except Exception:
+                    return self._human_review(generation)
             return self._result(StepKind.DONE, generation)
         failure = generation.state.failure_history[-1] if generation.state.failure_history else FailureRecord(
             failure_class=FailureClass.ORCHESTRATION,
@@ -447,20 +478,27 @@ class Finalizer:
             failure=failure,
         )
 
-    def _release_active_run(self, generation: StateGeneration) -> None:
+    def _release_active_run(self, generation: StateGeneration) -> StateGeneration:
         index = self.dependencies.active_run_index
         lookup = getattr(index, "lookup", None)
         if not callable(lookup):
-            return
+            raise FinalizationError("Active Run Index is unavailable")
         active = lookup(generation.state.repository_id)
         if active is None:
-            return
+            raise FinalizationError("Active Run Index entry is missing")
+        if getattr(active, "run_id", None) != generation.state.run_id:
+            raise FinalizationError("Active Run Index entry belongs to another run")
         index.release(
             generation.state.repository_id,
             generation.state.run_id,
             active.index_revision,
             active.index_hash,
             generation.state_hash,
+        )
+        return self.store.compare_and_swap(
+            generation.revision,
+            generation.state_hash,
+            generation.state.model_copy(update={"finalization_index_released": True}),
         )
 
     def _require_generation(self, generation: StateGeneration) -> None:

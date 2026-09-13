@@ -208,6 +208,7 @@ class LinearGateway:
         ticket_id: str,
         *,
         expected_external_revision: str | None = None,
+        expected_state_id: str | None = None,
     ) -> McpActionRequest:
         return self.request_action(
             generation,
@@ -215,7 +216,7 @@ class LinearGateway:
             entity="ticket",
             target=ticket_id,
             expected_external_revision=expected_external_revision,
-            arguments={"ticket_id": ticket_id},
+            arguments=({"ticket_id": ticket_id, "state_id": expected_state_id} if expected_state_id is not None else {"ticket_id": ticket_id}),
         )
 
     def request_state(

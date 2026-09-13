@@ -1784,6 +1784,7 @@ class TrustedMcpReceipt(ContractModel):
     result_hash: Sha256
     outcome: EffectOutcome
     external_revision: str | None = None
+    observed_state_id: str | None = None
     bridge_identity: EffectReference
     mcp_server_identity: EffectReference
     tool_call_id: EffectReference
@@ -1821,7 +1822,7 @@ class TrustedMcpReceipt(ContractModel):
     def normalize_receipt_hashes(cls, value: str) -> str:
         return value.lower()
 
-    @field_validator("expected_external_revision", "external_revision")
+    @field_validator("expected_external_revision", "external_revision", "observed_state_id")
     @classmethod
     def validate_receipt_revision(cls, value: str | None) -> str | None:
         if value is None:
@@ -2683,6 +2684,7 @@ class RunState(ContractModel):
     finalization_eligible: bool = False
     finalization: str | None = None
     finalization_evidence: FinalizationEvidence | None = None
+    finalization_index_released: bool = False
 
     @field_validator(
         "project_policy_hash",

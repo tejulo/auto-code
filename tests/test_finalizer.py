@@ -4,8 +4,12 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
+import os
+import socket
+import threading
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from auto_code.checkpoint import CheckpointAuthority
 from auto_code.cli import TrustedRuntimeConfig, main
@@ -36,6 +40,8 @@ from auto_code.contracts import (
     VerificationResult,
 )
 from auto_code.finalizer import FinalizationArtifacts, Finalizer, FinalizerDependencies
+from auto_code import finalization_service
+from auto_code.finalization_service import FinalizationHandlers, FinalizationService, FinalizationTrustMaterial
 from auto_code.hashing import hash_json
 from auto_code.linear import LinearGateway
 from auto_code.mcp_bridge import McpToolResult, TrustedLinearBridge
@@ -248,6 +254,8 @@ class FakeGitGuard:
     fail_push: bool = False
     commit_calls: int = 0
     push_calls: int = 0
+    fresh: bool = True
+    refresh_calls: int = 0
 
     def remote_base_sha(self) -> str:
         return self.baseline_sha
@@ -278,34 +286,70 @@ class FakeGitGuard:
     def observe_push(self) -> str | None:
         return self.pushed_sha
 
+    def refresh_finalization(self, branch: str, baseline_sha: str) -> bool:
+        self.refresh_calls += 1
+        return self.fresh and branch == self.branch and baseline_sha == self.baseline_sha
+
+    def commit_product_manifest(self, manifest: object, message: str) -> str:
+        return self.commit_manifest(manifest, message)
+
+    def push_product_commit(self, commit_sha: str) -> str:
+        return self.push(commit_sha)
+
+    def reconcile_product_commit(self, manifest: object, commit_sha: str | None) -> str | None:
+        del manifest
+        if self.commit_sha is None or (commit_sha is not None and self.commit_sha != commit_sha):
+            return None
+        return self.commit_sha
+
+    def reconcile_product_push(self, branch: str, commit_sha: str) -> str | None:
+        return self.pushed_sha if branch == self.branch and self.pushed_sha == commit_sha else None
+
 
 class FakeLinearClient:
     def __init__(self, projection: TicketConstraintProjection) -> None:
         self.projection = projection
         self.always_fail_done = False
+        self.projection_state_id = "started"
+        self.completed_state_id = "done"
         self.calls: list[str] = []
 
     def call(self, server_identity: str, tool_name: str, arguments: object) -> McpToolResult:
         del server_identity, arguments
         self.calls.append(tool_name)
         if tool_name == "query_ticket_projection":
-            return McpToolResult(tool_call_id="projection", result=self.projection.model_dump(mode="json", round_trip=True), external_revision="revision-1")
+            return McpToolResult(
+                tool_call_id="projection",
+                result=self.projection.model_dump(mode="json", round_trip=True),
+                external_revision="revision-1",
+                observed_state_id=self.projection_state_id,
+            )
         assert tool_name == "compare_and_complete_ticket"
         return McpToolResult(
             tool_call_id=f"done-{len(self.calls)}",
-            result={"state_id": "done"},
+            result={"state_id": self.completed_state_id},
             external_revision="revision-2",
             outcome="failure" if self.always_fail_done else "success",
+            observed_state_id=self.completed_state_id,
         )
 
 
 @dataclass
 class FakeActiveRunIndex:
     release_calls: int = 0
+    active: bool = True
+    run_id: str = "run-1"
+    index_revision: int = 1
+    index_hash: str = "a" * 64
+
+    def lookup(self, repository_id: str) -> FakeActiveRunIndex | None:
+        assert repository_id == "repo-1"
+        return self if self.active else None
 
     def release(self, *args: object) -> None:
-        del args
+        assert args[1] == self.run_id
         self.release_calls += 1
+        self.active = False
 
 
 @dataclass
@@ -440,6 +484,64 @@ def test_linear_failure_after_push_never_creates_second_commit(harness: Finalize
     assert harness.git.push_calls == 1
 
 
+def test_prefinalization_projection_binds_original_revision_and_state(harness: FinalizerHarness) -> None:
+    action = harness.finalizer.advance(harness.generation)
+
+    assert action.kind is StepKind.MCP_ACTION
+    assert action.action is not None
+    assert action.action.expected_external_revision == "revision-1"
+    assert action.action.arguments == {"ticket_id": "ENG-1", "state_id": "started"}
+
+
+def test_finalization_rejects_projection_with_the_wrong_observed_ticket_state(harness: FinalizerHarness) -> None:
+    harness.client.projection_state_id = "other"
+
+    action = harness.finalizer.advance(harness.generation)
+    assert action.action is not None
+    accepted = harness.accept(action)
+    result = harness.finalizer.advance(accepted)
+
+    assert result.kind is StepKind.HUMAN_REVIEW
+    assert harness.git.commit_calls == 0
+    assert harness.git.push_calls == 0
+
+
+def test_finalization_rejects_completion_with_the_wrong_observed_ticket_state(harness: FinalizerHarness) -> None:
+    action = harness.request_done()
+    harness.client.completed_state_id = "other"
+    accepted = harness.accept(action)
+    result = harness.finalizer.advance(accepted)
+
+    assert result.kind is StepKind.HUMAN_REVIEW
+    assert harness.git.commit_calls == 1
+    assert harness.git.push_calls == 1
+
+
+def test_finalization_fetches_the_remote_after_projection_before_git_effects(harness: FinalizerHarness) -> None:
+    projection = harness.finalizer.advance(harness.generation)
+    harness.generation = harness.accept(projection)
+    harness.git.fresh = False
+
+    result = harness.finalizer.advance(harness.generation)
+
+    assert result.kind is StepKind.HUMAN_REVIEW
+    assert harness.git.refresh_calls == 1
+    assert harness.git.commit_calls == 0
+    assert harness.git.push_calls == 0
+
+
+def test_finalization_requires_an_exact_active_run_index_entry_before_done(harness: FinalizerHarness) -> None:
+    action = harness.request_done()
+    harness.index.active = False
+    accepted = harness.accept(action)
+
+    result = harness.finalizer.advance(accepted)
+
+    assert result.kind is StepKind.HUMAN_REVIEW
+    assert harness.store.load().state.disposition.value == "human_review"
+    assert harness.index.release_calls == 0
+
+
 @pytest.mark.parametrize("effect", ("commit", "push", "linear_done"))
 def test_finalization_effect_exhaustion_survives_restart_without_an_iteration(
     harness: FinalizerHarness,
@@ -530,38 +632,51 @@ def test_post_review_binding_drift_requires_human_review_before_effects(
     assert harness.client.calls == []
 
 
-def test_finalize_and_receipt_cli_dispatch_only_injected_trusted_boundaries(
+def test_finalize_and_receipt_cli_dispatch_only_through_the_launcher_socket(
     harness: FinalizerHarness,
     capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Fails if finalization or receipt ingestion accepts unbound caller input."""
+    """Fails if installed finalization commands bypass descriptor-bound launcher composition."""
 
-    calls: list[tuple[object, ...]] = []
-    runtime = TrustedRuntimeConfig(
+    socket_path = harness.store.root / "launcher.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(2)
+    service = FinalizationService(
+        signing_key=Ed25519PrivateKey.generate(),
         state_root=harness.store.root,
-        project_root=harness.store.root,
-        project_policy_path=harness.store.root / "auto-code.yaml",
-        project_policy_hash=policy().policy_hash,
-        runner_identity=__import__("auto_code.contracts", fromlist=["RunnerIdentity"]).RunnerIdentity(
-            content_hash="a" * 64,
-            source_sha="b" * 64,
-            dependency_lock_hash="c" * 64,
-            contract_bundle_hash="d" * 64,
-            runner_archive_hash="e" * 64,
-            built_at="2026-09-12T00:00:00Z",
+        handlers=FinalizationHandlers(
+            finalize=lambda _: harness.finalizer.advance(harness.store.load()),
+            receipt=lambda request: StepResult(kind=StepKind.READY_TO_FINALIZE, run_id=request.run_id, state_revision=request.expected_revision, state_hash=request.expected_state_hash),
         ),
     )
+    trust = FinalizationTrustMaterial(public_key=service.public_key, state_root=harness.store.root)
 
-    assert main(
-        ["finalize", "--run", "run-1", "--expected-revision", str(harness.generation.revision), "--expected-hash", harness.generation.state_hash],
-        runtime=runtime,
-        finalizer_factory=lambda _: harness.finalizer,
-    ) == 0
-    assert '"kind":"mcp_action"' in capsys.readouterr().out
+    def invoke(operation: str, revision: int, state_hash: str, request_id: str | None = None) -> int:
+        descriptor = service.issue_descriptor(operation=operation, run_id="run-1", expected_revision=revision, expected_state_hash=state_hash, request_id=request_id, socket_path=socket_path, expires_at=datetime.now(UTC) + __import__("datetime").timedelta(minutes=1), timeout_seconds=1.0)
+        capability_path = harness.store.root / f"{descriptor.nonce}.json"
+        trust_path = harness.store.root / "finalization-trust.json"
+        capability_path.write_bytes(descriptor.to_bytes())
+        trust_path.write_bytes(trust.to_bytes())
+        capability_fd = os.open(capability_path, os.O_RDONLY)
+        trust_fd = os.open(trust_path, os.O_RDONLY)
+        monkeypatch.setattr(finalization_service, "_LAUNCHER_FINALIZATION_FD", capability_fd)
+        monkeypatch.setattr(finalization_service, "_LAUNCHER_FINALIZATION_TRUST_FD", trust_fd)
+        worker = threading.Thread(target=service.serve_once, args=(listener,), daemon=True)
+        worker.start()
+        try:
+            argv = [operation, "--run", "run-1", "--expected-revision", str(revision), "--expected-hash", state_hash]
+            if request_id is not None:
+                argv.extend(("--request-id", request_id))
+            return main(argv)
+        finally:
+            worker.join(timeout=2)
+            os.close(capability_fd)
+            os.close(trust_fd)
 
-    assert main(
-        ["receipt", "--run", "run-1", "--expected-revision", "1", "--expected-hash", "a" * 64, "--request-id", "11111111-1111-4111-8111-111111111111"],
-        runtime=runtime,
-        receipt_handler=lambda _, run, revision, state_hash, request_id: calls.append((run, revision, state_hash, request_id)),
-    ) == 0
-    assert calls == [("run-1", 1, "a" * 64, "11111111-1111-4111-8111-111111111111")]
+    try:
+        assert invoke("finalize", harness.generation.revision, harness.generation.state_hash) == 0
+        assert '"kind":"mcp_action"' in capsys.readouterr().out
+    finally:
+        listener.close()

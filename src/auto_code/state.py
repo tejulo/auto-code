@@ -701,6 +701,22 @@ class RunStateStore:
             if len(new) < len(old) or tuple(new[: len(old)]) != tuple(old):
                 raise InvalidStateTransition(f"append-only collection {field} must preserve its prefix")
         if previous.disposition in {RunDisposition.DONE, RunDisposition.ABANDONED}:
+            if previous.disposition is RunDisposition.DONE:
+                marked_released = previous.model_copy(update={"finalization_index_released": True})
+                if not previous.finalization_index_released and state == marked_released:
+                    return state
+                escalated = previous.model_copy(
+                    update={
+                        "disposition": RunDisposition.HUMAN_REVIEW,
+                        "failure_history": state.failure_history,
+                    }
+                )
+                if (
+                    not previous.finalization_index_released
+                    and state == escalated
+                    and len(state.failure_history) == len(previous.failure_history) + 1
+                ):
+                    return state
             if state != previous:
                 raise InvalidStateTransition("terminal state is immutable")
             return state

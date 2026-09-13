@@ -50,6 +50,7 @@ class McpToolResult:
     tool_call_id: str
     result: object
     external_revision: str | None = None
+    observed_state_id: str | None = None
     outcome: EffectOutcome = EffectOutcome.SUCCESS
     observations: tuple[str, ...] = ()
 
@@ -155,6 +156,7 @@ class TrustedLinearBridge:
             result_hash=_hash_external_result(result.result),
             outcome=result.outcome,
             external_revision=_safe_external_revision(result.external_revision),
+            observed_state_id=_safe_external_revision(result.observed_state_id),
             bridge_identity=self.bridge_identity,
             mcp_server_identity=self.mcp_server_identity,
             tool_call_id=result.tool_call_id,

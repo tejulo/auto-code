@@ -14,6 +14,7 @@ from typing import Protocol
 import uuid
 
 from .contracts import EvidenceRef, ProductChangeManifest, RepairRunnerIdentity, RunnerIdentity, StepResult
+from .finalization_service import FinalizationServiceError, invoke_protected_capability
 from .hashing import canonical_json_bytes
 from .state import RunStateStore, StateGeneration, StateStoreError
 from .supervisor import SupervisorStateMismatch
@@ -55,21 +56,6 @@ class _PrepareCoordinator(Protocol):
 
 class _Supervisor(Protocol):
     def step(self, run_id: str, expected_revision: int, expected_hash: str) -> StepResult: ...
-
-
-class _Finalizer(Protocol):
-    def advance(self, generation: StateGeneration) -> StepResult: ...
-
-
-class _ReceiptHandler(Protocol):
-    def __call__(
-        self,
-        runtime: TrustedRuntimeConfig,
-        run_id: str,
-        expected_revision: int,
-        expected_hash: str,
-        request_id: str,
-    ) -> object: ...
 
 
 class _RepairRequestCoordinator(Protocol):
@@ -377,8 +363,6 @@ def _run_step(
 
 def _run_finalize(
     args: argparse.Namespace,
-    runtime: TrustedRuntimeConfig | None,
-    finalizer_factory: Callable[[TrustedRuntimeConfig], _Finalizer] | None,
 ) -> int:
     if not args.run or args.expected_revision is None or args.expected_hash is None:
         print("finalize: invalid arguments", file=sys.stderr)
@@ -387,14 +371,10 @@ def _run_finalize(
         revision = int(args.expected_revision)
         if revision < 1 or _CANONICAL_SHA256.fullmatch(args.expected_hash) is None:
             raise ValueError
-        trusted_runtime = runtime if runtime is not None else load_launcher_runtime_from_protected_fd()
-        if finalizer_factory is None:
-            raise RuntimeConfigurationError("finalizer composition is unavailable")
-        store = RunStateStore(trusted_runtime.state_root, args.run)
-        generation = store.load()
-        require_expected(generation, revision, args.expected_hash)
-        result = finalizer_factory(trusted_runtime).advance(generation)
-    except (RuntimeConfigurationError, ValueError, StateStoreError, SupervisorStateMismatch):
+        response = invoke_protected_capability("finalize", args.run, revision, args.expected_hash, None)
+        assert response.result is not None
+        result = response.result
+    except (FinalizationServiceError, ValueError):
         print("finalize: expected state does not match", file=sys.stderr)
         return 2
     except Exception:
@@ -406,8 +386,6 @@ def _run_finalize(
 
 def _run_receipt(
     args: argparse.Namespace,
-    runtime: TrustedRuntimeConfig | None,
-    receipt_handler: _ReceiptHandler | None,
 ) -> int:
     if not args.run or args.expected_revision is None or args.expected_hash is None or not args.request_id:
         print("receipt: invalid arguments", file=sys.stderr)
@@ -418,11 +396,8 @@ def _run_receipt(
             raise ValueError
         if str(uuid.UUID(args.request_id)) != args.request_id:
             raise ValueError
-        trusted_runtime = runtime if runtime is not None else load_launcher_runtime_from_protected_fd()
-        if receipt_handler is None:
-            raise RuntimeConfigurationError("receipt handler is unavailable")
-        receipt_handler(trusted_runtime, args.run, revision, args.expected_hash, args.request_id)
-    except (RuntimeConfigurationError, ValueError, StateStoreError):
+        invoke_protected_capability("receipt", args.run, revision, args.expected_hash, args.request_id)
+    except (FinalizationServiceError, ValueError):
         print("receipt: operation unavailable", file=sys.stderr)
         return 2
     except Exception:
@@ -522,8 +497,6 @@ def main(
     *,
     prepare_coordinator_factory: Callable[[TrustedRuntimeConfig], _PrepareCoordinator] | None = None,
     supervisor_factory: Callable[[TrustedRuntimeConfig], _Supervisor] | None = None,
-    finalizer_factory: Callable[[TrustedRuntimeConfig], _Finalizer] | None = None,
-    receipt_handler: _ReceiptHandler | None = None,
     repair_request_coordinator_factory: Callable[[TrustedRuntimeConfig], _RepairRequestCoordinator] | None = None,
 ) -> int:
     arguments = sys.argv[1:] if argv is None else argv
@@ -543,9 +516,9 @@ def main(
     if args.command == "step":
         return _run_step(args, runtime, supervisor_factory)
     if args.command == "finalize":
-        return _run_finalize(args, runtime, finalizer_factory)
+        return _run_finalize(args)
     if args.command == "receipt":
-        return _run_receipt(args, runtime, receipt_handler)
+        return _run_receipt(args)
     if args.command == "repair-request":
         return _run_repair_request(args, runtime, repair_request_coordinator_factory)
     if args.command != "status":
