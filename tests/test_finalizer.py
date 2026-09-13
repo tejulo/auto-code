@@ -726,7 +726,7 @@ def test_index_tombstone_cannot_authorize_another_run(harness: FinalizerHarness)
 
 
 def test_launcher_replays_completed_nonce_without_second_git_effect(harness: FinalizerHarness) -> None:
-    """Replaying a launcher capability returns its durable response without another Git effect."""
+    """A recreated launcher replays its durable response without another Git effect."""
 
     projection = harness.finalizer.advance(harness.generation)
     generation = harness.accept(projection)
@@ -751,14 +751,13 @@ def test_launcher_replays_completed_nonce_without_second_git_effect(harness: Fin
         generation.state_hash,
         socket_path=socket_path,
     )
-    service = launcher._services[descriptor.nonce]
     trust = FinalizationTrustMaterial(
         public_key=generation.state.finalization_public_key,
         state_root=harness.store.root,
         descriptor_hash=sha256(descriptor.to_bytes()).hexdigest(),
     )
 
-    def invoke_once() -> object:
+    def invoke_once(service: FinalizationService) -> object:
         worker = threading.Thread(target=service.serve_once, args=(listener,), daemon=True)
         worker.start()
         try:
@@ -767,8 +766,26 @@ def test_launcher_replays_completed_nonce_without_second_git_effect(harness: Fin
             worker.join(timeout=2)
 
     try:
-        first = invoke_once()
-        replayed = invoke_once()
+        first = invoke_once(launcher._services[descriptor.nonce])
+        del launcher
+        restarted = FinalizationLauncher.from_runtime(
+            FinalizationLauncherRuntime(
+                state_root=harness.store.root,
+                linear=harness.finalizer.dependencies.linear,
+                git_guard=harness.git,
+                active_run_index=harness.index,
+                artifact_authority=SimpleNamespace(load_for=lambda _: harness.artifacts),
+            )
+        )
+        assert restarted._services == {}
+        current = harness.store.load()
+        restarted_descriptor = restarted.serve_descriptor(
+            "run-1",
+            current.revision,
+            current.state_hash,
+            socket_path=socket_path,
+        )
+        replayed = invoke_once(restarted._services[restarted_descriptor.nonce])
     finally:
         listener.close()
 

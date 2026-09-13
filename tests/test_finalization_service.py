@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 import socket
 import stat
+import subprocess
+import sys
 import threading
 import time
 
@@ -424,9 +426,8 @@ def test_trusted_fd_rejects_attacker_descriptor_before_connect(
 
 def test_attacker_cannot_finalize_with_replaced_fd4_and_fd5(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A caller-selected FD5 key must not replace the Active Run's launcher key."""
+    """Inherited attacker FDs must fail before their socket can receive a request."""
 
     state_root = tmp_path / "state"
     key = Ed25519PrivateKey.generate()
@@ -496,18 +497,45 @@ def test_attacker_cannot_finalize_with_replaced_fd4_and_fd5(
     descriptor_fd = os.open(descriptor_path, os.O_RDONLY)
     trust_fd = os.open(trust_path, os.O_RDONLY)
     try:
-        monkeypatch.setattr(finalization_service, "_LAUNCHER_FINALIZATION_FD", descriptor_fd)
-        monkeypatch.setattr(finalization_service, "_LAUNCHER_FINALIZATION_TRUST_FD", trust_fd)
-        with pytest.raises(FinalizationServiceError, match="trust"):
-            invoke_protected_capability(
-                "finalize",
-                "run-1",
-                generation.revision,
+        child = subprocess.run(
+            (
+                sys.executable,
+                "-c",
+                """
+import os
+import sys
+from pathlib import Path
+
+from auto_code.finalization_service import FinalizationCapabilityError, FinalizationServiceError, invoke_protected_capability
+
+os.dup2(int(sys.argv[1]), 4)
+os.dup2(int(sys.argv[2]), 5)
+try:
+    invoke_protected_capability(
+        "finalize",
+        "run-1",
+        int(sys.argv[5]),
+        sys.argv[6],
+        None,
+        expected_state_root=Path(sys.argv[3]),
+        expected_finalization_key_hash=sys.argv[4],
+    )
+except (FinalizationCapabilityError, FinalizationServiceError):
+    raise SystemExit(0)
+raise SystemExit("attacker-controlled inherited FDs reached finalization")
+""",
+                str(descriptor_fd),
+                str(trust_fd),
+                str(state_root),
+                generation.state.finalization_public_key_hash,
+                str(generation.revision),
                 generation.state_hash,
-                None,
-                expected_state_root=state_root,
-                expected_finalization_key_hash=generation.state.finalization_public_key_hash,
-            )
+            ),
+            pass_fds=(descriptor_fd, trust_fd),
+            capture_output=True,
+            text=True,
+        )
+        assert child.returncode == 0, child.stderr
         with pytest.raises(TimeoutError):
             listener.accept()
     finally:
