@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import fcntl
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import sys
 
@@ -24,12 +27,16 @@ from .process import (
     ProcessRunner,
     SandboxPolicy,
 )
-from .repair import RepairError, RepairGuard, UnauthorizedRepairError
+from .repair import RepairError, RepairGuard, RepairWorkspaceHandle, UnauthorizedRepairError
 from .runner import (
     BuiltRunnerRelease,
+    PendingRunnerActivation,
+    ProtectedRepairService,
     ReleaseManifestEntry,
+    RepairJournal,
     RepairRegression,
     RepairRunner,
+    RunnerActivationReceipt,
     RunnerRegistry,
     TrustedLauncher,
     capture_built_release_manifest,
@@ -338,6 +345,36 @@ class DescriptorNonceStore:
                 raise PermissionError("repair descriptor nonce was consumed")
             return binding_hash
 
+    @contextmanager
+    def transaction(
+        self,
+        descriptor: RepairRuntimeDescriptor,
+        *,
+        reconcile_completed: bool = False,
+    ) -> Iterator[_DescriptorNonceTransaction]:
+        self._require_unexpired(descriptor)
+        binding_hash = hash_json(descriptor.nonce_binding())
+        path, lock = self._paths(descriptor.nonce)
+        payload = {
+            "nonce": descriptor.nonce,
+            "binding_hash": binding_hash,
+            "operation": descriptor.operation,
+            "expiry": descriptor.expiry.isoformat(),
+            "status": "pending",
+            "result_hash": None,
+        }
+        with _interprocess_lock(lock):
+            result_hash: str | None = None
+            if not _write_new_json(path, payload):
+                existing = self._load(path, descriptor)
+                if existing["binding_hash"] != binding_hash:
+                    raise PermissionError("repair descriptor nonce binding conflicts")
+                if existing["status"] == "completed" and reconcile_completed:
+                    result_hash = _hash(existing["result_hash"], "repair descriptor result")
+                elif existing["status"] != "pending":
+                    raise PermissionError("repair descriptor nonce was consumed")
+            yield _DescriptorNonceTransaction(self, descriptor, path, result_hash)
+
     def require_active(self, descriptor: RepairRuntimeDescriptor) -> str:
         self._require_unexpired(descriptor)
         path, lock = self._paths(descriptor.nonce)
@@ -389,6 +426,223 @@ class DescriptorNonceStore:
             raise PermissionError("repair descriptor is expired")
 
 
+@dataclass(frozen=True, slots=True)
+class _DescriptorNonceTransaction:
+    store: DescriptorNonceStore
+    descriptor: RepairRuntimeDescriptor
+    path: Path
+    completed_result_hash: str | None = None
+
+    def require_active(self, descriptor: RepairRuntimeDescriptor) -> str:
+        if descriptor != self.descriptor:
+            raise PermissionError("repair descriptor nonce binding conflicts")
+        self.store._require_unexpired(descriptor)
+        payload = self.store._load(self.path, descriptor)
+        expected = hash_json(descriptor.nonce_binding())
+        if payload["status"] != "pending" or payload["binding_hash"] != expected:
+            raise PermissionError("repair descriptor nonce was consumed")
+        return expected
+
+    def complete(self, result_hash: str) -> None:
+        _hash(result_hash, "repair descriptor result")
+        if self.completed_result_hash is not None:
+            if result_hash != self.completed_result_hash:
+                raise PermissionError("repair descriptor result conflicts")
+            return
+        self.require_active(self.descriptor)
+        payload = self.store._load(self.path, self.descriptor)
+        _atomic_replace_json(self.path, {**payload, "status": "completed", "result_hash": result_hash})
+
+
+@dataclass(frozen=True, slots=True)
+class _ProtectedRepairService:
+    descriptor: RepairRuntimeDescriptor
+    nonce_store: DescriptorNonceStore | _DescriptorNonceTransaction
+
+    def require_prepare(self, generation: object, failure_hash: str) -> None:
+        self.nonce_store.require_active(self.descriptor)
+        if (
+            self.descriptor.operation != "prepare"
+            or getattr(generation, "revision", None) != self.descriptor.expected_revision
+            or getattr(generation, "state_hash", None) != self.descriptor.expected_state_hash
+            or failure_hash != self.descriptor.failure_hash
+        ):
+            raise PermissionError("repair prepare transaction is not authorized")
+
+    def require_apply(self, request_hash: str) -> None:
+        self.nonce_store.require_active(self.descriptor)
+        if self.descriptor.operation != "apply" or request_hash != self.descriptor.request_hash:
+            raise PermissionError("repair apply transaction is not authorized")
+
+    def prepare_handle_id(self, generation: object, failure_hash: str) -> str:
+        self.require_prepare(generation, failure_hash)
+        handle_id = self.descriptor.nonce[:32]
+        directory = _ensure_directory(
+            self.descriptor.registry_root,
+            self.descriptor.registry_root / "repair-prepare-journals",
+        )
+        path = directory / f"{self.descriptor.nonce}.json"
+        payload = {
+            "nonce": self.descriptor.nonce,
+            "binding_hash": hash_json(self.descriptor.nonce_binding()),
+            "handle_id": handle_id,
+            "workspace_path": str(self.descriptor.repair_workspace_root / handle_id),
+            "status": "intended",
+            "handle_hash": None,
+        }
+        if not _write_new_json(path, payload):
+            existing = _read_canonical_json(path, "repair prepare journal")
+            if not isinstance(existing, dict) or any(
+                existing.get(key) != value
+                for key, value in payload.items()
+                if key not in {"status", "handle_hash"}
+            ) or existing.get("status") not in {"intended", "completed"}:
+                raise PermissionError("repair prepare journal conflicts")
+        return handle_id
+
+    def load_prepared_handle(
+        self,
+        registry: RunnerRegistry,
+        handle_id: str,
+    ) -> RepairWorkspaceHandle | None:
+        self.nonce_store.require_active(self.descriptor)
+        path = registry.handles / f"{handle_id}.json"
+        if _path_lstat(path, "repair workspace handle") is None:
+            return None
+        handle = registry.load_workspace_handle(handle_id)
+        if (
+            handle.run_id != self.descriptor.run_id
+            or handle.expected_revision != self.descriptor.expected_revision
+            or handle.expected_state_hash != self.descriptor.expected_state_hash
+            or handle.failure_hash != self.descriptor.failure_hash
+            or handle.path != self.descriptor.repair_workspace_root / handle_id
+        ):
+            raise PermissionError("prepared workspace handle does not match descriptor")
+        journal = _read_canonical_json(
+            self.descriptor.registry_root / "repair-prepare-journals" / f"{self.descriptor.nonce}.json",
+            "repair prepare journal",
+        )
+        if (
+            not isinstance(journal, dict)
+            or journal.get("status") != "completed"
+            or journal.get("handle_hash") != hash_json(handle.payload())
+        ):
+            raise PermissionError("prepared workspace handle is not reconciled")
+        return handle
+
+    def issue_workspace_handle(
+        self,
+        registry: RunnerRegistry,
+        handle: object,
+    ) -> object:
+        if not isinstance(handle, RepairWorkspaceHandle):
+            raise PermissionError("repair workspace handle is invalid")
+        self.require_prepare(
+            type("GenerationBinding", (), {
+                "revision": handle.expected_revision,
+                "state_hash": handle.expected_state_hash,
+            })(),
+            handle.failure_hash,
+        )
+        if registry.repair_runner_identity != self.descriptor.repair_runner_identity:
+            raise PermissionError("repair runner identity is not launcher pinned")
+        path = registry.handles / f"{handle.id}.json"
+        if not _write_new_json(path, handle.payload()) and registry.load_workspace_handle(handle.id) != handle:
+            raise PermissionError("issued workspace handle conflicts")
+        journal = self.descriptor.registry_root / "repair-prepare-journals" / f"{self.descriptor.nonce}.json"
+        prepared = _read_canonical_json(journal, "repair prepare journal")
+        if not isinstance(prepared, dict) or prepared.get("handle_id") != handle.id:
+            raise PermissionError("repair prepare journal is invalid")
+        _atomic_replace_json(
+            journal,
+            {**prepared, "status": "completed", "handle_hash": hash_json(handle.payload())},
+        )
+        return handle
+
+    def record_pending(
+        self,
+        registry: RunnerRegistry,
+        pending: PendingRunnerActivation,
+    ) -> PendingRunnerActivation:
+        self.require_apply(pending.request_hash)
+        self._require_registry(registry)
+        if (
+            pending.run_id != self.descriptor.run_id
+            or pending.expected_revision != self.descriptor.expected_revision
+            or pending.expected_state_hash != self.descriptor.expected_state_hash
+        ):
+            raise PermissionError("pending activation does not match repair descriptor")
+        path = registry.pending_path(pending.request_hash)
+        if not _write_new_json(path, pending.payload()):
+            existing = registry.lookup_pending(pending.request_hash)
+            if existing != pending:
+                raise PermissionError("pending activation conflicts with its request")
+            return existing
+        return pending
+
+    def publish_activation(
+        self,
+        registry: RunnerRegistry,
+        pending: PendingRunnerActivation,
+        receipt: RunnerActivationReceipt,
+        journal: RepairJournal,
+    ) -> RunnerActivationReceipt:
+        self.require_apply(receipt.request_hash)
+        self._require_registry(registry)
+        if receipt.request_hash != pending.request_hash or receipt.old_runner_identity != pending.old_runner_identity:
+            raise PermissionError("activation does not match pending repair transaction")
+        journal.require(
+            "source_manifest",
+            "regression",
+            "build",
+            "old_runner_terminated",
+            "new_runner_started",
+            "identity_attested",
+        )
+        generation = RunStateStore.load_read_only(self.descriptor.state_root, self.descriptor.run_id)
+        if (
+            generation.revision != pending.expected_revision
+            or generation.state_hash != pending.expected_state_hash
+            or generation.state.disposition is not RunDisposition.REPAIR_REQUIRED
+            or generation.state.runner_identity != pending.old_runner_identity
+        ):
+            raise PermissionError("activation expected-old state changed")
+        pointer_published = False
+        with _interprocess_lock(registry.pointer_lock):
+            if _path_lstat(registry.pointer_path, "runner activation pointer") is not None:
+                pointer = _read_canonical_json(registry.pointer_path, "runner activation pointer")
+                if not isinstance(pointer, dict) or set(pointer) != {"request_hash", "receipt_hash", "runner_identity"}:
+                    raise PermissionError("runner activation pointer is invalid")
+                current_identity = RunnerIdentity.model_validate(pointer["runner_identity"])
+                if current_identity == receipt.new_runner_identity and registry.lookup_activation(receipt.request_hash) == receipt:
+                    pointer_published = True
+                elif current_identity != pending.old_runner_identity:
+                    raise PermissionError("runner activation pointer does not match expected old runner")
+            if not pointer_published:
+                activation_path = registry.activation_path(receipt.request_hash)
+                if not _write_new_json(activation_path, receipt.payload()):
+                    existing = registry.lookup_activation(receipt.request_hash)
+                    if existing != receipt:
+                        raise PermissionError("activation replay conflicts with its request")
+                    receipt = existing
+                _atomic_replace_json(
+                    registry.pointer_path,
+                    {
+                        "request_hash": receipt.request_hash,
+                        "receipt_hash": receipt.content_hash,
+                        "runner_identity": receipt.new_runner_identity.model_dump(mode="json", round_trip=True),
+                    },
+                )
+        return receipt
+
+    def _require_registry(self, registry: RunnerRegistry) -> None:
+        if (
+            registry.root != self.descriptor.registry_root
+            or registry.repair_runner_identity != self.descriptor.repair_runner_identity
+        ):
+            raise PermissionError("repair registry is not descriptor bound")
+
+
 class _RepairWorktreeFactory:
     def __init__(self, descriptor: RepairRuntimeDescriptor, executor: ProcessGitExecutor) -> None:
         self.descriptor = descriptor
@@ -398,8 +652,12 @@ class _RepairWorktreeFactory:
         if not isinstance(handle_id, str) or len(handle_id) != 32 or any(character not in _SHA256 for character in handle_id):
             raise PermissionError("repair workspace handle is invalid")
         path = self.descriptor.repair_workspace_root / handle_id
-        if path.exists() or path.is_symlink():
+        if path.is_symlink():
             raise PermissionError("repair workspace already exists")
+        if path.exists():
+            if not path.is_dir() or not any(path.iterdir()):
+                raise PermissionError("repair workspace is incomplete")
+            return path
         result = self.executor.run(
             ("worktree", "add", "--detach", str(path)),
             cwd=self.descriptor.repair_repository_root,
@@ -490,6 +748,10 @@ class _ProcessBuilder:
             descriptor.registry_root,
             descriptor.registry_root / "repair-build-results",
         )
+        self.snapshot_root = descriptor.release_root.parent / "repair-source-snapshots"
+        self.snapshot_root.mkdir(mode=0o700, exist_ok=True)
+        if self.snapshot_root.is_symlink() or not self.snapshot_root.is_dir():
+            raise PermissionError("repair source snapshot root is invalid")
 
     def _receipt_path(self, effect_id: str) -> Path:
         return self.receipt_root / f"{_hash(effect_id, 'build effect')}.json"
@@ -537,12 +799,13 @@ class _ProcessBuilder:
         contract_manifest_hash: str,
     ) -> BuiltRunnerRelease:
         effect_id = _hash(effect_id, "build effect")
+        snapshot = self._materialize_snapshot(effect_id, workspace, source_manifest, dependency_lock_hash)
         binding_hash = hash_json(
             {
                 "command": list(self.descriptor.build_command),
                 "executable_hash": self.descriptor.build_executable_hash,
                 "sandbox_policy_hash": self.descriptor.sandbox_policy_hash,
-                "workspace": str(workspace),
+                "snapshot": str(snapshot),
                 "source_manifest_hash": source_manifest.content_hash,
                 "dependency_lock_hash": dependency_lock_hash,
                 "previous_contract_manifest_hash": contract_manifest_hash,
@@ -566,13 +829,13 @@ class _ProcessBuilder:
                 (
                     *self.descriptor.build_command,
                     "--effect-id", effect_id,
-                    "--workspace", str(workspace),
+                    "--workspace", str(snapshot),
                     "--release-root", str(release),
                     "--source-manifest", source_manifest.content_hash,
                     "--dependency-lock", dependency_lock_hash,
                     "--previous-contract-manifest", contract_manifest_hash,
                 ),
-                workspace,
+                self.descriptor.repair_repository_root,
                 self.descriptor.regression_timeout,
                 self.evidence,
                 self.descriptor.environment,
@@ -629,6 +892,122 @@ class _ProcessBuilder:
             return observed
         return built
 
+    def _materialize_snapshot(
+        self,
+        effect_id: str,
+        workspace: Path,
+        source_manifest: RepairSourceManifest,
+        dependency_lock_hash: str,
+    ) -> Path:
+        snapshot = self.snapshot_root / effect_id
+        if _path_lstat(snapshot, "repair source snapshot") is not None:
+            self._verify_snapshot(snapshot, source_manifest, dependency_lock_hash)
+            return snapshot
+        temporary = self.snapshot_root / f".{effect_id}.{self.descriptor.nonce}"
+        if _path_lstat(temporary, "repair source snapshot temporary") is not None:
+            raise PermissionError("repair source snapshot is incomplete")
+        temporary.mkdir(mode=0o700)
+        try:
+            for entry in source_manifest.workspace_files:
+                relative = _relative_path(entry.path, "repair source snapshot path")
+                source = workspace / relative
+                destination = temporary / relative
+                destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                metadata = os.lstat(source)
+                expected_mode = entry.mode
+                actual_mode = "120000" if stat.S_ISLNK(metadata.st_mode) else (
+                    "100755" if stat.S_ISREG(metadata.st_mode) and metadata.st_mode & 0o111 else "100644"
+                )
+                if actual_mode != expected_mode:
+                    raise PermissionError("repair source changed before snapshot")
+                if entry.kind == "symlink" and stat.S_ISLNK(metadata.st_mode):
+                    target = os.readlink(source)
+                    if sha256(os.fsencode(target)).hexdigest() != entry.content_sha256:
+                        raise PermissionError("repair source changed before snapshot")
+                    destination.symlink_to(target)
+                elif entry.kind == "file" and stat.S_ISREG(metadata.st_mode):
+                    source_descriptor = os.open(
+                        source,
+                        os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                    )
+                    destination_descriptor = os.open(
+                        destination,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                        stat.S_IMODE(metadata.st_mode) & ~0o222,
+                    )
+                    digest = sha256()
+                    try:
+                        while chunk := os.read(source_descriptor, 65_536):
+                            digest.update(chunk)
+                            remaining = memoryview(chunk)
+                            while remaining:
+                                remaining = remaining[os.write(destination_descriptor, remaining):]
+                        os.fsync(destination_descriptor)
+                    finally:
+                        os.close(source_descriptor)
+                        os.close(destination_descriptor)
+                    if digest.hexdigest() != entry.content_sha256:
+                        raise PermissionError("repair source changed before snapshot")
+                else:
+                    raise PermissionError("repair source changed before snapshot")
+            for current, directories, _ in os.walk(temporary, topdown=False, followlinks=False):
+                for directory in directories:
+                    path = Path(current) / directory
+                    if not path.is_symlink():
+                        path.chmod(0o555)
+                Path(current).chmod(0o555)
+            os.replace(temporary, snapshot)
+        except BaseException:
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise
+        self._verify_snapshot(snapshot, source_manifest, dependency_lock_hash)
+        return snapshot
+
+    @staticmethod
+    def _verify_snapshot(
+        snapshot: Path,
+        source_manifest: RepairSourceManifest,
+        dependency_lock_hash: str,
+    ) -> None:
+        expected = {entry.path: entry for entry in source_manifest.workspace_files}
+        observed: set[str] = set()
+        for current, directories, files in os.walk(snapshot, followlinks=False):
+            current_path = Path(current)
+            for name in tuple(directories):
+                path = current_path / name
+                if path.is_symlink():
+                    directories.remove(name)
+                    files.append(name)
+            for name in files:
+                path = current_path / name
+                relative = path.relative_to(snapshot).as_posix()
+                entry = expected.get(relative)
+                metadata = os.lstat(path)
+                if entry is None:
+                    raise PermissionError("repair source snapshot contains an unexpected path")
+                if stat.S_ISLNK(metadata.st_mode):
+                    kind = "symlink"
+                    digest = sha256(os.fsencode(os.readlink(path))).hexdigest()
+                elif stat.S_ISREG(metadata.st_mode):
+                    kind = "file"
+                    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+                    content_hash = sha256()
+                    try:
+                        while chunk := os.read(descriptor, 65_536):
+                            content_hash.update(chunk)
+                    finally:
+                        os.close(descriptor)
+                    digest = content_hash.hexdigest()
+                else:
+                    raise PermissionError("repair source snapshot contains an unsupported path")
+                if kind != entry.kind or digest != entry.content_sha256 or metadata.st_mode & 0o222:
+                    raise PermissionError("repair source snapshot does not match its manifest")
+                observed.add(relative)
+        if observed != set(expected) or snapshot.stat().st_mode & 0o222:
+            raise PermissionError("repair source snapshot is incomplete or mutable")
+        if GitGuard(snapshot).dependency_lock_hash() != dependency_lock_hash:
+            raise PermissionError("repair source snapshot dependency lock does not match")
+
 
 class _ProcessLifecycleEffect:
     def __init__(
@@ -641,7 +1020,7 @@ class _ProcessLifecycleEffect:
         process: ProcessRunner,
         evidence: FilesystemEvidenceSink,
         policy: SandboxPolicy,
-        authorize: Callable[[], object],
+        repair_service: ProtectedRepairService,
     ) -> None:
         self.label = label
         self.command = command
@@ -650,7 +1029,7 @@ class _ProcessLifecycleEffect:
         self.process = process
         self.evidence = evidence
         self.policy = policy
-        self.authorize = authorize
+        self.repair_service = repair_service
         self.receipt_root = _ensure_directory(
             descriptor.registry_root,
             descriptor.registry_root / "repair-lifecycle-results",
@@ -660,7 +1039,7 @@ class _ProcessLifecycleEffect:
         return self.receipt_root / f"{_hash(effect_id, 'lifecycle effect')}.json"
 
     def observe(self, effect_id: str, run_id: str, runner: RunnerIdentity) -> str | None:
-        self.authorize()
+        self.repair_service.require_apply(self.descriptor.request_hash or "")
         path = self._path(effect_id)
         if _path_lstat(path, "repair lifecycle receipt") is None:
             observed = self.process.observe_reconciled_effect(
@@ -686,7 +1065,7 @@ class _ProcessLifecycleEffect:
         return _hash(payload["evidence_hash"], "lifecycle evidence")
 
     def invoke(self, effect_id: str, run_id: str, runner: RunnerIdentity) -> str:
-        self.authorize()
+        self.repair_service.require_apply(self.descriptor.request_hash or "")
         result, evidence_hash = self.process.run_reconciled_effect(
             effect_id,
             self._binding_hash(run_id, runner),
@@ -742,15 +1121,17 @@ class ProtectedRepairRuntime:
         ):
             raise PermissionError("repair prepare is not authorized")
         nonce_store = DescriptorNonceStore(self.descriptor.registry_root)
-        nonce_store.begin(self.descriptor)
-        nonce_store.require_active(self.descriptor)
-        generation = RunStateStore.load_read_only(self.descriptor.state_root, run_id)
-        if generation.revision != expected_revision or generation.state_hash != expected_state_hash:
-            raise PermissionError("repair prepare generation is stale")
-        runner = self._compose_runner(workspace=None, authorize=lambda: nonce_store.require_active(self.descriptor))
-        handle = runner.prepare_workspace(generation, failure_hash)
-        nonce_store.complete(self.descriptor, hash_json(handle.payload()))
-        return handle
+        with nonce_store.transaction(self.descriptor, reconcile_completed=True) as transaction:
+            if transaction.completed_result_hash is not None:
+                return self._recover_prepared_handle(transaction.completed_result_hash)
+            repair_service = _ProtectedRepairService(self.descriptor, transaction)  # type: ignore[arg-type]
+            generation = RunStateStore.load_read_only(self.descriptor.state_root, run_id)
+            if generation.revision != expected_revision or generation.state_hash != expected_state_hash:
+                raise PermissionError("repair prepare generation is stale")
+            runner = self._compose_runner(workspace=None, repair_service=repair_service)
+            handle = runner.prepare_workspace(generation, failure_hash)
+            transaction.complete(hash_json(handle.payload()))
+            return handle
 
     def apply(self, workspace: str, request_hash: str) -> object:
         workspace_path = _absolute_path(workspace, "repair workspace")
@@ -772,9 +1153,88 @@ class ProtectedRepairRuntime:
         ):
             raise PermissionError("repair request does not match descriptor")
         nonce_store = DescriptorNonceStore(self.descriptor.registry_root)
-        nonce_store.begin(self.descriptor)
-        authorize = lambda: nonce_store.require_active(self.descriptor)
-        authorize()
+        with nonce_store.transaction(self.descriptor, reconcile_completed=True) as transaction:
+            if transaction.completed_result_hash is not None:
+                return self._recover_applied_generation(transaction.completed_result_hash)
+            return self._apply_transaction(workspace_path, request, transaction)
+
+    def _recover_prepared_handle(self, result_hash: str) -> RepairWorkspaceHandle:
+        descriptor = self.descriptor
+        registry = RunnerRegistry(
+            descriptor.registry_root,
+            repair_runner_identity=descriptor.repair_runner_identity,
+        )
+        handle = registry.load_workspace_handle(descriptor.nonce[:32])
+        if (
+            handle.run_id != descriptor.run_id
+            or handle.expected_revision != descriptor.expected_revision
+            or handle.expected_state_hash != descriptor.expected_state_hash
+            or handle.failure_hash != descriptor.failure_hash
+            or handle.path != descriptor.repair_workspace_root / handle.id
+            or hash_json(handle.payload()) != result_hash
+        ):
+            raise PermissionError("completed repair prepare result does not match descriptor")
+        journal = _read_canonical_json(
+            descriptor.registry_root / "repair-prepare-journals" / f"{descriptor.nonce}.json",
+            "repair prepare journal",
+        )
+        if (
+            not isinstance(journal, dict)
+            or journal.get("status") != "completed"
+            or journal.get("handle_hash") != result_hash
+        ):
+            raise PermissionError("completed repair prepare result is not reconciled")
+        handle.identity.verify()
+        return handle
+
+    def _recover_applied_generation(self, result_hash: str) -> object:
+        descriptor = self.descriptor
+        registry = RunnerRegistry(
+            descriptor.registry_root,
+            repair_runner_identity=descriptor.repair_runner_identity,
+        )
+        store = RunStateStore(
+            descriptor.state_root,
+            descriptor.run_id,
+            repair_activation_verifier=registry,
+        )
+        generation = store.load()
+        receipt = registry.current_activation()
+        journal = RepairJournal(descriptor.state_root, descriptor.request_hash or "")
+        journal.require(
+            "source_manifest",
+            "regression",
+            "build",
+            "old_runner_terminated",
+            "new_runner_started",
+            "identity_attested",
+            "activation",
+            "state_activated",
+        )
+        if (
+            generation.revision != descriptor.expected_revision + 1
+            or generation.state_hash != result_hash
+            or generation.state.disposition is not RunDisposition.ACTIVE
+            or generation.state.restart_receipt_hash != receipt.content_hash
+            or generation.state.runner_identity != receipt.new_runner_identity
+            or receipt.request_hash != descriptor.request_hash
+            or journal.completed("state_activated") != result_hash
+        ):
+            raise PermissionError("completed repair apply result does not match descriptor")
+        return generation
+
+    def _apply_transaction(
+        self,
+        workspace_path: Path,
+        request: object,
+        transaction: _DescriptorNonceTransaction,
+    ) -> object:
+        from .repair import RepairRequest
+
+        if not isinstance(request, RepairRequest):
+            raise PermissionError("repair request is invalid")
+        repair_service = _ProtectedRepairService(self.descriptor, transaction)  # type: ignore[arg-type]
+        repair_service.require_apply(request.content_hash)
         generation = RunStateStore.load_read_only(self.descriptor.state_root, self.descriptor.run_id)
         generation_changed = (
             generation.revision != self.descriptor.expected_revision
@@ -785,7 +1245,7 @@ class ProtectedRepairRuntime:
         capabilities = self._compose_process_capabilities(exact_workspace=workspace_path)
         runner = self._compose_runner(
             workspace=workspace_path,
-            authorize=authorize,
+            repair_service=repair_service,
             capabilities=capabilities,
         )
         if not generation_changed:
@@ -801,7 +1261,7 @@ class ProtectedRepairRuntime:
                 process=process,
                 evidence=evidence,
                 policy=policy,
-                authorize=authorize,
+                repair_service=repair_service,
             )
 
         store = RunStateStore(
@@ -819,17 +1279,17 @@ class ProtectedRepairRuntime:
             attest_new_runner=lifecycle(
                 "attest", self.descriptor.attest_command, self.descriptor.attest_executable_hash
             ),
-            authorize=authorize,
+            repair_service=repair_service,
         )
         activated = launcher.reconcile_activation(self.descriptor.run_id, request.content_hash)
-        nonce_store.complete(self.descriptor, activated.state_hash)
+        transaction.complete(activated.state_hash)
         return activated
 
     def _compose_runner(
         self,
         *,
         workspace: Path | None,
-        authorize: Callable[[], object],
+        repair_service: ProtectedRepairService,
         capabilities: tuple[ProcessRunner, FilesystemEvidenceSink, SandboxPolicy, RunnerRegistry] | None = None,
     ) -> RepairRunner:
         descriptor = self.descriptor
@@ -877,7 +1337,7 @@ class ProtectedRepairRuntime:
             repair_runner_identity=descriptor.repair_runner_identity,
             state_root=descriptor.state_root,
             repair_workspace_root=descriptor.repair_workspace_root,
-            authorize=authorize,
+            repair_service=repair_service,
         )
 
     def _compose_process_capabilities(
@@ -886,6 +1346,8 @@ class ProtectedRepairRuntime:
         exact_workspace: Path | None = None,
     ) -> tuple[ProcessRunner, FilesystemEvidenceSink, SandboxPolicy, RunnerRegistry]:
         descriptor = self.descriptor
+        snapshot_root = descriptor.release_root.parent / "repair-source-snapshots"
+        snapshot_root.mkdir(mode=0o700, exist_ok=True)
         for path in (
             descriptor.registry_root,
             descriptor.state_root,
@@ -893,6 +1355,7 @@ class ProtectedRepairRuntime:
             descriptor.repair_workspace_root,
             descriptor.controlled_home,
             descriptor.release_root,
+            snapshot_root,
             *descriptor.secret_paths,
         ):
             if not path.is_absolute() or path.is_symlink() or not path.is_dir():
@@ -919,6 +1382,7 @@ class ProtectedRepairRuntime:
                 descriptor.repair_repository_root,
                 descriptor.repair_workspace_root,
                 descriptor.release_root,
+                snapshot_root,
                 *((command_workspace,) if command_workspace is not None else ()),
             ),
             writable_roots=(
@@ -1015,10 +1479,49 @@ def main(
         protected = runtime if runtime is not None else load_protected_runtime()
         if args.command == "prepare":
             revision = int(args.expected_revision)
-            protected.prepare(args.run, revision, args.expected_hash, args.failure)
+            handle = protected.prepare(args.run, revision, args.expected_hash, args.failure)
+            if not isinstance(handle, RepairWorkspaceHandle):
+                raise ValueError("repair prepare returned an invalid handle")
+            print(
+                json.dumps(
+                    {
+                        "schema_version": "v1",
+                        "operation": "prepare",
+                        "run_id": handle.run_id,
+                        "expected_revision": handle.expected_revision,
+                        "expected_state_hash": handle.expected_state_hash,
+                        "failure_hash": handle.failure_hash,
+                        "workspace": {
+                            "id": handle.id,
+                            "path": str(handle.path),
+                            "baseline_hash": handle.baseline_hash,
+                        },
+                    },
+                    sort_keys=True,
+                )
+            )
             return 0
         if args.command == "apply":
-            protected.apply(args.workspace, args.request)
+            generation = protected.apply(args.workspace, args.request)
+            runner_identity = getattr(generation.state, "runner_identity", None)
+            if not isinstance(runner_identity, RunnerIdentity):
+                raise ValueError("repair apply returned an invalid generation")
+            print(
+                json.dumps(
+                    {
+                        "schema_version": "v1",
+                        "operation": "apply",
+                        "run_id": generation.state.run_id,
+                        "request_hash": args.request,
+                        "workspace_id": Path(args.workspace).name,
+                        "workspace_path": str(Path(args.workspace)),
+                        "revision": generation.revision,
+                        "state_hash": generation.state_hash,
+                        "runner_identity_hash": runner_identity.content_hash,
+                    },
+                    sort_keys=True,
+                )
+            )
             return 0
     except (RepairRuntimeConfigurationError, RepairError, StateStoreError, ValueError, PermissionError, OSError):
         pass

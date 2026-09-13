@@ -422,6 +422,7 @@ class RepairRequestCoordinator:
             or state.runner_identity is None
             or state.project_policy_hash is None
             or state.product_change_manifest is None
+            or state.product_change_manifest_hash is None
             or not state.failure_history
             or state.failure_history[-1].failure_class is not FailureClass.ORCHESTRATION
         ):
@@ -445,7 +446,10 @@ class RepairRequestCoordinator:
         if not failure_evidence or not failure_evidence.issubset(plan.evidence):
             raise UnauthorizedRepairError("repair plan does not cite the authoritative failure evidence")
         manifest = self.load_product_manifest(state.product_change_manifest)
-        if not isinstance(manifest, ProductChangeManifest):
+        if (
+            not isinstance(manifest, ProductChangeManifest)
+            or manifest.content_hash != state.product_change_manifest_hash
+        ):
             raise UnauthorizedRepairError("authoritative product manifest is invalid")
         relative_plan = str(Path(plan_path).relative_to(handle.path).as_posix())
         if relative_plan != ".repair-control/plan.json":

@@ -1087,6 +1087,7 @@ def test_cas_requires_definition_change_to_clear_dependent_state(tmp_path: Path)
             update={
                 "task_status_manifest": task_status_manifest(first_definition, UnitStatus.UNCHECKED),
                 "product_change_manifest": "product-change-1",
+                "product_change_manifest_hash": "a" * 64,
                 "build_identity": "build-1",
                 "verification_result": "verification-1",
                 "browser_result": "browser-1",
@@ -1112,6 +1113,7 @@ def test_cas_requires_definition_change_to_clear_dependent_state(tmp_path: Path)
             "task_definition_manifest": second_definition,
             "task_status_manifest": None,
             "product_change_manifest": None,
+            "product_change_manifest_hash": None,
             "build_identity": None,
             "verification_result": None,
             "browser_result": None,
@@ -1126,6 +1128,35 @@ def test_cas_requires_definition_change_to_clear_dependent_state(tmp_path: Path)
     )
 
     assert store.compare_and_swap(first.revision, first.state_hash, reset).state == reset
+
+
+def test_product_change_manifest_reference_and_hash_cannot_be_substituted(tmp_path: Path) -> None:
+    store = RunStateStore(tmp_path, "run-1")
+    initial = store.compare_and_swap(
+        0,
+        EMPTY_STATE_HASH,
+        RunState(run_id="run-1", ticket_id="ENG-1", repository_id="repo-1", max_crew_iterations=3),
+    )
+    bound = store.compare_and_swap(
+        initial.revision,
+        initial.state_hash,
+        initial.state.model_copy(
+            update={
+                "product_change_manifest": "manifests/product.json",
+                "product_change_manifest_hash": "a" * 64,
+            }
+        ),
+    )
+
+    assert bound.state.product_change_manifest_hash == "a" * 64
+    substituted = bound.state.model_copy(
+        update={
+            "product_change_manifest": "manifests/substitute.json",
+            "product_change_manifest_hash": "b" * 64,
+        }
+    )
+    with pytest.raises(InvalidStateTransition, match="Product Change Manifest"):
+        store.compare_and_swap(bound.revision, bound.state_hash, substituted)
 
 
 def test_cas_rejects_unbound_checkpoint_even_for_a_constructed_snapshot(tmp_path: Path) -> None:

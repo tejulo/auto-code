@@ -10,6 +10,7 @@ from typing import Sequence
 
 import pytest
 
+import auto_code.git as git_module
 from auto_code.git import (
     BranchBinding,
     BranchReuseError,
@@ -605,6 +606,29 @@ def test_repair_source_manifest_binds_unchanged_and_ignored_workspace_files(
     assert workspace["ignored.cache"].binary is True
     assert workspace["ignored.cache"].content_sha256 == sha256(b"\x00ignored\n").hexdigest()
     assert not any(entry.path.startswith(".git/") for entry in manifest.workspace_files)
+
+
+@pytest.mark.parametrize(
+    ("limit_name", "limit"),
+    (
+        ("MAX_REPAIR_SOURCE_FILES", 1),
+        ("MAX_REPAIR_SOURCE_FILE_BYTES", 1),
+        ("MAX_REPAIR_SOURCE_TOTAL_BYTES", 1),
+    ),
+)
+def test_repair_source_manifest_rejects_file_count_per_file_and_aggregate_oversize(
+    git_repo_with_remote: GitRepository,
+    monkeypatch: pytest.MonkeyPatch,
+    limit_name: str,
+    limit: int,
+) -> None:
+    guard = git_repo_with_remote.guard()
+    baseline = git_repo_with_remote.git("rev-parse", "HEAD").stdout_text.strip()
+    (git_repo_with_remote.root / "old.txt").write_text("repaired\n", encoding="ascii")
+    monkeypatch.setattr(git_module, limit_name, limit)
+
+    with pytest.raises(GitGuardError, match="limit"):
+        guard.collect_repair_source_manifest(baseline, planned_paths=("old.txt",))
 
 
 def test_collect_manifest_inputs_uses_trusted_full_output_when_public_evidence_is_capped(

@@ -14,6 +14,7 @@ from .contracts import FailureClass, RunnerIdentity, RunDisposition, Stage
 from .git import RepairSourceManifest
 from .hashing import hash_json
 from .process import CommandResult, EvidenceSink, ProcessRunner, SandboxPolicy
+from .process import VerifiedExecutable
 from .repair import (
     InjectedCrash,
     RepairGuard,
@@ -48,6 +49,9 @@ _PHASES = frozenset(
         "state_activated",
     }
 )
+MAX_RELEASE_FILES = 10_000
+MAX_RELEASE_FILE_BYTES = 64 * 1024 * 1024
+MAX_RELEASE_TOTAL_BYTES = 512 * 1024 * 1024
 
 
 class RepairWorktreeFactory(Protocol):
@@ -85,6 +89,40 @@ class LifecycleEffect(Protocol):
     def observe(self, effect_id: str, run_id: str, runner: RunnerIdentity) -> str | None: ...
 
     def invoke(self, effect_id: str, run_id: str, runner: RunnerIdentity) -> str: ...
+
+
+class TicketInvoker(Protocol):
+    def invoke(self, executable: VerifiedExecutable, argv: tuple[str, ...]) -> object: ...
+
+
+class ProtectedRepairService(Protocol):
+    """OS-capability service supplied only by the verified repair entrypoint."""
+
+    def require_prepare(self, generation: StateGeneration, failure_hash: str) -> None: ...
+
+    def require_apply(self, request_hash: str) -> None: ...
+
+    def prepare_handle_id(self, generation: StateGeneration, failure_hash: str) -> str: ...
+
+    def load_prepared_handle(
+        self, registry: RunnerRegistry, handle_id: str
+    ) -> RepairWorkspaceHandle | None: ...
+
+    def issue_workspace_handle(
+        self, registry: RunnerRegistry, handle: RepairWorkspaceHandle
+    ) -> RepairWorkspaceHandle: ...
+
+    def record_pending(
+        self, registry: RunnerRegistry, pending: PendingRunnerActivation
+    ) -> PendingRunnerActivation: ...
+
+    def publish_activation(
+        self,
+        registry: RunnerRegistry,
+        pending: PendingRunnerActivation,
+        receipt: RunnerActivationReceipt,
+        journal: RepairJournal,
+    ) -> RunnerActivationReceipt: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -686,12 +724,6 @@ class RunnerRegistry:
     def pending_path(self, request_hash: str) -> Path:
         return self.pending / f"{_require_hash(request_hash, 'repair request')}.json"
 
-    def issue_workspace_handle(self, handle: RepairWorkspaceHandle) -> RepairWorkspaceHandle:
-        path = self.handles / f"{handle.id}.json"
-        if not _write_new_json(path, handle.payload()) and self.load_workspace_handle(handle.id) != handle:
-            raise UnauthorizedRepairError("issued workspace handle conflicts")
-        return handle
-
     def load_workspace_handle(self, handle_id: str) -> RepairWorkspaceHandle:
         try:
             handle = RepairWorkspaceHandle.from_payload(
@@ -702,15 +734,6 @@ class RunnerRegistry:
             return handle
         except Exception:
             raise UnauthorizedRepairError("repair workspace handle was not issued") from None
-
-    def record_pending(self, pending: PendingRunnerActivation) -> PendingRunnerActivation:
-        path = self.pending_path(pending.request_hash)
-        if not _write_new_json(path, pending.payload()):
-            existing = self.lookup_pending(pending.request_hash)
-            if existing != pending:
-                raise UnauthorizedRepairError("pending activation conflicts with its request")
-            return existing
-        return pending
 
     def lookup_pending(self, request_hash: str) -> PendingRunnerActivation:
         pending = PendingRunnerActivation.from_payload(
@@ -772,11 +795,9 @@ class RepairRunner:
         repair_runner_identity: RunnerIdentity,
         state_root: Path,
         repair_workspace_root: Path,
-        authorize: Callable[[], object],
+        repair_service: ProtectedRepairService,
         now: Callable[[], datetime] | None = None,
     ) -> None:
-        if not callable(authorize):
-            raise ValueError("repair authorization capability is invalid")
         self.worktree_factory = worktree_factory
         self.git = git
         self.regression = regression
@@ -787,7 +808,7 @@ class RepairRunner:
         self.repair_workspace_root = repair_workspace_root
         self.repair_workspace_root_identity = RepairWorkspaceIdentity.capture(repair_workspace_root)
         self.now = now or (lambda: datetime.now(UTC))
-        self.authorize = authorize
+        self.repair_service = repair_service
         self._crash_marker: tuple[str, str] | None = None
 
     def crash_at(self, phase: str, point: str) -> None:
@@ -806,7 +827,7 @@ class RepairRunner:
         generation: StateGeneration,
         failure_hash: str,
     ) -> RepairWorkspaceHandle:
-        self.authorize()
+        self.repair_service.require_prepare(generation, failure_hash)
         if self.repair_runner_identity != self.registry.repair_runner_identity:
             raise PermissionError("repair runner identity is not launcher pinned")
         self.repair_workspace_root_identity.verify()
@@ -819,14 +840,19 @@ class RepairRunner:
             or hash_json(state.failure_history[-1].model_dump(mode="json", round_trip=True)) != failure_hash
         ):
             raise UnauthorizedRepairError("repair workspace requires protected repair state")
-        handle_id = uuid.uuid4().hex
-        self.authorize()
+        handle_id = self.repair_service.prepare_handle_id(generation, failure_hash)
+        recovered = self.repair_service.load_prepared_handle(self.registry, handle_id)
+        if recovered is not None:
+            recovered.identity.verify()
+            return recovered
+        self.repair_service.require_prepare(generation, failure_hash)
         path = self.worktree_factory.create(handle_id)
         identity = RepairWorkspaceIdentity.capture(path)
         if not path.is_relative_to(self.repair_workspace_root) or not any(path.iterdir()):
             raise UnauthorizedRepairError("repair workspace must be a fresh populated worktree")
-        self.authorize()
-        return self.registry.issue_workspace_handle(
+        self.repair_service.require_prepare(generation, failure_hash)
+        return self.repair_service.issue_workspace_handle(
+            self.registry,
             RepairWorkspaceHandle(
                 id=handle_id,
                 identity=identity,
@@ -837,11 +863,11 @@ class RepairRunner:
                 failure_hash=_require_hash(failure_hash, "repair failure"),
                 old_runner_hash=state.runner_identity.content_hash,
                 expires_at=self.now() + timedelta(hours=1),
-            )
+            ),
         )
 
     def validate_regress_build(self, request: RepairRequest) -> PendingRunnerActivation:
-        self.authorize()
+        self.repair_service.require_apply(request.content_hash)
         self.repair_workspace_root_identity.verify()
         request.workspace.identity.verify()
         generation = RunStateStore.load_read_only(self.state_root, request.run_id)
@@ -881,7 +907,7 @@ class RepairRunner:
         )
         for _ in range(3):
             request.workspace.identity.verify()
-            self.authorize()
+            self.repair_service.require_apply(request.content_hash)
             source = self.git.collect_repair_source_manifest(
                 request.workspace.baseline_hash,
                 planned_paths=request.plan.files,
@@ -898,14 +924,14 @@ class RepairRunner:
             self._apply_crash_marker(regression_journal, "regression")
             regression_effect_id = regression_journal.request_hash
             request.workspace.identity.verify()
-            self.authorize()
+            self.repair_service.require_apply(request.content_hash)
             regression_hash = regression_journal.reconcile_effect(
                 "regression",
                 source.content_hash,
                 observe=lambda: self.regression.observe(regression_effect_id),
                 invoke=lambda: self.regression.run(regression_effect_id, request.workspace.path),
             )
-            self.authorize()
+            self.repair_service.require_apply(request.content_hash)
             after_regression = self.git.collect_repair_source_manifest(
                 request.workspace.baseline_hash,
                 planned_paths=request.plan.files,
@@ -913,11 +939,11 @@ class RepairRunner:
             )
             if after_regression != source:
                 continue
-            self.authorize()
+            self.repair_service.require_apply(request.content_hash)
             dependency_hash = _require_hash(
                 self.git.dependency_lock_hash(request.workspace.path), "dependency lock"
             )
-            self.authorize()
+            self.repair_service.require_apply(request.content_hash)
             before_build = self.git.collect_repair_source_manifest(
                 request.workspace.baseline_hash,
                 planned_paths=request.plan.files,
@@ -946,7 +972,7 @@ class RepairRunner:
         )
         def build() -> str:
             nonlocal built, pending_result
-            self.authorize()
+            self.repair_service.require_apply(request.content_hash)
             built = self.builder.observe(build_effect_id)
             if built is None:
                 built = self.builder.build(
@@ -979,7 +1005,7 @@ class RepairRunner:
                 previous_contract_hashes=dict(request.contract_hashes),
                 contract_hashes=dict(built.contract_hashes),
             )
-            self.registry.record_pending(pending_result)
+            self.repair_service.record_pending(self.registry, pending_result)
             return built.build_evidence_hash
 
         self._apply_crash_marker(journal, "build")
@@ -1005,20 +1031,18 @@ class TrustedLauncher:
         terminate_old_runner: LifecycleEffect,
         start_new_runner: LifecycleEffect,
         attest_new_runner: LifecycleEffect,
-        authorize: Callable[[], object],
-        ticket_invoker: Callable[[tuple[str, ...]], object] | None = None,
+        repair_service: ProtectedRepairService,
+        ticket_invoker: TicketInvoker | None = None,
     ) -> None:
         if store.repair_activation_verifier is not registry:
             raise ValueError("state store is not bound to the protected activation registry")
-        if not callable(authorize):
-            raise ValueError("activation authorization capability is invalid")
         self.store = store
         self.registry = registry
         self.terminate_old_runner = terminate_old_runner
         self.start_new_runner = start_new_runner
         self.attest_new_runner = attest_new_runner
         self.ticket_invoker = ticket_invoker
-        self.authorize = authorize
+        self.repair_service = repair_service
         self._crash_marker: str | None = None
         self._effect_crash_marker: tuple[str, str] | None = None
 
@@ -1031,7 +1055,7 @@ class TrustedLauncher:
         self._effect_crash_marker = (phase, point)
 
     def reconcile_activation(self, run_id: str, request_hash: str) -> StateGeneration:
-        self.authorize()
+        self.repair_service.require_apply(request_hash)
         if run_id != self.store.run_id:
             raise UnauthorizedRepairError("activation run does not match launcher")
         current = self.store.load()
@@ -1055,17 +1079,17 @@ class TrustedLauncher:
             raise UnauthorizedRepairError("pending activation does not match repair state")
         journal = RepairJournal(self.store.root, request_hash)
         journal.require("source_manifest", "regression", "build")
-        self.authorize()
+        self.repair_service.require_apply(request_hash)
         terminated = self._reconcile_lifecycle_effect(
             journal, "old_runner_terminated", self.terminate_old_runner, run_id, pending.old_runner_identity,
         )
         self._maybe_crash("old_runner_terminated")
-        self.authorize()
+        self.repair_service.require_apply(request_hash)
         restarted = self._reconcile_lifecycle_effect(
             journal, "new_runner_started", self.start_new_runner, run_id, pending.new_runner_identity,
         )
         self._maybe_crash("new_runner_started")
-        self.authorize()
+        self.repair_service.require_apply(request_hash)
         attested = self._reconcile_lifecycle_effect(
             journal, "identity_attested", self.attest_new_runner, run_id, pending.new_runner_identity,
         )
@@ -1092,33 +1116,8 @@ class TrustedLauncher:
             "source_manifest", "regression", "build", "old_runner_terminated", "new_runner_started",
             "identity_attested",
         )
-        self.authorize()
-        with _interprocess_lock(self.registry.pointer_lock):
-            if _path_lstat(self.registry.pointer_path, "runner activation pointer") is not None:
-                pointer = _read_canonical_json(self.registry.pointer_path, "runner activation pointer")
-                if not isinstance(pointer, dict) or set(pointer) != {"request_hash", "receipt_hash", "runner_identity"}:
-                    raise UnauthorizedRepairError("runner activation pointer is invalid")
-                current_identity = RunnerIdentity.model_validate(pointer["runner_identity"])
-                if current_identity != pending.old_runner_identity:
-                    if current_identity == receipt.new_runner_identity:
-                        existing = self.registry.lookup_activation(receipt.request_hash)
-                        if existing == receipt:
-                            return self.store.load()
-                    raise UnauthorizedRepairError("runner activation pointer does not match expected old runner")
-            activation_path = self.registry.activation_path(receipt.request_hash)
-            if not _write_new_json(activation_path, receipt.payload()):
-                existing = self.registry.lookup_activation(receipt.request_hash)
-                if existing != receipt:
-                    raise UnauthorizedRepairError("activation replay conflicts with its request")
-                receipt = existing
-            _atomic_replace_json(
-                self.registry.pointer_path,
-                {
-                    "request_hash": receipt.request_hash,
-                    "receipt_hash": receipt.content_hash,
-                    "runner_identity": receipt.new_runner_identity.model_dump(mode="json", round_trip=True),
-                },
-            )
+        receipt = self.repair_service.publish_activation(self.registry, pending, receipt, journal)
+        self._maybe_crash("activation_pointer")
         journal.record("activation", receipt.content_hash)
         checkpoints, outputs = self._compatible_checkpoints(
             current.state.checkpoints,
@@ -1134,7 +1133,7 @@ class TrustedLauncher:
                 "restart_receipt_hash": receipt.content_hash,
             }
         )
-        self.authorize()
+        self.repair_service.require_apply(request_hash)
         generation = self.store.compare_and_swap(current.revision, current.state_hash, updated)
         self._maybe_crash("state_cas")
         journal.record("state_activated", generation.state_hash)
@@ -1170,8 +1169,28 @@ class TrustedLauncher:
                 raise UnauthorizedRepairError("active runner release identity is invalid")
         except Exception as error:
             raise PermissionError("ticket runner release is invalid") from error
-        executable = receipt.release_root / receipt.runner_executable
-        return self.ticket_invoker((str(executable), *argv))
+        executable_path = receipt.release_root / receipt.runner_executable
+        descriptor = os.open(
+            executable_path,
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        )
+        executable = VerifiedExecutable(str(executable_path), descriptor)
+        try:
+            metadata = os.fstat(descriptor)
+            entry = next(item for item in receipt.release_manifest if item.path == receipt.runner_executable)
+            digest = hashlib.sha256()
+            while chunk := os.read(descriptor, 65_536):
+                digest.update(chunk)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or not metadata.st_mode & 0o111
+                or digest.hexdigest() != entry.content_sha256
+            ):
+                raise PermissionError("ticket runner release executable is invalid")
+            return self.ticket_invoker.invoke(executable, argv)
+        finally:
+            executable.close()
 
     def _maybe_crash(self, marker: str) -> None:
         if self._crash_marker == marker:
@@ -1282,12 +1301,15 @@ def _capture_immutable_release_manifest(root: Path) -> tuple[ReleaseManifestEntr
     if not candidate.is_absolute() or candidate.is_symlink() or not candidate.is_dir():
         raise UnauthorizedRepairError("built runner release root is invalid")
     entries: list[ReleaseManifestEntry] = []
+    total_bytes = 0
     root_metadata = os.lstat(candidate)
     if root_metadata.st_mode & 0o222:
         raise UnauthorizedRepairError("built runner release is mutable")
     for current, directories, files in os.walk(candidate, followlinks=False):
         current_path = Path(current)
         for name in sorted((*directories, *files)):
+            if len(entries) >= MAX_RELEASE_FILES:
+                raise UnauthorizedRepairError("built runner release file-count limit exceeded")
             path = current_path / name
             metadata = os.lstat(path)
             if metadata.st_mode & 0o222:
@@ -1296,30 +1318,46 @@ def _capture_immutable_release_manifest(root: Path) -> tuple[ReleaseManifestEntr
             if stat.S_ISLNK(metadata.st_mode):
                 kind = "symlink"
                 content = os.fsencode(os.readlink(path))
+                size = len(content)
+                if size > MAX_RELEASE_FILE_BYTES or total_bytes + size > MAX_RELEASE_TOTAL_BYTES:
+                    raise UnauthorizedRepairError("built runner release byte limit exceeded")
+                content_hash = hashlib.sha256(content).hexdigest()
             elif stat.S_ISREG(metadata.st_mode):
                 kind = "file"
                 descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
                 try:
-                    chunks: list[bytes] = []
-                    while chunk := os.read(descriptor, 65_536):
-                        chunks.append(chunk)
-                    content = b"".join(chunks)
+                    size = os.fstat(descriptor).st_size
+                    if size > MAX_RELEASE_FILE_BYTES or total_bytes + size > MAX_RELEASE_TOTAL_BYTES:
+                        raise UnauthorizedRepairError("built runner release byte limit exceeded")
+                    digest = hashlib.sha256()
+                    observed = 0
+                    while chunk := os.read(descriptor, min(65_536, MAX_RELEASE_FILE_BYTES + 1 - observed)):
+                        observed += len(chunk)
+                        if observed > size or total_bytes + observed > MAX_RELEASE_TOTAL_BYTES:
+                            raise UnauthorizedRepairError("built runner release byte limit exceeded")
+                        digest.update(chunk)
+                    if observed != size:
+                        raise UnauthorizedRepairError("built runner release changed during capture")
+                    size = observed
+                    content_hash = digest.hexdigest()
                 finally:
                     os.close(descriptor)
             elif stat.S_ISDIR(metadata.st_mode):
                 kind = "directory"
-                content = b""
+                size = 0
+                content_hash = hashlib.sha256(b"").hexdigest()
             else:
                 raise UnauthorizedRepairError("built runner release contains an unsupported file")
+            total_bytes += size
             entries.append(
                 ReleaseManifestEntry(
                     path=relative,
                     kind=kind,
                     mode=stat.S_IMODE(metadata.st_mode),
-                    content_sha256=hashlib.sha256(content).hexdigest(),
+                    content_sha256=content_hash,
                 )
             )
-    if not entries or len(entries) > 100_000:
+    if not entries:
         raise UnauthorizedRepairError("built runner release manifest is invalid")
     result = tuple(sorted(entries, key=lambda entry: entry.path))
     if len({entry.path for entry in result}) != len(result):

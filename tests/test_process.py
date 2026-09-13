@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from dataclasses import replace
 from hashlib import sha256
+import array
+import json
 import os
 from pathlib import Path
+import socket
 import subprocess
+import threading
 
 import pytest
 
@@ -18,6 +22,7 @@ from auto_code.process import (
     EvidenceSinkError,
     FilesystemEvidenceSink,
     HashVerifiedExecutables,
+    LauncherSocketSandbox,
     ManagedProcessRunner,
     ManagedProcessStartError,
     ProcessConfigurationError,
@@ -28,6 +33,7 @@ from auto_code.process import (
     SandboxPolicy,
     VerifiedExecutable,
 )
+from auto_code.hashing import canonical_json_bytes
 
 
 def test_filesystem_evidence_sink_rejects_replaced_root(tmp_path: Path) -> None:
@@ -367,6 +373,78 @@ def test_runner_hands_the_sandbox_a_verified_descriptor_after_executable_replace
 
     assert result.returncode == 0
     assert executable.read_bytes() == b"replacement executable\n"
+
+
+def test_launcher_socket_executes_the_verified_descriptor_after_path_replacement(
+    sandbox_policy: SandboxPolicy,
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "probe"
+    replacement = tmp_path / "replacement"
+    executable.write_bytes(b"#!/bin/sh\nprintf trusted-descriptor")
+    replacement.write_bytes(b"#!/bin/sh\nprintf mutable-path")
+    executable.chmod(0o700)
+    replacement.chmod(0o700)
+    socket_path = tmp_path / "launcher.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(1)
+
+    def serve() -> None:
+        connection, _ = listener.accept()
+        with connection:
+            descriptors = array.array("i")
+            raw, ancillary, _, _ = connection.recvmsg(65_536, socket.CMSG_SPACE(descriptors.itemsize))
+            for level, kind, data in ancillary:
+                if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                    descriptors.frombytes(data[: len(data) - (len(data) % descriptors.itemsize)])
+            while not raw.endswith(b"\n"):
+                raw += connection.recv(65_536)
+            request = json.loads(raw)
+            replacement.replace(executable)
+            if len(descriptors) != 1:
+                completed = subprocess.CompletedProcess((), 97, b"", b"missing descriptor")
+            else:
+                descriptor = descriptors[0]
+                completed = subprocess.run(
+                    (f"/proc/self/fd/{descriptor}", *request["argv"]),
+                    pass_fds=(descriptor,),
+                    capture_output=True,
+                    check=False,
+                )
+                os.close(descriptor)
+            connection.sendall(
+                canonical_json_bytes(
+                    {
+                        "returncode": completed.returncode,
+                        "stdout": completed.stdout.decode("ascii"),
+                        "stderr": completed.stderr.decode("ascii"),
+                    }
+                )
+                + b"\n"
+            )
+
+    thread = threading.Thread(target=serve)
+    thread.start()
+    try:
+        result = ProcessRunner(
+            HashVerifiedExecutables({executable: sha256(b"#!/bin/sh\nprintf trusted-descriptor").hexdigest()}),
+            LauncherSocketSandbox(socket_path, "launcher"),
+        ).run(
+            (str(executable), "argument"),
+            sandbox_policy.project_root,
+            3,
+            RecordingEvidenceSink(),
+            {"LANG": "C"},
+            sandbox_policy,
+        )
+    finally:
+        thread.join(timeout=3)
+        listener.close()
+
+    assert result.returncode == 0
+    assert result.stdout_text == "trusted-descriptor"
+    assert executable.read_bytes() == b"#!/bin/sh\nprintf mutable-path"
 
 
 def test_runner_rejects_a_working_directory_symlink_to_authoritative_state(sandbox_policy: SandboxPolicy) -> None:

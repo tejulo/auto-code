@@ -2654,6 +2654,7 @@ class RunState(ContractModel):
     task_definition_manifest: TaskDefinitionManifest | None = None
     task_status_manifest: TaskStatusManifest | None = None
     product_change_manifest: str | None = None
+    product_change_manifest_hash: Sha256 | None = None
     build_identity: str | None = None
     verification_result: str | None = None
     browser_result: str | None = None
@@ -2680,6 +2681,7 @@ class RunState(ContractModel):
         "preparation_input_hash",
         "ticket_snapshot_hash",
         "compatibility_receipt_hash",
+        "product_change_manifest_hash",
     )
     @classmethod
     def normalize_preparation_binding_hashes(cls, value: str | None) -> str | None:
@@ -2724,6 +2726,8 @@ class RunState(ContractModel):
                 raise ValueError("Compatibility receipt hash does not match its reference")
         elif self.preparation_phase is not PreparationPhase.SELECTED or self.compensated:
             raise ValueError("Preparation state requires a complete preparation binding")
+        if (self.product_change_manifest is None) != (self.product_change_manifest_hash is None):
+            raise ValueError("Product Change Manifest reference and hash must be bound together")
         if self.crew_iteration_count > self.authorized_iteration_limit:
             raise ValueError("Crew Iteration count exceeds authorized limit")
         if self.iteration_open and self.crew_iteration_count == 0:

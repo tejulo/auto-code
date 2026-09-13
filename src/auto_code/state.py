@@ -691,6 +691,11 @@ class RunStateStore:
             raise InvalidStateTransition("immutable field branch cannot change after it is set")
         if previous.branch_binding is not None and state.branch_binding != previous.branch_binding:
             raise InvalidStateTransition("branch binding cannot change after it is set")
+        if previous.product_change_manifest is not None and state.product_change_manifest is not None and (
+            previous.product_change_manifest != state.product_change_manifest
+            or previous.product_change_manifest_hash != state.product_change_manifest_hash
+        ):
+            raise InvalidStateTransition("Product Change Manifest binding cannot be substituted")
         for field in ("effect_ledger", "failure_history", "human_authorizations"):
             old = getattr(previous, field)
             new = getattr(state, field)
@@ -1135,6 +1140,7 @@ class RunStateStore:
             raise InvalidStateTransition("Task definition change must clear Task status")
         dependent_fields = (
             "product_change_manifest",
+            "product_change_manifest_hash",
             "build_identity",
             "verification_result",
             "browser_result",

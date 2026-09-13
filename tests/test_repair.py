@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+import array
 import inspect
 import json
 import os
@@ -12,12 +13,14 @@ import shutil
 import subprocess
 import sys
 import threading
+import uuid
 
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from auto_code import repair_entrypoint
+import auto_code.runner as runner_module
 from auto_code.cli import TrustedRuntimeConfig, main as ticket_main
 from auto_code.contracts import (
     EvidenceRef,
@@ -169,6 +172,8 @@ class FakeSandboxServer:
         self.path = path
         self.requests: list[dict[str, object]] = []
         self.effects: dict[tuple[str, str], dict[str, object]] = {}
+        self.before_build: Callable[[dict[str, object]], None] | None = None
+        self.before_worktree: Callable[[], None] | None = None
         self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._socket.bind(str(path))
         self._socket.listen()
@@ -189,7 +194,11 @@ class FakeSandboxServer:
         while not self._stopped:
             connection, _ = self._socket.accept()
             with connection:
-                raw = b""
+                descriptors = array.array("i")
+                raw, ancillary, _, _ = connection.recvmsg(65_536, socket.CMSG_SPACE(descriptors.itemsize))
+                for level, kind, data in ancillary:
+                    if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                        descriptors.frombytes(data[: len(data) - (len(data) % descriptors.itemsize)])
                 while not raw.endswith(b"\n"):
                     chunk = connection.recv(65_536)
                     if not chunk:
@@ -225,11 +234,15 @@ class FakeSandboxServer:
                 stdout = ""
                 stderr = ""
                 returncode = 0
-                if Path(argv[0]).name == "git":
+                executable_name = ""
+                if descriptors:
+                    executable_name = Path(os.readlink(f"/proc/self/fd/{descriptors[0]}")).name
+                if executable_name == "git":
                     completed = subprocess.run(
-                        argv,
+                        (f"/proc/self/fd/{descriptors[0]}", *argv),
                         cwd=request["policy"]["cwd"],
                         env=request["environment"],
+                        pass_fds=(descriptors[0],),
                         capture_output=True,
                         check=False,
                     )
@@ -237,12 +250,16 @@ class FakeSandboxServer:
                     stdout = completed.stdout.decode("utf-8", errors="replace")
                     stderr = completed.stderr.decode("utf-8", errors="replace")
                 elif "worktree" in argv and "add" in argv:
+                    if self.before_worktree is not None:
+                        self.before_worktree()
                     workspace = Path(argv[-1])
                     (workspace / "src" / "auto_code").mkdir(parents=True)
                     (workspace / "src" / "auto_code" / "runner.py").write_text("baseline\n", encoding="ascii")
                 elif "rev-parse" in argv:
                     stdout = "a" * 40 + "\n"
-                elif len(argv) > 1 and argv[1] == "build":
+                elif argv and argv[0] == "build":
+                    if self.before_build is not None:
+                        self.before_build(request)
                     release = Path(argv[argv.index("--release-root") + 1])
                     release.mkdir(parents=True)
                     (release / "runner.py").write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
@@ -269,6 +286,8 @@ class FakeSandboxServer:
                     )
                     self.effects[effect_key] = response
                 connection.sendall(canonical_json_bytes(response) + b"\n")
+                for descriptor in descriptors:
+                    os.close(descriptor)
 
 
 def preparation_state(*, runner: RunnerIdentity) -> RunState:
@@ -436,7 +455,7 @@ class FakeBuilder:
         release = self.root / f"release-{self.calls}"
         release.mkdir(parents=True)
         artifact = release / "runner.py"
-        artifact.write_bytes(b"immutable runner\n")
+        artifact.write_bytes(b"#!/bin/sh\nprintf immutable-runner")
         artifact.chmod(0o555)
         release.chmod(0o555)
         manifest = capture_built_release_manifest(release)
@@ -480,6 +499,69 @@ class FakeLifecycleEffect:
         return result
 
 
+class FakeTicketInvoker:
+    def __init__(self, commands: list[tuple[str, ...]] | None = None) -> None:
+        self.commands = [] if commands is None else commands
+
+    def invoke(self, executable: VerifiedExecutable, argv: tuple[str, ...]) -> tuple[str, ...]:
+        os.fstat(executable.descriptor)
+        self.commands.append(argv)
+        return argv
+
+
+class FakeProtectedRepairService:
+    def __init__(self) -> None:
+        self.request_hash: str | None = None
+
+    def require_prepare(self, generation: object, failure_hash: str) -> None:
+        return None
+
+    def require_apply(self, request_hash: str) -> None:
+        if self.request_hash is not None and request_hash != self.request_hash:
+            raise PermissionError("wrong repair transaction")
+
+    def prepare_handle_id(self, generation: object, failure_hash: str) -> str:
+        return uuid.uuid4().hex
+
+    def load_prepared_handle(self, registry: RunnerRegistry, handle_id: str) -> None:
+        return None
+
+    def issue_workspace_handle(self, registry: RunnerRegistry, handle: object) -> object:
+        path = registry.handles / f"{getattr(handle, 'id')}.json"
+        path.write_bytes(canonical_json_bytes(getattr(handle, "payload")()))
+        return handle
+
+    def record_pending(
+        self, registry: RunnerRegistry, pending: PendingRunnerActivation
+    ) -> PendingRunnerActivation:
+        path = registry.pending_path(pending.request_hash)
+        if not path.exists():
+            path.write_bytes(canonical_json_bytes(pending.payload()))
+        return registry.lookup_pending(pending.request_hash)
+
+    def publish_activation(
+        self,
+        registry: RunnerRegistry,
+        pending: PendingRunnerActivation,
+        receipt: RunnerActivationReceipt,
+        journal: RepairJournal,
+    ) -> RunnerActivationReceipt:
+        from auto_code.state import _atomic_replace_json, _write_new_json
+
+        path = registry.activation_path(receipt.request_hash)
+        if not _write_new_json(path, receipt.payload()):
+            receipt = registry.lookup_activation(receipt.request_hash)
+        _atomic_replace_json(
+            registry.pointer_path,
+            {
+                "request_hash": receipt.request_hash,
+                "receipt_hash": receipt.content_hash,
+                "runner_identity": receipt.new_runner_identity.model_dump(mode="json", round_trip=True),
+            },
+        )
+        return receipt
+
+
 class RepairHarness:
     def __init__(self, tmp_path: Path, *, same_repository: bool = False) -> None:
         self.state_root = tmp_path / "state"
@@ -494,6 +576,7 @@ class RepairHarness:
                 update={
                     "disposition": RunDisposition.REPAIR_REQUIRED,
                     "product_change_manifest": "manifests/product.json",
+                    "product_change_manifest_hash": product_manifest().content_hash,
                     "failure_history": (self.failure,),
                 }
             ),
@@ -502,6 +585,7 @@ class RepairHarness:
         self.git = FakeGit()
         self.regression = FakeRegression()
         self.builder = FakeBuilder(tmp_path / "releases")
+        self.repair_service = FakeProtectedRepairService()
         self.runner = RepairRunner(
             worktree_factory=FakeWorktreeFactory(self.workspace_root),
             git=self.git,
@@ -511,7 +595,7 @@ class RepairHarness:
             repair_runner_identity=identity("e", repair=True),
             state_root=self.state_root,
             repair_workspace_root=self.workspace_root,
-            authorize=lambda: None,
+            repair_service=self.repair_service,
             now=lambda: NOW,
         )
         self.failure_hash = hash_json(self.failure.model_dump(mode="json", round_trip=True))
@@ -534,13 +618,15 @@ class RepairHarness:
         )
 
     def request(self) -> RepairRequest:
-        return self.coordinator.create_request(
+        request = self.coordinator.create_request(
             "run-1",
             self.generation.revision,
             self.generation.state_hash,
             self.handle.path,
             self.plan_path,
         )
+        self.repair_service.request_hash = request.content_hash
+        return request
 
 
 def activation_receipt(request_hash: str, old: RunnerIdentity, new: RunnerIdentity) -> RunnerActivationReceipt:
@@ -690,6 +776,46 @@ def test_descriptor_nonce_is_bound_recoverable_and_terminal_after_completion(tmp
         ).require_active(descriptor)
 
 
+def test_descriptor_nonce_transaction_serializes_concurrent_use(tmp_path: Path) -> None:
+    descriptor = repair_entrypoint.RepairRuntimeDescriptor.from_payload(
+        descriptor_payload(tmp_path, issued_at=NOW), now=NOW
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    second_finished = threading.Event()
+    outcomes: list[str] = []
+
+    def first() -> None:
+        store = repair_entrypoint.DescriptorNonceStore(tmp_path / "state", now=lambda: NOW)
+        with store.transaction(descriptor) as transaction:
+            entered.set()
+            release.wait(timeout=2)
+            transaction.complete("a" * 64)
+
+    def second() -> None:
+        entered.wait(timeout=2)
+        store = repair_entrypoint.DescriptorNonceStore(tmp_path / "state", now=lambda: NOW)
+        try:
+            with store.transaction(descriptor):
+                outcomes.append("entered")
+        except PermissionError:
+            outcomes.append("consumed")
+        finally:
+            second_finished.set()
+
+    first_thread = threading.Thread(target=first)
+    second_thread = threading.Thread(target=second)
+    first_thread.start()
+    second_thread.start()
+    assert entered.wait(timeout=2)
+    assert not second_finished.wait(timeout=0.1)
+    release.set()
+    first_thread.join(timeout=2)
+    second_thread.join(timeout=2)
+
+    assert outcomes == ["consumed"]
+
+
 def test_repair_plan_contract_rejects_commands_unbounded_text_and_unsorted_paths() -> None:
     with pytest.raises(MissingRepairPlanError):
         RepairPlan.from_payload(
@@ -737,6 +863,30 @@ def test_request_derives_generation_policy_failure_repository_manifest_and_contr
     assert request.old_runner_identity == harness.generation.state.runner_identity
     assert request.ticket_owned_paths == ("src/auto_code/runner.py",)
     assert request.contract_hashes == {}
+
+
+def test_request_rejects_a_self_consistent_manifest_that_does_not_match_state(tmp_path: Path) -> None:
+    harness = RepairHarness(tmp_path)
+    substitute = ProductChangeManifest.from_files(
+        "f" * 40,
+        (
+            ProductChangeFile(
+                path="src/auto_code/substitute.py",
+                status="A",
+                old_path=None,
+                old_mode="000000",
+                mode="100644",
+                old_object_id=None,
+                object_id="e" * 40,
+                binary=False,
+                untracked=True,
+            ),
+        ),
+    )
+    harness.coordinator.load_product_manifest = lambda _: substitute
+
+    with pytest.raises(UnauthorizedRepairError, match="manifest"):
+        harness.request()
 
 
 def test_request_rejects_a_stale_generation_before_writing_request(tmp_path: Path) -> None:
@@ -971,6 +1121,33 @@ def test_build_identity_requires_an_actual_immutable_release_and_all_bindings(tm
     assert built.identity.contract_bundle_hash == hash_json({})
 
 
+@pytest.mark.parametrize(
+    ("limit_name", "limit"),
+    (
+        ("MAX_RELEASE_FILES", 1),
+        ("MAX_RELEASE_FILE_BYTES", 1),
+        ("MAX_RELEASE_TOTAL_BYTES", 1),
+    ),
+)
+def test_release_manifest_rejects_file_count_per_file_and_aggregate_oversize(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    limit_name: str,
+    limit: int,
+) -> None:
+    release = tmp_path / "release"
+    release.mkdir()
+    for name in ("runner", "contracts.json"):
+        path = release / name
+        path.write_bytes(b"content")
+        path.chmod(0o555)
+    release.chmod(0o555)
+    monkeypatch.setattr(runner_module, limit_name, limit, raising=False)
+
+    with pytest.raises(UnauthorizedRepairError, match="limit"):
+        capture_built_release_manifest(release)
+
+
 def test_runner_rejects_same_repository_ticket_overlap_before_regression(tmp_path: Path) -> None:
     harness = RepairHarness(tmp_path, same_repository=True)
     request = harness.request()
@@ -1050,6 +1227,7 @@ def test_built_contract_manifest_drives_per_stage_compatibility(tmp_path: Path) 
         harness.request(),
         contract_hashes={Stage.ANALYST: "a" * 64, Stage.ARCHITECT_OUTLINE: "b" * 64},
     )
+    harness.repair_service.request_hash = request.content_hash
     harness.builder.contract_hashes = {
         Stage.ANALYST: "a" * 64,
         Stage.ARCHITECT_OUTLINE: "c" * 64,
@@ -1062,7 +1240,7 @@ def test_built_contract_manifest_drives_per_stage_compatibility(tmp_path: Path) 
     launcher = TrustedLauncher(
         harness.store,
         harness.registry,
-        authorize=lambda: None,
+        repair_service=harness.repair_service,
         terminate_old_runner=FakeLifecycleEffect("terminate", lifecycle_calls),
         start_new_runner=FakeLifecycleEffect("start", lifecycle_calls),
         attest_new_runner=FakeLifecycleEffect("attest", lifecycle_calls),
@@ -1078,6 +1256,7 @@ def test_contract_mismatch_invalidates_later_equal_descendants(tmp_path: Path) -
         harness.request(),
         contract_hashes={Stage.ANALYST: "a" * 64, Stage.ARCHITECT_OUTLINE: "b" * 64},
     )
+    harness.repair_service.request_hash = request.content_hash
     harness.builder.contract_hashes = {
         Stage.ANALYST: "c" * 64,
         Stage.ARCHITECT_OUTLINE: "b" * 64,
@@ -1087,7 +1266,7 @@ def test_contract_mismatch_invalidates_later_equal_descendants(tmp_path: Path) -
     TrustedLauncher(
         harness.store,
         harness.registry,
-        authorize=lambda: None,
+        repair_service=harness.repair_service,
         terminate_old_runner=FakeLifecycleEffect("terminate", lifecycle_calls),
         start_new_runner=FakeLifecycleEffect("start", lifecycle_calls),
         attest_new_runner=FakeLifecycleEffect("attest", lifecycle_calls),
@@ -1134,14 +1313,17 @@ def test_pending_build_record_recovers_a_missing_build_journal_completion(tmp_pa
 
 def test_registry_possession_alone_cannot_publish_an_activation(tmp_path: Path) -> None:
     registry = RunnerRegistry(tmp_path / "registry", repair_runner_identity=identity("e", repair=True))
-    activation_names = {
+    mutation_names = {
         name
         for name in dir(registry)
-        if any(fragment in name for fragment in ("publish", "activate", "replace_pointer"))
+        if any(
+            fragment in name
+            for fragment in ("publish", "activate", "replace_pointer", "record", "issue")
+        )
         and callable(getattr(registry, name))
     }
 
-    assert activation_names == set()
+    assert mutation_names == set()
     assert not registry.pointer_path.exists()
 
 
@@ -1154,11 +1336,11 @@ def test_state_transition_verification_accepts_only_the_current_activation_point
     launcher = TrustedLauncher(
         harness.store,
         harness.registry,
-        authorize=lambda: None,
+        repair_service=harness.repair_service,
         terminate_old_runner=FakeLifecycleEffect("terminate", lifecycle_calls),
         start_new_runner=FakeLifecycleEffect("start", lifecycle_calls),
         attest_new_runner=FakeLifecycleEffect("attest", lifecycle_calls),
-        ticket_invoker=lambda argv: argv,
+        ticket_invoker=FakeTicketInvoker(),
     )
     activated = launcher.reconcile_activation("run-1", request.content_hash)
     assert harness.registry.verify_transition(previous, activated.state)
@@ -1183,11 +1365,11 @@ def test_activation_receipt_persists_exact_release_and_invocation_reverifies_it(
     launcher = TrustedLauncher(
         harness.store,
         harness.registry,
-        authorize=lambda: None,
+        repair_service=harness.repair_service,
         terminate_old_runner=FakeLifecycleEffect("terminate", lifecycle_calls),
         start_new_runner=FakeLifecycleEffect("start", lifecycle_calls),
         attest_new_runner=FakeLifecycleEffect("attest", lifecycle_calls),
-        ticket_invoker=lambda argv: commands.append(argv) or argv,
+        ticket_invoker=FakeTicketInvoker(commands),
     )
     launcher.reconcile_activation("run-1", request.content_hash)
 
@@ -1195,13 +1377,50 @@ def test_activation_receipt_persists_exact_release_and_invocation_reverifies_it(
     assert receipt.release_root == pending.release_root
     assert receipt.release_manifest == pending.release_manifest
     assert receipt.runner_executable == "runner.py"
-    assert launcher.invoke("run-1", ("status",)) == (str(receipt.release_root / "runner.py"), "status")
+    assert launcher.invoke("run-1", ("status",)) == ("status",)
+    assert commands == [("status",)]
 
     receipt.release_root.chmod(0o755)
     (receipt.release_root / "runner.py").chmod(0o644)
     (receipt.release_root / "runner.py").write_bytes(b"tampered runner\n")
     with pytest.raises(PermissionError, match="release"):
         launcher.invoke("run-1", ("status",))
+
+
+def test_ticket_runner_executes_descriptor_held_release_after_path_replacement(tmp_path: Path) -> None:
+    harness = RepairHarness(tmp_path)
+    request = harness.request()
+    pending = harness.runner.validate_regress_build(request)
+    calls: list[str] = []
+
+    class ReplacingInvoker:
+        def invoke(self, executable: VerifiedExecutable, argv: tuple[str, ...]) -> str:
+            pending.release_root.chmod(0o755)
+            replacement = pending.release_root / "replacement"
+            replacement.write_bytes(b"#!/bin/sh\nprintf mutable-runner")
+            replacement.chmod(0o555)
+            replacement.replace(pending.release_root / pending.runner_executable)
+            completed = subprocess.run(
+                (f"/proc/self/fd/{executable.descriptor}", *argv),
+                pass_fds=(executable.descriptor,),
+                capture_output=True,
+                check=False,
+            )
+            assert completed.returncode == 0
+            return completed.stdout.decode("ascii")
+
+    launcher = TrustedLauncher(
+        harness.store,
+        harness.registry,
+        repair_service=harness.repair_service,
+        terminate_old_runner=FakeLifecycleEffect("terminate", calls),
+        start_new_runner=FakeLifecycleEffect("start", calls),
+        attest_new_runner=FakeLifecycleEffect("attest", calls),
+        ticket_invoker=ReplacingInvoker(),  # type: ignore[arg-type]
+    )
+    launcher.reconcile_activation("run-1", request.content_hash)
+
+    assert launcher.invoke("run-1", ("status",)) == "immutable-runner"
 
 
 def test_activation_receipt_rejects_missing_transaction_evidence() -> None:
@@ -1244,11 +1463,11 @@ def test_launcher_keeps_state_non_active_until_termination_start_and_attestation
     launcher = TrustedLauncher(
         harness.store,
                 harness.registry,
-        authorize=lambda: None,
+        repair_service=harness.repair_service,
         terminate_old_runner=terminate,
         start_new_runner=start,
         attest_new_runner=attest,
-        ticket_invoker=lambda argv: argv,
+        ticket_invoker=FakeTicketInvoker(),
     )
     launcher.crash_after("new_runner_started")
 
@@ -1263,11 +1482,11 @@ def test_launcher_keeps_state_non_active_until_termination_start_and_attestation
     recovered = TrustedLauncher(
         harness.store,
         harness.registry,
-        authorize=lambda: None,
+        repair_service=harness.repair_service,
         terminate_old_runner=terminate,
         start_new_runner=start,
         attest_new_runner=attest,
-        ticket_invoker=lambda argv: argv,
+        ticket_invoker=FakeTicketInvoker(),
     )
     generation = recovered.reconcile_activation("run-1", request.content_hash)
 
@@ -1293,7 +1512,7 @@ def test_launcher_lifecycle_recovery_observes_each_effect_before_reinvoking(
     launcher = TrustedLauncher(
         harness.store,
         harness.registry,
-        authorize=lambda: None,
+        repair_service=harness.repair_service,
         terminate_old_runner=FakeLifecycleEffect("terminate", calls),
         start_new_runner=FakeLifecycleEffect("start", calls),
         attest_new_runner=FakeLifecycleEffect("attest", calls),
@@ -1319,11 +1538,11 @@ def test_recovery_after_state_cas_records_final_phase_without_repeating_lifecycl
     launcher = TrustedLauncher(
         harness.store,
         harness.registry,
-        authorize=lambda: None,
+        repair_service=harness.repair_service,
         terminate_old_runner=terminate,
         start_new_runner=start,
         attest_new_runner=attest,
-        ticket_invoker=lambda argv: argv,
+        ticket_invoker=FakeTicketInvoker(),
     )
     launcher.crash_after("state_cas")
 
@@ -1333,11 +1552,11 @@ def test_recovery_after_state_cas_records_final_phase_without_repeating_lifecycl
     recovered = TrustedLauncher(
         harness.store,
         harness.registry,
-        authorize=lambda: None,
+        repair_service=harness.repair_service,
         terminate_old_runner=terminate,
         start_new_runner=start,
         attest_new_runner=attest,
-        ticket_invoker=lambda argv: argv,
+        ticket_invoker=FakeTicketInvoker(),
     )
     generation = recovered.reconcile_activation("run-1", request.content_hash)
 
@@ -1345,6 +1564,35 @@ def test_recovery_after_state_cas_records_final_phase_without_repeating_lifecycl
     assert calls == ["terminate", "start", "attest"]
     assert RepairJournal(harness.state_root, request.content_hash).completed("state_activated") == generation.state_hash
     assert recovered.invoke("run-1", ("status",))[-1] == "status"
+
+
+def test_recovery_after_pointer_publication_completes_the_exact_state_transition(tmp_path: Path) -> None:
+    harness = RepairHarness(tmp_path)
+    request = harness.request()
+    harness.runner.validate_regress_build(request)
+    calls: list[str] = []
+    launcher = TrustedLauncher(
+        harness.store,
+        harness.registry,
+        repair_service=harness.repair_service,
+        terminate_old_runner=FakeLifecycleEffect("terminate", calls),
+        start_new_runner=FakeLifecycleEffect("start", calls),
+        attest_new_runner=FakeLifecycleEffect("attest", calls),
+    )
+    launcher.crash_after("activation_pointer")
+
+    with pytest.raises(InjectedCrash):
+        launcher.reconcile_activation("run-1", request.content_hash)
+
+    assert harness.registry.current_activation().request_hash == request.content_hash
+    assert harness.store.load().state.disposition is RunDisposition.REPAIR_REQUIRED
+
+    generation = launcher.reconcile_activation("run-1", request.content_hash)
+
+    assert generation.state.disposition is RunDisposition.ACTIVE
+    assert generation.state.runner_identity == harness.registry.current_activation().new_runner_identity
+    assert RepairJournal(harness.state_root, request.content_hash).completed("state_activated") == generation.state_hash
+    assert calls == ["terminate", "start", "attest"]
 
 
 def test_protected_runtime_exposes_no_unbound_capability_injection(tmp_path: Path) -> None:
@@ -1448,13 +1696,14 @@ def test_installed_ticket_cli_composes_repair_request_from_launcher_descriptor(
 def test_protected_cli_has_no_callback_only_production_composition() -> None:
     assert tuple(inspect.signature(repair_entrypoint.main).parameters) == ("argv", "runtime")
     assert not hasattr(repair_entrypoint.ProtectedRepairRuntime, "with_capabilities")
-    assert inspect.signature(RepairRunner).parameters["authorize"].default is inspect.Parameter.empty
-    assert inspect.signature(TrustedLauncher).parameters["authorize"].default is inspect.Parameter.empty
+    assert "authorize" not in inspect.signature(RepairRunner).parameters
+    assert "authorize" not in inspect.signature(TrustedLauncher).parameters
 
 
 def test_installed_protected_prepare_composes_pinned_process_git_and_sandbox(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     harness = RepairHarness(tmp_path)
     repository = tmp_path / "repair-repository"
@@ -1501,6 +1750,9 @@ def test_installed_protected_prepare_composes_pinned_process_git_and_sandbox(
             "dynamic_downloads_disabled": True,
         }
     )
+    preparation_observation: dict[str, bool] = {}
+    journal_path = harness.state_root / "repair-prepare-journals" / f'{payload["nonce"]}.json'
+    server.before_worktree = lambda: preparation_observation.update(journal_exists=journal_path.exists())
     descriptor = signed_descriptor(tmp_path / "descriptor.json", payload, private_key)
     try:
         monkeypatch.setattr(repair_entrypoint, "_REPAIR_DESCRIPTOR_FD", descriptor)
@@ -1512,11 +1764,37 @@ def test_installed_protected_prepare_composes_pinned_process_git_and_sandbox(
             ],
             runtime=runtime,
         )
+        requests_before_recovery = len(server.requests)
+        recovered = runtime.prepare(
+            "run-1",
+            harness.generation.revision,
+            harness.generation.state_hash,
+            harness.failure_hash,
+        )
     finally:
         os.close(descriptor)
         server.close()
 
     assert result == 0
+    output = json.loads(capsys.readouterr().out)
+    assert preparation_observation == {"journal_exists": True}
+    assert recovered.id == output["workspace"]["id"]
+    assert recovered.path == Path(output["workspace"]["path"])
+    assert len(server.requests) == requests_before_recovery
+    assert output == {
+        "schema_version": "v1",
+        "operation": "prepare",
+        "run_id": "run-1",
+        "expected_revision": harness.generation.revision,
+        "expected_state_hash": harness.generation.state_hash,
+        "failure_hash": harness.failure_hash,
+        "workspace": {
+            "id": output["workspace"]["id"],
+            "path": output["workspace"]["path"],
+            "baseline_hash": "a" * 40,
+        },
+    }
+    assert Path(output["workspace"]["path"]).name == output["workspace"]["id"]
     assert any("worktree" in request["argv"] for request in server.requests)
     assert all(request["sandbox_identity"] == "launcher-sandbox" for request in server.requests)
     nonce = harness.state_root / "repair-descriptor-nonces" / f'{payload["nonce"]}.json'
@@ -1526,6 +1804,7 @@ def test_installed_protected_prepare_composes_pinned_process_git_and_sandbox(
 def test_installed_protected_apply_builds_reconciles_and_activates_from_descriptor(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     harness = RepairHarness(tmp_path)
     repository = tmp_path / "repair-repository"
@@ -1627,8 +1906,20 @@ def test_installed_protected_apply_builds_reconciles_and_activates_from_descript
         ],
         runtime=request_runtime,
     ) == 0
+    capsys.readouterr()
     requests = tuple((handle.path / ".repair-control" / "requests").iterdir())
     request_hash = requests[0].stem
+    observed_build: dict[str, object] = {}
+
+    def mutate_after_snapshot(request: dict[str, object]) -> None:
+        argv = request["argv"]
+        assert isinstance(argv, list)
+        build_workspace = Path(argv[argv.index("--workspace") + 1])
+        (handle.path / "src" / "auto_code" / "runner.py").write_text("mutated after snapshot\n", encoding="ascii")
+        observed_build["workspace"] = build_workspace
+        observed_build["content"] = (build_workspace / "src" / "auto_code" / "runner.py").read_text(encoding="ascii")
+
+    server.before_build = mutate_after_snapshot
 
     apply_payload = protected_payload("apply")
     apply_payload.pop("failure_hash", None)
@@ -1648,10 +1939,6 @@ def test_installed_protected_apply_builds_reconciles_and_activates_from_descript
             ["apply", "--workspace", str(handle.path), "--request", request_hash],
             runtime=runtime,
         )
-        nonce_path = harness.state_root / "repair-descriptor-nonces" / f'{apply_payload["nonce"]}.json'
-        pending_nonce = json.loads(nonce_path.read_text(encoding="ascii"))
-        pending_nonce.update({"status": "pending", "result_hash": None})
-        nonce_path.write_bytes(canonical_json_bytes(pending_nonce))
         sandbox_requests = len(server.requests)
         recovered = runtime.apply(str(handle.path), request_hash)
     finally:
@@ -1666,10 +1953,29 @@ def test_installed_protected_apply_builds_reconciles_and_activates_from_descript
     receipt = harness.registry.current_activation()
     assert receipt.release_root.is_relative_to(tmp_path / "runner-releases")
     assert receipt.release_manifest
+    assert observed_build == {
+        "workspace": tmp_path / "repair-source-snapshots" / next(
+            request["effect_id"]
+            for request in server.requests
+            if request.get("operation") == "invoke_effect" and request.get("argv", [None])[0] == "build"
+        ),
+        "content": "repaired\n",
+    }
     effect_operations = [request.get("operation") for request in server.requests if request.get("operation")]
     assert effect_operations.count("observe_effect") == 5
     assert effect_operations.count("invoke_effect") == 5
     assert len(server.effects) == 5
+    assert json.loads(capsys.readouterr().out) == {
+        "schema_version": "v1",
+        "operation": "apply",
+        "run_id": "run-1",
+        "request_hash": request_hash,
+        "workspace_id": handle.id,
+        "workspace_path": str(handle.path),
+        "revision": generation.revision,
+        "state_hash": generation.state_hash,
+        "runner_identity_hash": generation.state.runner_identity.content_hash,
+    }
 
 
 def test_protected_runtime_has_no_ambient_process_or_git_adapter() -> None:

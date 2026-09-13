@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
+import array
 import hashlib
 import hmac
 import json
@@ -197,8 +198,8 @@ class LauncherSocketSandbox:
         request = {
             "schema_version": "v1",
             "sandbox_identity": self.identity,
-            "argv": list(argv),
-            "executable_path": executable.path,
+            "argv": list(argv[1:]),
+            "executable_via_fd": True,
             "timeout": timeout,
             "environment": dict(env),
             "policy": {
@@ -210,21 +211,8 @@ class LauncherSocketSandbox:
                 "dynamic_downloads_disabled": policy.dynamic_downloads_disabled,
             },
         }
-        raw = canonical_json_bytes(request) + b"\n"
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as transport:
-            transport.settimeout(timeout)
-            transport.connect(str(self.socket_path))
-            transport.sendall(raw)
-            response = b""
-            while not response.endswith(b"\n"):
-                chunk = transport.recv(65_536)
-                if not chunk:
-                    break
-                response += chunk
-                if len(response) > 1_048_576:
-                    raise ProcessConfigurationError("Launcher sandbox response is too large")
+        payload = self._exchange(request, timeout, executable_descriptor=executable.descriptor)
         try:
-            payload = json.loads(response.decode("utf-8"))
             if not isinstance(payload, dict) or set(payload) != {"returncode", "stdout", "stderr"}:
                 raise ValueError
             if (
@@ -235,7 +223,7 @@ class LauncherSocketSandbox:
             ):
                 raise ValueError
             return SandboxCompleted(payload["returncode"], payload["stdout"], payload["stderr"])
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        except ValueError as error:
             raise ProcessConfigurationError("Launcher sandbox response is invalid") from error
 
     def observe_effect(
@@ -287,8 +275,8 @@ class LauncherSocketSandbox:
                 "operation": "invoke_effect",
                 "effect_id": effect_id,
                 "binding_hash": binding_hash,
-                "argv": list(argv),
-                "executable_path": executable.path,
+                "argv": list(argv[1:]),
+                "executable_via_fd": True,
                 "timeout": timeout,
                 "environment": dict(env),
                 "policy": {
@@ -301,6 +289,7 @@ class LauncherSocketSandbox:
                 },
             },
             timeout,
+            executable_descriptor=executable.descriptor,
         )
         if (
             not isinstance(payload, dict)
@@ -316,7 +305,13 @@ class LauncherSocketSandbox:
         receipt = _require_effect_hash(payload["receipt_hash"])
         return SandboxCompleted(payload["returncode"], payload["stdout"], payload["stderr"]), receipt
 
-    def _exchange(self, request: Mapping[str, object], timeout: float) -> object:
+    def _exchange(
+        self,
+        request: Mapping[str, object],
+        timeout: float,
+        *,
+        executable_descriptor: int | None = None,
+    ) -> object:
         metadata = os.lstat(self.socket_path)
         if not stat.S_ISSOCK(metadata.st_mode) or (metadata.st_dev, metadata.st_ino) != (self._device, self._inode):
             raise ProcessConfigurationError("Launcher sandbox socket identity changed")
@@ -324,7 +319,16 @@ class LauncherSocketSandbox:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as transport:
             transport.settimeout(timeout)
             transport.connect(str(self.socket_path))
-            transport.sendall(raw)
+            if executable_descriptor is None:
+                transport.sendall(raw)
+            else:
+                descriptors = array.array("i", (executable_descriptor,))
+                sent = transport.sendmsg(
+                    (raw,),
+                    ((socket.SOL_SOCKET, socket.SCM_RIGHTS, descriptors),),
+                )
+                if sent < len(raw):
+                    transport.sendall(raw[sent:])
             response = b""
             while not response.endswith(b"\n"):
                 chunk = transport.recv(65_536)

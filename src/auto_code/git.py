@@ -31,6 +31,9 @@ _SAFE_GIT_ENVIRONMENT = {
     "GIT_CONFIG_NOSYSTEM": "1",
     "GIT_TERMINAL_PROMPT": "0",
 }
+MAX_REPAIR_SOURCE_FILES = 10_000
+MAX_REPAIR_SOURCE_FILE_BYTES = 16 * 1024 * 1024
+MAX_REPAIR_SOURCE_TOTAL_BYTES = 256 * 1024 * 1024
 
 
 class GitGuardError(RuntimeError):
@@ -586,7 +589,7 @@ class GitGuard:
                 content_sha256=(
                     None
                     if entry.status.startswith("D")
-                    else hashlib.sha256(_read_worktree_bytes(self.repository / entry.path)).hexdigest()
+                    else _bounded_worktree_hash(self.repository / entry.path)[0]
                 ),
             )
             for entry in source_entries
@@ -601,6 +604,7 @@ class GitGuard:
     def _repair_workspace_files(self, control_paths: tuple[str, ...]) -> tuple[RepairWorkspaceFile, ...]:
         controls = frozenset(control_paths)
         entries: list[RepairWorkspaceFile] = []
+        total_bytes = 0
         for current, directories, files in os.walk(self.repository, followlinks=False):
             current_path = Path(current)
             if current_path == self.repository:
@@ -612,6 +616,8 @@ class GitGuard:
                     directories.remove(name)
                     files.append(name)
             for name in files:
+                if len(entries) >= MAX_REPAIR_SOURCE_FILES:
+                    raise GitGuardError("Repair source file-count limit exceeded")
                 path = current_path / name
                 relative = path.relative_to(self.repository).as_posix()
                 if relative in controls:
@@ -623,13 +629,18 @@ class GitGuard:
                     kind = "file"
                 else:
                     raise GitGuardError("Repair workspace contains an unsupported file")
+                content_hash, size = _bounded_worktree_hash(
+                    path,
+                    remaining_bytes=MAX_REPAIR_SOURCE_TOTAL_BYTES - total_bytes,
+                )
+                total_bytes += size
                 entries.append(
                     RepairWorkspaceFile(
                         path=_validate_relative_path(relative),
                         kind=kind,
                         mode=_worktree_mode(path),
                         binary=_worktree_is_binary(path),
-                        content_sha256=hashlib.sha256(_read_worktree_bytes(path)).hexdigest(),
+                        content_sha256=content_hash,
                     )
                 )
         result = tuple(sorted(entries, key=lambda entry: entry.path))
@@ -1066,6 +1077,44 @@ def _read_worktree_bytes(path: Path) -> bytes:
             return b"".join(chunks)
         finally:
             os.close(descriptor)
+    except OSError as error:
+        raise GitGuardError("Worktree path cannot be read safely") from error
+
+
+def _bounded_worktree_hash(
+    path: Path,
+    *,
+    remaining_bytes: int = MAX_REPAIR_SOURCE_TOTAL_BYTES,
+) -> tuple[str, int]:
+    try:
+        metadata = os.lstat(path)
+        if stat.S_ISLNK(metadata.st_mode):
+            content = os.fsencode(os.readlink(path))
+            size = len(content)
+            if size > MAX_REPAIR_SOURCE_FILE_BYTES or size > remaining_bytes:
+                raise GitGuardError("Repair source byte limit exceeded")
+            return hashlib.sha256(content).hexdigest(), size
+        if not stat.S_ISREG(metadata.st_mode):
+            raise GitGuardError("Worktree path is not a regular file or symlink")
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+        try:
+            size = os.fstat(descriptor).st_size
+            if size > MAX_REPAIR_SOURCE_FILE_BYTES or size > remaining_bytes:
+                raise GitGuardError("Repair source byte limit exceeded")
+            digest = hashlib.sha256()
+            observed = 0
+            while chunk := os.read(descriptor, min(65_536, MAX_REPAIR_SOURCE_FILE_BYTES + 1 - observed)):
+                observed += len(chunk)
+                if observed > size or observed > MAX_REPAIR_SOURCE_FILE_BYTES or observed > remaining_bytes:
+                    raise GitGuardError("Repair source byte limit exceeded")
+                digest.update(chunk)
+            if observed != size:
+                raise GitGuardError("Repair source changed during capture")
+            return digest.hexdigest(), observed
+        finally:
+            os.close(descriptor)
+    except GitGuardError:
+        raise
     except OSError as error:
         raise GitGuardError("Worktree path cannot be read safely") from error
 
