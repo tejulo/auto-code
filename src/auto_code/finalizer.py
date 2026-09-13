@@ -1,0 +1,481 @@
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from datetime import UTC, datetime
+import uuid
+
+from .contracts import (
+    BrowserResult,
+    BuildIdentity,
+    ChangeOutline,
+    EffectIntention,
+    EffectIntentionPayload,
+    EffectInvocation,
+    EffectInvocationPayload,
+    EffectObservation,
+    EffectObservationPayload,
+    EffectOutcome,
+    EffectReconciliation,
+    EffectReconciliationPayload,
+    FailureClass,
+    FailureRecord,
+    FailureSource,
+    FinalizationEvidence,
+    FindingKind,
+    McpActionRequest,
+    ProductChangeManifest,
+    RequirementsPackage,
+    ReviewManifest,
+    ReviewResult,
+    RunDisposition,
+    RunState,
+    Stage,
+    StepKind,
+    StepResult,
+    TaskDefinitionManifest,
+    TaskStatusManifest,
+    TicketConstraintProjection,
+    TicketSnapshot,
+    TrustedMcpReceipt,
+    UnitStatus,
+    VerificationResult,
+)
+from .hashing import hash_json
+from .linear import LinearGateway
+from .project_config import ProjectConfig
+from .state import CompareAndSwapConflict, RunStateStore, StateGeneration
+
+
+class FinalizationError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class FinalizationArtifacts:
+    """The immutable artifacts that were reviewed for one finalization."""
+
+    ticket_snapshot: TicketSnapshot
+    original_state_id: str
+    original_external_revision: str
+    project_policy: ProjectConfig
+    requirements: RequirementsPackage
+    change_outline: ChangeOutline
+    artifact_hashes: Mapping[str, str]
+    task_definition: TaskDefinitionManifest
+    task_status: TaskStatusManifest
+    product_manifest: ProductChangeManifest
+    build_identity: BuildIdentity
+    verification_result: VerificationResult
+    browser_result: BrowserResult
+    review_manifest: ReviewManifest
+    review_result: ReviewResult
+
+
+@dataclass(frozen=True)
+class FinalizerDependencies:
+    store: RunStateStore
+    linear: LinearGateway
+    git_guard: object
+    active_run_index: object
+    project_policy: ProjectConfig
+    load_artifacts: Callable[[RunState], FinalizationArtifacts]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.store, RunStateStore) or not isinstance(self.linear, LinearGateway):
+            raise ValueError("Finalizer requires a state store and Linear gateway")
+        if not isinstance(self.project_policy, ProjectConfig) or not callable(self.load_artifacts):
+            raise ValueError("Finalizer requires trusted approval inputs")
+
+
+class Finalizer:
+    """Advance approved work through durable, one-way finalization effects."""
+
+    def __init__(self, dependencies: FinalizerDependencies) -> None:
+        if not isinstance(dependencies, FinalizerDependencies):
+            raise ValueError("Finalizer requires typed dependencies")
+        self.dependencies = dependencies
+        self.store = dependencies.store
+
+    def advance(self, generation: StateGeneration) -> StepResult:
+        self._require_generation(generation)
+        while True:
+            state = generation.state
+            if state.disposition is RunDisposition.WAITING_MCP:
+                return self._pending_result(generation)
+            if state.disposition is not RunDisposition.ACTIVE:
+                return self._gated_result(generation)
+            try:
+                artifacts = self._verify_approval(state)
+                self._verify_git_position(state, artifacts)
+            except Exception:
+                return self._human_review(generation)
+
+            if state.prefinalization_ticket_projection is None:
+                request = self.dependencies.linear.request_ticket_projection(
+                    generation,
+                    state.ticket_id,
+                    expected_external_revision=artifacts.original_external_revision,
+                )
+                persisted = self.dependencies.linear.persist_pending(generation, request)
+                return self._action_result(persisted, request)
+            if state.prefinalization_ticket_projection != self._projection_hash(artifacts.ticket_snapshot):
+                return self._human_review(generation)
+
+            if state.commit_sha is None:
+                reconciled = self._reconcile_local_effect(generation, "commit")
+                if reconciled is not generation:
+                    generation = reconciled
+                    continue
+                if self._attempts(state, "commit") >= artifacts.project_policy.finalization.max_invocations_per_effect:
+                    return self._human_review(generation)
+                generation = self._invoke_commit(generation, artifacts)
+                if generation.state.commit_sha is None:
+                    return self._ready_result(generation)
+                continue
+
+            if state.pushed_sha is None:
+                reconciled = self._reconcile_local_effect(generation, "push")
+                if reconciled is not generation:
+                    generation = reconciled
+                    continue
+                if self._attempts(state, "push") >= artifacts.project_policy.finalization.max_invocations_per_effect:
+                    return self._human_review(generation)
+                generation = self._invoke_push(generation, artifacts)
+                if generation.state.pushed_sha is None:
+                    return self._ready_result(generation)
+                continue
+
+            if state.linear_done_receipt is None:
+                if self._attempts(state, "compare_and_complete_ticket") >= artifacts.project_policy.finalization.max_invocations_per_effect:
+                    return self._human_review(generation)
+                request = self.dependencies.linear.request_action(
+                    generation,
+                    operation="compare_and_complete_ticket",
+                    entity="ticket",
+                    target=state.ticket_id,
+                    expected_external_revision=artifacts.original_external_revision,
+                    arguments={"ticket_id": state.ticket_id, "state_id": artifacts.project_policy.linear.completed_state_id},
+                )
+                persisted = self.dependencies.linear.persist_pending(generation, request)
+                return self._action_result(persisted, request)
+
+            try:
+                self._verify_approval(state)
+                self._verify_git_position(state, artifacts)
+            except Exception:
+                return self._human_review(generation)
+            evidence = FinalizationEvidence(
+                prefinalization_ticket_projection=state.prefinalization_ticket_projection,
+                commit_sha=state.commit_sha,
+                pushed_sha=state.pushed_sha,
+                linear_done_receipt=state.linear_done_receipt,
+            )
+            done = self.store.compare_and_swap(
+                generation.revision,
+                generation.state_hash,
+                state.model_copy(
+                    update={
+                        "disposition": RunDisposition.DONE,
+                        "finalization": "approved-finalization",
+                        "finalization_evidence": evidence,
+                    }
+                ),
+            )
+            self._release_active_run(done)
+            return self._result(StepKind.DONE, done)
+
+    def accept_trusted_receipt(self, generation: StateGeneration, receipt: TrustedMcpReceipt) -> StateGeneration:
+        """Consume only bridge-authenticated receipts matched by the pending request."""
+
+        self._require_generation(generation)
+        pending = generation.state.pending_external_request
+        if pending is None:
+            return self.dependencies.linear.consume_receipt(generation, receipt)
+        artifacts = self._verify_approval(generation.state)
+
+        def update(state: RunState, accepted: TrustedMcpReceipt) -> RunState:
+            if pending.operation == "query_ticket_projection":
+                if accepted.outcome is not EffectOutcome.SUCCESS or accepted.result_hash != self._projection_hash(artifacts.ticket_snapshot):
+                    return self._failed_state(state)
+                return state.model_copy(update={"prefinalization_ticket_projection": accepted.result_hash})
+            if pending.operation == "compare_and_complete_ticket" and accepted.outcome is EffectOutcome.SUCCESS:
+                return state.model_copy(update={"linear_done_receipt": accepted.content_hash})
+            return state
+
+        return self.dependencies.linear.consume_receipt(generation, receipt, state_update=update)
+
+    def _verify_approval(self, state: RunState) -> FinalizationArtifacts:
+        artifacts = self.dependencies.load_artifacts(state)
+        if not isinstance(artifacts, FinalizationArtifacts):
+            raise FinalizationError("finalization artifacts are unavailable")
+        review = artifacts.review_manifest
+        if (
+            not state.finalization_eligible
+            or state.iteration_open
+            or not artifacts.review_result.approved
+            or state.review_manifest != review.content_hash
+            or state.review_result != hash_json(artifacts.review_result.model_dump(mode="json", round_trip=True))
+            or artifacts.review_result.review_manifest_hash != review.content_hash
+            or artifacts.project_policy.policy_hash != self.dependencies.project_policy.policy_hash
+            or review.project_policy_hash != self.dependencies.project_policy.policy_hash
+            or review.baseline_sha != artifacts.product_manifest.baseline_sha
+            or review.requirements_package_hash != hash_json(artifacts.requirements.model_dump(mode="json", round_trip=True))
+            or review.change_outline_hash != hash_json(artifacts.change_outline.model_dump(mode="json", round_trip=True))
+            or dict(review.artifact_hashes) != dict(artifacts.artifact_hashes)
+            or review.task_definition_hash != artifacts.task_definition.definition_hash
+            or review.task_status_hash != hash_json(artifacts.task_status.model_dump(mode="json", round_trip=True))
+            or review.product_manifest_hash != artifacts.product_manifest.content_hash
+            or review.build_identity_hash != hash_json(artifacts.build_identity.model_dump(mode="json", round_trip=True))
+            or review.verification_result_hash != hash_json(artifacts.verification_result.model_dump(mode="json", round_trip=True))
+            or review.browser_result_hash != hash_json(artifacts.browser_result.model_dump(mode="json", round_trip=True))
+            or state.requirements_package != review.requirements_package_hash
+            or state.change_outline != review.change_outline_hash
+            or state.product_change_manifest_hash != review.product_manifest_hash
+            or state.build_identity != review.build_identity_hash
+            or state.verification_result != review.verification_result_hash
+            or state.browser_result != review.browser_result_hash
+            or state.task_definition_manifest != artifacts.task_definition
+            or state.task_status_manifest != artifacts.task_status
+            or any(status.status is not UnitStatus.CHECKED for status in artifacts.task_status.statuses)
+        ):
+            raise FinalizationError("review bindings changed")
+        if artifacts.build_identity.baseline_sha != artifacts.product_manifest.baseline_sha:
+            raise FinalizationError("Build Identity baseline changed")
+        if artifacts.build_identity.product_manifest_hash != artifacts.product_manifest.content_hash:
+            raise FinalizationError("Build Identity product changed")
+        if artifacts.build_identity.project_policy_hash != self.dependencies.project_policy.policy_hash:
+            raise FinalizationError("Build Identity policy changed")
+        VerificationResult.model_validate(
+            artifacts.verification_result.model_dump(mode="json", round_trip=True),
+            context={"build_identity": artifacts.build_identity},
+        )
+        if not artifacts.verification_result.passed:
+            raise FinalizationError("verification failed")
+        BrowserResult.model_validate(
+            artifacts.browser_result.model_dump(mode="json", round_trip=True),
+            context={"browser_e2e_decision": artifacts.change_outline.browser_e2e_decision, "build_identity": artifacts.build_identity},
+        )
+        checkpoint = state.checkpoints.get(Stage.REVIEWER)
+        if checkpoint is None or checkpoint.output_manifest_hash != state.review_result:
+            raise FinalizationError("Reviewer checkpoint changed")
+        return artifacts
+
+    def _verify_git_position(self, state: RunState, artifacts: FinalizationArtifacts) -> None:
+        git = self.dependencies.git_guard
+        if not state.branch or self._call(git, "current_branch") != state.branch:
+            raise FinalizationError("ticket branch changed")
+        if self._call(git, "remote_base_sha") != artifacts.product_manifest.baseline_sha:
+            raise FinalizationError("remote base advanced")
+        if state.commit_sha is not None and self._call(git, "observe_commit") != state.commit_sha:
+            raise FinalizationError("local commit changed")
+        if state.pushed_sha is not None and self._call(git, "observe_push") != state.pushed_sha:
+            raise FinalizationError("remote ticket branch changed")
+
+    def _invoke_commit(self, generation: StateGeneration, artifacts: FinalizationArtifacts) -> StateGeneration:
+        intended, effect_id = self._intend(generation, "commit", generation.state.ticket_id)
+        try:
+            commit = self._call(
+                self.dependencies.git_guard,
+                "commit_manifest",
+                artifacts.product_manifest,
+                f"{generation.state.ticket_id}: {artifacts.ticket_snapshot.title}",
+            )
+            if not isinstance(commit, str) or len(commit) not in {40, 64}:
+                raise FinalizationError("Git commit result is invalid")
+            return self._record_local_result(intended, effect_id, "commit", EffectOutcome.SUCCESS, commit, {"commit_sha": commit})
+        except Exception:
+            return self._record_local_result(intended, effect_id, "commit", EffectOutcome.FAILURE, None, {})
+
+    def _invoke_push(self, generation: StateGeneration, artifacts: FinalizationArtifacts) -> StateGeneration:
+        del artifacts
+        intended, effect_id = self._intend(generation, "push", generation.state.ticket_id)
+        try:
+            pushed = self._call(self.dependencies.git_guard, "push", generation.state.commit_sha)
+            if pushed != generation.state.commit_sha:
+                raise FinalizationError("Git push result is invalid")
+            return self._record_local_result(intended, effect_id, "push", EffectOutcome.SUCCESS, pushed, {"pushed_sha": pushed})
+        except Exception:
+            return self._record_local_result(intended, effect_id, "push", EffectOutcome.FAILURE, None, {})
+
+    def _reconcile_local_effect(self, generation: StateGeneration, operation: str) -> StateGeneration:
+        intentions, phases = generation.state.validate_effect_ledger()
+        unresolved = [
+            (effect_id, intention)
+            for effect_id, intention in intentions.items()
+            if intention.payload.operation == operation and phases[effect_id] != "reconciled"
+        ]
+        if not unresolved:
+            return generation
+        effect_id, _ = unresolved[-1]
+        observed = self._call(self.dependencies.git_guard, "observe_commit" if operation == "commit" else "observe_push")
+        expected = generation.state.commit_sha if operation == "push" else observed
+        if observed is not None and (operation != "push" or observed == expected):
+            updates = {"commit_sha": observed} if operation == "commit" else {"pushed_sha": observed}
+            return self._record_local_result(generation, effect_id, operation, EffectOutcome.SUCCESS, observed, updates)
+        return self._record_local_result(generation, effect_id, operation, EffectOutcome.UNKNOWN, None, {})
+
+    def _intend(self, generation: StateGeneration, operation: str, target: str) -> tuple[StateGeneration, str]:
+        effect_id = f"{operation}-{uuid.uuid4().hex}"
+        sequence = generation.state.effect_ledger[-1].sequence + 1 if generation.state.effect_ledger else 1
+        state = generation.state.model_copy(
+            update={
+                "effect_ledger": (
+                    *generation.state.effect_ledger,
+                    EffectIntention(
+                        effect_id=effect_id,
+                        sequence=sequence,
+                        timestamp=datetime.now(UTC),
+                        payload=EffectIntentionPayload(
+                            operation=operation,
+                            target=target,
+                            request_hash=hash_json({"effect_id": effect_id, "operation": operation, "target": target}),
+                        ),
+                    ),
+                )
+            }
+        )
+        return self.store.compare_and_swap(generation.revision, generation.state_hash, state), effect_id
+
+    def _record_local_result(
+        self,
+        generation: StateGeneration,
+        effect_id: str,
+        operation: str,
+        outcome: EffectOutcome,
+        external_revision: str | None,
+        updates: Mapping[str, object],
+    ) -> StateGeneration:
+        del operation
+        sequence = generation.state.effect_ledger[-1].sequence + 1
+        now = datetime.now(UTC)
+        state = generation.state.model_copy(
+            update={
+                **updates,
+                "effect_ledger": (
+                    *generation.state.effect_ledger,
+                    EffectInvocation(effect_id=effect_id, sequence=sequence, timestamp=now, payload=EffectInvocationPayload()),
+                    EffectObservation(
+                        effect_id=effect_id,
+                        sequence=sequence + 1,
+                        timestamp=now,
+                        payload=EffectObservationPayload(outcome=outcome, external_revision=external_revision, evidence_refs=()),
+                    ),
+                    EffectReconciliation(
+                        effect_id=effect_id,
+                        sequence=sequence + 2,
+                        timestamp=now,
+                        payload=EffectReconciliationPayload(
+                            outcome=outcome,
+                            evidence_refs=(),
+                            receipt_hash=hash_json({"effect_id": effect_id, "outcome": outcome.value, "revision": external_revision}),
+                        ),
+                    ),
+                ),
+            }
+        )
+        return self.store.compare_and_swap(generation.revision, generation.state_hash, state)
+
+    def _human_review(self, generation: StateGeneration) -> StepResult:
+        if generation.state.disposition is RunDisposition.HUMAN_REVIEW:
+            return self._gated_result(generation)
+        persisted = self.store.compare_and_swap(
+            generation.revision,
+            generation.state_hash,
+            self._failed_state(generation.state),
+        )
+        return self._result(StepKind.HUMAN_REVIEW, persisted, failure=persisted.state.failure_history[-1])
+
+    @staticmethod
+    def _failed_state(state: RunState) -> RunState:
+        failure = FailureRecord(
+            failure_class=FailureClass.ORCHESTRATION,
+            failure_source=FailureSource.FINALIZATION,
+            finding_kind=FindingKind.ARTIFACT_MISMATCH,
+        )
+        return state.model_copy(update={"disposition": RunDisposition.HUMAN_REVIEW, "failure_history": (*state.failure_history, failure)})
+
+    @staticmethod
+    def _projection_hash(snapshot: TicketSnapshot) -> str:
+        projection = TicketConstraintProjection.from_snapshot(snapshot)
+        return hash_json(projection.model_dump(mode="json", round_trip=True))
+
+    @staticmethod
+    def _attempts(state: RunState, operation: str) -> int:
+        return sum(
+            isinstance(event, EffectIntention) and event.payload.operation == operation
+            for event in state.effect_ledger
+        )
+
+    def _pending_result(self, generation: StateGeneration) -> StepResult:
+        action = self.dependencies.linear.replay_pending(generation)
+        if action is None:
+            return self._human_review(generation)
+        return self._action_result(generation, action)
+
+    def _gated_result(self, generation: StateGeneration) -> StepResult:
+        if generation.state.disposition is RunDisposition.DONE:
+            return self._result(StepKind.DONE, generation)
+        failure = generation.state.failure_history[-1] if generation.state.failure_history else FailureRecord(
+            failure_class=FailureClass.ORCHESTRATION,
+            failure_source=FailureSource.FINALIZATION,
+            finding_kind=FindingKind.INVALID_ROUTING,
+        )
+        return self._result(StepKind.HUMAN_REVIEW, generation, failure=failure)
+
+    def _ready_result(self, generation: StateGeneration) -> StepResult:
+        return self._result(StepKind.READY_TO_FINALIZE, generation)
+
+    @staticmethod
+    def _action_result(generation: StateGeneration, action: McpActionRequest) -> StepResult:
+        return StepResult(
+            kind=StepKind.MCP_ACTION,
+            run_id=generation.state.run_id,
+            state_revision=generation.revision,
+            state_hash=generation.state_hash,
+            request_id=action.request_id,
+            action=action,
+        )
+
+    @staticmethod
+    def _result(kind: StepKind, generation: StateGeneration, *, failure: FailureRecord | None = None) -> StepResult:
+        return StepResult(
+            kind=kind,
+            run_id=generation.state.run_id,
+            state_revision=generation.revision,
+            state_hash=generation.state_hash,
+            failure=failure,
+        )
+
+    def _release_active_run(self, generation: StateGeneration) -> None:
+        index = self.dependencies.active_run_index
+        lookup = getattr(index, "lookup", None)
+        if not callable(lookup):
+            return
+        active = lookup(generation.state.repository_id)
+        if active is None:
+            return
+        index.release(
+            generation.state.repository_id,
+            generation.state.run_id,
+            active.index_revision,
+            active.index_hash,
+            generation.state_hash,
+        )
+
+    def _require_generation(self, generation: StateGeneration) -> None:
+        if not isinstance(generation, StateGeneration) or generation.state.run_id != self.store.run_id:
+            raise FinalizationError("finalization generation belongs to another run")
+        current = self.store.load()
+        if current != generation:
+            raise CompareAndSwapConflict("finalization generation is stale")
+
+    @staticmethod
+    def _call(target: object, method: str, *args: object) -> object:
+        callback = getattr(target, method, None)
+        if not callable(callback):
+            raise FinalizationError(f"Git finalization capability {method} is unavailable")
+        return callback(*args)
+
+
+__all__ = ["FinalizationArtifacts", "FinalizationError", "Finalizer", "FinalizerDependencies"]
