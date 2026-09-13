@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 import array
+import fcntl
 import inspect
 import json
 import os
@@ -69,8 +71,9 @@ from auto_code.runner import (
     RunnerRegistry,
     TrustedLauncher,
     capture_built_release_manifest,
+    capture_runner_archive,
 )
-from auto_code.state import EMPTY_STATE_HASH, RunStateStore
+from auto_code.state import EMPTY_STATE_HASH, InvalidStateTransition, RunStateStore, _write_new_json
 
 
 NOW = datetime(2026, 9, 12, tzinfo=UTC)
@@ -83,6 +86,7 @@ def identity(character: str, *, contract: str = "d", repair: bool = False) -> Ru
         source_sha="b" * 64,
         dependency_lock_hash="c" * 64,
         contract_bundle_hash=contract * 64,
+        runner_archive_hash="d" * 64,
         built_at=NOW,
     )
 
@@ -121,6 +125,8 @@ def descriptor_payload(
         "release_root": str(tmp_path / "runner-releases"),
         "build_command": [sys.executable, "-m", "auto_code.build_runner"],
         "build_executable_hash": "3" * 64,
+        "ticket_interpreter": str(Path(sys.executable).resolve()),
+        "ticket_interpreter_hash": "3" * 64,
         "runner_executable": "runner.py",
         "contract_manifest": "contracts.json",
         "terminate_command": [sys.executable, "terminate"],
@@ -168,8 +174,9 @@ def signed_descriptor(path: Path, payload: dict[str, object], key: Ed25519Privat
 
 
 class FakeSandboxServer:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, activation_private_key: Ed25519PrivateKey | None = None) -> None:
         self.path = path
+        self.activation_private_key = activation_private_key or Ed25519PrivateKey.generate()
         self.requests: list[dict[str, object]] = []
         self.effects: dict[tuple[str, str], dict[str, object]] = {}
         self.before_build: Callable[[dict[str, object]], None] | None = None
@@ -208,6 +215,27 @@ class FakeSandboxServer:
                     continue
                 request = json.loads(raw)
                 self.requests.append(request)
+                if request.get("operation") == "sign_activation":
+                    public_key = self.activation_private_key.public_key().public_bytes(
+                        encoding=serialization.Encoding.Raw,
+                        format=serialization.PublicFormat.Raw,
+                    )
+                    public_key_hash = sha256(public_key).hexdigest()
+                    if request.get("public_key_hash") != public_key_hash:
+                        connection.sendall(canonical_json_bytes({"error": "wrong key"}) + b"\n")
+                        continue
+                    connection.sendall(
+                        canonical_json_bytes(
+                            {
+                                "public_key_hash": public_key_hash,
+                                "signature": self.activation_private_key.sign(
+                                    bytes.fromhex(request["payload_hex"])
+                                ).hex(),
+                            }
+                        )
+                        + b"\n"
+                    )
+                    continue
                 if request.get("operation") == "observe_effect":
                     key = (request["effect_id"], request["binding_hash"])
                     completed = self.effects.get(key)
@@ -290,7 +318,7 @@ class FakeSandboxServer:
                     os.close(descriptor)
 
 
-def preparation_state(*, runner: RunnerIdentity) -> RunState:
+def preparation_state(*, runner: RunnerIdentity, repair_activation_public_key: bytes | None = None) -> RunState:
     preparation = TrustedPreparationInputRef(
         input_id="11111111-1111-4111-8111-111111111111",
         relative_path="trusted-mcp/preparation/11111111-1111-4111-8111-111111111111.json",
@@ -311,6 +339,14 @@ def preparation_state(*, runner: RunnerIdentity) -> RunState:
         observations=("captured",),
         bridge_signature="7" * 64,
     )
+    trust = (
+        {}
+        if repair_activation_public_key is None
+        else {
+            "repair_activation_public_key": repair_activation_public_key.hex(),
+            "repair_activation_public_key_hash": sha256(repair_activation_public_key).hexdigest(),
+        }
+    )
     return RunState(
         run_id="run-1",
         ticket_id="ENG-1",
@@ -328,6 +364,7 @@ def preparation_state(*, runner: RunnerIdentity) -> RunState:
             creator="trusted-launcher",
         ),
         runner_identity=runner,
+        **trust,
     )
 
 
@@ -438,6 +475,8 @@ class FakeBuilder:
         self.sources: list[RepairSourceManifest] = []
         self.contract_hashes: dict[Stage, str] | None = None
         self.results: dict[str, BuiltRunnerRelease] = {}
+        self.runner_content = b"#!/bin/sh\nprintf immutable-runner"
+        self.extra_files: dict[str, bytes] = {}
 
     def observe(self, effect_id: str) -> BuiltRunnerRelease | None:
         return self.results.get(effect_id)
@@ -455,8 +494,13 @@ class FakeBuilder:
         release = self.root / f"release-{self.calls}"
         release.mkdir(parents=True)
         artifact = release / "runner.py"
-        artifact.write_bytes(b"#!/bin/sh\nprintf immutable-runner")
+        artifact.write_bytes(self.runner_content)
         artifact.chmod(0o555)
+        for name, content in self.extra_files.items():
+            extra = release / name
+            extra.parent.mkdir(parents=True, exist_ok=True)
+            extra.write_bytes(content)
+            extra.chmod(0o444)
         release.chmod(0o555)
         manifest = capture_built_release_manifest(release)
         manifest_hash = hash_json(
@@ -466,6 +510,7 @@ class FakeBuilder:
             root=release,
             release_manifest=manifest,
             release_manifest_hash=manifest_hash,
+            runner_archive_hash=sha256(capture_runner_archive(release, manifest, "runner.py")).hexdigest(),
             runner_executable="runner.py",
             repair_source_manifest_hash=source_manifest.content_hash,
             dependency_lock_hash=dependency_lock_hash,
@@ -507,6 +552,20 @@ class FakeTicketInvoker:
         os.fstat(executable.descriptor)
         self.commands.append(argv)
         return argv
+
+
+class FakeActivationSigner:
+    def __init__(self, private_key: Ed25519PrivateKey) -> None:
+        self.private_key = private_key
+
+    def sign(self, payload: bytes, public_key_hash: str) -> str:
+        public_key = self.private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+        if sha256(public_key).hexdigest() != public_key_hash:
+            raise PermissionError("wrong activation signing key")
+        return self.private_key.sign(payload).hex()
 
 
 class FakeProtectedRepairService:
@@ -565,9 +624,19 @@ class FakeProtectedRepairService:
 class RepairHarness:
     def __init__(self, tmp_path: Path, *, same_repository: bool = False) -> None:
         self.state_root = tmp_path / "state"
+        self.activation_private_key = Ed25519PrivateKey.generate()
+        activation_public_key = self.activation_private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+        self.activation_signer = FakeActivationSigner(self.activation_private_key)
         self.registry = RunnerRegistry(self.state_root, repair_runner_identity=identity("e", repair=True))
-        self.store = RunStateStore(self.state_root, "run-1", repair_activation_verifier=self.registry)
-        initial = self.store.compare_and_swap(0, EMPTY_STATE_HASH, preparation_state(runner=identity("a")))
+        self.store = RunStateStore(self.state_root, "run-1")
+        initial = self.store.compare_and_swap(
+            0,
+            EMPTY_STATE_HASH,
+            preparation_state(runner=identity("a"), repair_activation_public_key=activation_public_key),
+        )
         self.failure = repair_failure()
         self.generation = self.store.compare_and_swap(
             initial.revision,
@@ -639,6 +708,7 @@ def activation_receipt(request_hash: str, old: RunnerIdentity, new: RunnerIdenti
             "content_hash": release_manifest_hash,
             "source_sha": "3" * 64,
             "contract_bundle_hash": hash_json({}),
+            "runner_archive_hash": "d" * 64,
         }
     )
     return RunnerActivationReceipt(
@@ -654,6 +724,7 @@ def activation_receipt(request_hash: str, old: RunnerIdentity, new: RunnerIdenti
         release_root=Path("/immutable-release"),
         release_manifest=release_manifest,
         release_manifest_hash=release_manifest_hash,
+        runner_archive_hash="d" * 64,
         runner_executable="runner.py",
         termination_evidence_hash="7" * 64,
         restart_evidence_hash="8" * 64,
@@ -663,6 +734,8 @@ def activation_receipt(request_hash: str, old: RunnerIdentity, new: RunnerIdenti
         compatible_checkpoint_stages=(),
         previous_contract_hashes={},
         contract_hashes={},
+        activation_public_key_hash="a" * 64,
+        signature="0" * 128,
     )
 
 
@@ -680,7 +753,7 @@ def test_generated_test_key_cannot_sign_a_production_descriptor(
         os.close(descriptor)
 
 
-def test_injected_test_key_validates_only_when_explicitly_supplied(
+def test_generated_test_key_validates_only_when_installed_as_the_trust_anchor(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -692,7 +765,8 @@ def test_injected_test_key_validates_only_when_explicitly_supplied(
     descriptor = signed_descriptor(tmp_path / "descriptor.json", descriptor_payload(tmp_path), private_key)
     try:
         monkeypatch.setattr(repair_entrypoint, "_REPAIR_DESCRIPTOR_FD", descriptor)
-        runtime = repair_entrypoint.load_protected_runtime(verification_key=public_key)
+        monkeypatch.setattr(repair_entrypoint, "_REPAIR_DESCRIPTOR_VERIFICATION_KEY", public_key)
+        runtime = repair_entrypoint.load_protected_runtime()
     finally:
         os.close(descriptor)
 
@@ -1099,6 +1173,7 @@ def test_build_identity_requires_an_actual_immutable_release_and_all_bindings(tm
         root=mutable,
         release_manifest=(),
         release_manifest_hash="1" * 64,
+        runner_archive_hash="0" * 64,
         runner_executable="runner.py",
         repair_source_manifest_hash="2" * 64,
         dependency_lock_hash="3" * 64,
@@ -1116,6 +1191,7 @@ def test_build_identity_requires_an_actual_immutable_release_and_all_bindings(tm
     )
     built = builder.build("e" * 64, tmp_path, source, "6" * 64, "7" * 64)
     assert built.identity.content_hash == built.release_manifest_hash
+    assert built.identity.runner_archive_hash == built.runner_archive_hash
     assert built.identity.source_sha == source.content_hash
     assert built.identity.dependency_lock_hash == "6" * 64
     assert built.identity.contract_bundle_hash == hash_json({})
@@ -1153,6 +1229,45 @@ def test_runner_rejects_same_repository_ticket_overlap_before_regression(tmp_pat
     request = harness.request()
     with pytest.raises(RepairTicketOverlap):
         harness.runner.validate_regress_build(request)
+    assert harness.regression.calls == 0
+    assert harness.builder.calls == 0
+
+
+@pytest.mark.parametrize(
+    ("path", "old_path"),
+    (
+        ("src/auto_code/repaired.py", "src/auto_code/runner.py"),
+        ("src/auto_code/runner.py", "src/auto_code/original.py"),
+    ),
+)
+def test_runner_rejects_same_repository_ticket_overlap_on_either_rename_path(
+    tmp_path: Path,
+    path: str,
+    old_path: str,
+) -> None:
+    harness = RepairHarness(tmp_path, same_repository=True)
+    request = harness.request()
+    source = RepairSourceManifest(
+        baseline_sha="a" * 40,
+        files=(
+            RepairSourceFile(
+                path=path,
+                status="R100",
+                old_path=old_path,
+                old_object_id="b" * 40,
+                object_id="c" * 40,
+                mode="100644",
+                binary=False,
+                untracked=False,
+                content_sha256="1" * 64,
+            ),
+        ),
+    )
+    harness.git.collect_repair_source_manifest = lambda *args, **kwargs: source  # type: ignore[method-assign]
+
+    with pytest.raises(RepairTicketOverlap):
+        harness.runner.validate_regress_build(request)
+
     assert harness.regression.calls == 0
     assert harness.builder.calls == 0
 
@@ -1241,6 +1356,7 @@ def test_built_contract_manifest_drives_per_stage_compatibility(tmp_path: Path) 
         harness.store,
         harness.registry,
         repair_service=harness.repair_service,
+        activation_signer=harness.activation_signer,
         terminate_old_runner=FakeLifecycleEffect("terminate", lifecycle_calls),
         start_new_runner=FakeLifecycleEffect("start", lifecycle_calls),
         attest_new_runner=FakeLifecycleEffect("attest", lifecycle_calls),
@@ -1267,6 +1383,7 @@ def test_contract_mismatch_invalidates_later_equal_descendants(tmp_path: Path) -
         harness.store,
         harness.registry,
         repair_service=harness.repair_service,
+        activation_signer=harness.activation_signer,
         terminate_old_runner=FakeLifecycleEffect("terminate", lifecycle_calls),
         start_new_runner=FakeLifecycleEffect("start", lifecycle_calls),
         attest_new_runner=FakeLifecycleEffect("attest", lifecycle_calls),
@@ -1331,19 +1448,19 @@ def test_state_transition_verification_accepts_only_the_current_activation_point
     harness = RepairHarness(tmp_path)
     request = harness.request()
     harness.runner.validate_regress_build(request)
-    previous = harness.store.load()
     lifecycle_calls: list[str] = []
     launcher = TrustedLauncher(
         harness.store,
         harness.registry,
         repair_service=harness.repair_service,
+        activation_signer=harness.activation_signer,
         terminate_old_runner=FakeLifecycleEffect("terminate", lifecycle_calls),
         start_new_runner=FakeLifecycleEffect("start", lifecycle_calls),
         attest_new_runner=FakeLifecycleEffect("attest", lifecycle_calls),
         ticket_invoker=FakeTicketInvoker(),
     )
     activated = launcher.reconcile_activation("run-1", request.content_hash)
-    assert harness.registry.verify_transition(previous, activated.state)
+    assert activated.state.restart_receipt_hash == harness.registry.current_activation().content_hash
 
     from auto_code.state import _atomic_replace_json
 
@@ -1351,7 +1468,6 @@ def test_state_transition_verification_accepts_only_the_current_activation_point
     payload = json.loads(pointer.read_text(encoding="utf-8"))
     payload["receipt_hash"] = "f" * 64
     _atomic_replace_json(pointer, payload)
-    assert not harness.registry.verify_transition(previous, activated.state)
     with pytest.raises(UnauthorizedRepairError, match="pointer"):
         launcher.invoke("run-1", ("status",))
 
@@ -1366,6 +1482,7 @@ def test_activation_receipt_persists_exact_release_and_invocation_reverifies_it(
         harness.store,
         harness.registry,
         repair_service=harness.repair_service,
+        activation_signer=harness.activation_signer,
         terminate_old_runner=FakeLifecycleEffect("terminate", lifecycle_calls),
         start_new_runner=FakeLifecycleEffect("start", lifecycle_calls),
         attest_new_runner=FakeLifecycleEffect("attest", lifecycle_calls),
@@ -1389,6 +1506,8 @@ def test_activation_receipt_persists_exact_release_and_invocation_reverifies_it(
 
 def test_ticket_runner_executes_descriptor_held_release_after_path_replacement(tmp_path: Path) -> None:
     harness = RepairHarness(tmp_path)
+    harness.builder.runner_content = b"import helper\nprint(helper.VALUE)\n"
+    harness.builder.extra_files = {"helper.py": b"VALUE = 'immutable-runner'\n"}
     request = harness.request()
     pending = harness.runner.validate_regress_build(request)
     calls: list[str] = []
@@ -1397,22 +1516,25 @@ def test_ticket_runner_executes_descriptor_held_release_after_path_replacement(t
         def invoke(self, executable: VerifiedExecutable, argv: tuple[str, ...]) -> str:
             pending.release_root.chmod(0o755)
             replacement = pending.release_root / "replacement"
-            replacement.write_bytes(b"#!/bin/sh\nprintf mutable-runner")
-            replacement.chmod(0o555)
-            replacement.replace(pending.release_root / pending.runner_executable)
+            replacement.write_bytes(b"VALUE = 'mutable-runner'\n")
+            replacement.chmod(0o444)
+            replacement.replace(pending.release_root / "helper.py")
+            required_seals = fcntl.F_SEAL_SEAL | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE
+            assert fcntl.fcntl(executable.descriptor, fcntl.F_GET_SEALS) & required_seals == required_seals
             completed = subprocess.run(
-                (f"/proc/self/fd/{executable.descriptor}", *argv),
+                (sys.executable, f"/proc/self/fd/{executable.descriptor}", *argv),
                 pass_fds=(executable.descriptor,),
                 capture_output=True,
                 check=False,
             )
             assert completed.returncode == 0
-            return completed.stdout.decode("ascii")
+            return completed.stdout.decode("ascii").strip()
 
     launcher = TrustedLauncher(
         harness.store,
         harness.registry,
         repair_service=harness.repair_service,
+        activation_signer=harness.activation_signer,
         terminate_old_runner=FakeLifecycleEffect("terminate", calls),
         start_new_runner=FakeLifecycleEffect("start", calls),
         attest_new_runner=FakeLifecycleEffect("attest", calls),
@@ -1421,6 +1543,34 @@ def test_ticket_runner_executes_descriptor_held_release_after_path_replacement(t
     launcher.reconcile_activation("run-1", request.content_hash)
 
     assert launcher.invoke("run-1", ("status",)) == "immutable-runner"
+
+
+def test_ticket_runner_fails_closed_when_sealed_memfd_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = RepairHarness(tmp_path)
+    request = harness.request()
+    harness.runner.validate_regress_build(request)
+    calls: list[str] = []
+    invocations: list[tuple[str, ...]] = []
+    launcher = TrustedLauncher(
+        harness.store,
+        harness.registry,
+        repair_service=harness.repair_service,
+        activation_signer=harness.activation_signer,
+        terminate_old_runner=FakeLifecycleEffect("terminate", calls),
+        start_new_runner=FakeLifecycleEffect("start", calls),
+        attest_new_runner=FakeLifecycleEffect("attest", calls),
+        ticket_invoker=FakeTicketInvoker(invocations),
+    )
+    launcher.reconcile_activation("run-1", request.content_hash)
+    monkeypatch.delattr(os, "memfd_create")
+
+    with pytest.raises(PermissionError, match="sealed runner archive"):
+        launcher.invoke("run-1", ("status",))
+
+    assert invocations == []
 
 
 def test_activation_receipt_rejects_missing_transaction_evidence() -> None:
@@ -1464,6 +1614,7 @@ def test_launcher_keeps_state_non_active_until_termination_start_and_attestation
         harness.store,
                 harness.registry,
         repair_service=harness.repair_service,
+        activation_signer=harness.activation_signer,
         terminate_old_runner=terminate,
         start_new_runner=start,
         attest_new_runner=attest,
@@ -1483,6 +1634,7 @@ def test_launcher_keeps_state_non_active_until_termination_start_and_attestation
         harness.store,
         harness.registry,
         repair_service=harness.repair_service,
+        activation_signer=harness.activation_signer,
         terminate_old_runner=terminate,
         start_new_runner=start,
         attest_new_runner=attest,
@@ -1493,6 +1645,92 @@ def test_launcher_keeps_state_non_active_until_termination_start_and_attestation
     assert generation.state.disposition is RunDisposition.ACTIVE
     assert calls == ["terminate", "start", "attest"]
     assert recovered.invoke("run-1", ("status",))[-1] == "status"
+
+
+def test_activation_lock_rejects_a_stale_concurrent_request_before_lifecycle_effects(tmp_path: Path) -> None:
+    harness = RepairHarness(tmp_path)
+    first_request = harness.request()
+    first_pending = harness.runner.validate_regress_build(first_request)
+    second_hash = "f" * 64
+    second_pending = replace(
+        first_pending,
+        request_hash=second_hash,
+    )
+    assert _write_new_json(harness.registry.pending_path(second_hash), second_pending.payload())
+    second_journal = RepairJournal(harness.state_root, second_hash)
+    second_journal.record("source_manifest", second_pending.repair_source_manifest_hash)
+    second_journal.record("regression", second_pending.regression_evidence_hash)
+    second_journal.record("build", second_pending.build_evidence_hash)
+    harness.repair_service.request_hash = None
+
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_finished = threading.Event()
+    first_calls: list[str] = []
+    second_calls: list[str] = []
+    outcomes: dict[str, BaseException | None] = {}
+
+    def capture_error(operation: Callable[[], object]) -> BaseException | None:
+        try:
+            operation()
+        except BaseException as error:
+            return error
+        return None
+
+    class BlockingTermination(FakeLifecycleEffect):
+        def invoke(self, effect_id: str, run_id: str, runner: RunnerIdentity) -> str:
+            first_entered.set()
+            assert release_first.wait(timeout=5)
+            return super().invoke(effect_id, run_id, runner)
+
+    first_launcher = TrustedLauncher(
+        RunStateStore(harness.state_root, "run-1"),
+        harness.registry,
+        repair_service=harness.repair_service,
+        activation_signer=harness.activation_signer,
+        terminate_old_runner=BlockingTermination("terminate", first_calls),
+        start_new_runner=FakeLifecycleEffect("start", first_calls),
+        attest_new_runner=FakeLifecycleEffect("attest", first_calls),
+    )
+    second_launcher = TrustedLauncher(
+        RunStateStore(harness.state_root, "run-1"),
+        harness.registry,
+        repair_service=harness.repair_service,
+        activation_signer=harness.activation_signer,
+        terminate_old_runner=FakeLifecycleEffect("terminate", second_calls),
+        start_new_runner=FakeLifecycleEffect("start", second_calls),
+        attest_new_runner=FakeLifecycleEffect("attest", second_calls),
+    )
+
+    first = threading.Thread(
+        target=lambda: outcomes.update(
+            first=capture_error(
+                lambda: first_launcher.reconcile_activation("run-1", first_request.content_hash)
+            )
+        )
+    )
+
+    def activate_second() -> None:
+        outcomes["second"] = capture_error(
+            lambda: second_launcher.reconcile_activation("run-1", second_hash)
+        )
+        second_finished.set()
+
+    second = threading.Thread(target=activate_second)
+    first.start()
+    assert first_entered.wait(timeout=5)
+    second.start()
+    assert not second_finished.wait(timeout=0.2)
+    release_first.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert outcomes["first"] is None
+    assert isinstance(outcomes["second"], UnauthorizedRepairError)
+    assert first_calls == ["terminate", "start", "attest"]
+    assert second_calls == []
 
 
 @pytest.mark.parametrize(
@@ -1513,6 +1751,7 @@ def test_launcher_lifecycle_recovery_observes_each_effect_before_reinvoking(
         harness.store,
         harness.registry,
         repair_service=harness.repair_service,
+        activation_signer=harness.activation_signer,
         terminate_old_runner=FakeLifecycleEffect("terminate", calls),
         start_new_runner=FakeLifecycleEffect("start", calls),
         attest_new_runner=FakeLifecycleEffect("attest", calls),
@@ -1539,6 +1778,7 @@ def test_recovery_after_state_cas_records_final_phase_without_repeating_lifecycl
         harness.store,
         harness.registry,
         repair_service=harness.repair_service,
+        activation_signer=harness.activation_signer,
         terminate_old_runner=terminate,
         start_new_runner=start,
         attest_new_runner=attest,
@@ -1553,6 +1793,7 @@ def test_recovery_after_state_cas_records_final_phase_without_repeating_lifecycl
         harness.store,
         harness.registry,
         repair_service=harness.repair_service,
+        activation_signer=harness.activation_signer,
         terminate_old_runner=terminate,
         start_new_runner=start,
         attest_new_runner=attest,
@@ -1575,6 +1816,7 @@ def test_recovery_after_pointer_publication_completes_the_exact_state_transition
         harness.store,
         harness.registry,
         repair_service=harness.repair_service,
+        activation_signer=harness.activation_signer,
         terminate_old_runner=FakeLifecycleEffect("terminate", calls),
         start_new_runner=FakeLifecycleEffect("start", calls),
         attest_new_runner=FakeLifecycleEffect("attest", calls),
@@ -1603,7 +1845,7 @@ def test_protected_runtime_exposes_no_unbound_capability_injection(tmp_path: Pat
     assert not hasattr(repair_entrypoint.ProtectedRepairRuntime(descriptor), "with_capabilities")
 
 
-def test_state_store_rejects_repair_activation_without_registry_verification(tmp_path: Path) -> None:
+def test_state_store_rejects_repair_activation_without_a_signed_receipt(tmp_path: Path) -> None:
     store = RunStateStore(tmp_path, "run-1")
     initial = store.compare_and_swap(0, EMPTY_STATE_HASH, RunState(
         run_id="run-1", ticket_id="ENG-1", repository_id="repo-1", max_crew_iterations=3
@@ -1618,6 +1860,7 @@ def test_state_store_rejects_repair_activation_without_registry_verification(tmp
             "disposition": RunDisposition.ACTIVE,
             "runner_identity": identity("b"),
             "restart_receipt_hash": "1" * 64,
+            "restart_receipt_request_hash": "2" * 64,
         }
     )
     with pytest.raises(Exception, match="repair activation"):
@@ -1694,10 +1937,132 @@ def test_installed_ticket_cli_composes_repair_request_from_launcher_descriptor(
 
 
 def test_protected_cli_has_no_callback_only_production_composition() -> None:
-    assert tuple(inspect.signature(repair_entrypoint.main).parameters) == ("argv", "runtime")
+    public_key = Ed25519PrivateKey.generate().public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    state = preparation_state(runner=identity("a")).model_copy(
+        update={
+            "repair_activation_public_key": public_key.hex(),
+            "repair_activation_public_key_hash": sha256(public_key).hexdigest(),
+        }
+    )
+
+    assert state.repair_activation_public_key == public_key.hex()
+    assert state.repair_activation_public_key_hash == sha256(public_key).hexdigest()
+    assert "repair_activation_verifier" not in inspect.signature(RunStateStore).parameters
+    assert tuple(inspect.signature(repair_entrypoint.main).parameters) == ("argv",)
+    assert tuple(inspect.signature(repair_entrypoint.load_protected_runtime).parameters) == ()
     assert not hasattr(repair_entrypoint.ProtectedRepairRuntime, "with_capabilities")
     assert "authorize" not in inspect.signature(RepairRunner).parameters
     assert "authorize" not in inspect.signature(TrustedLauncher).parameters
+
+
+def test_activation_receipt_signature_binds_the_complete_transition() -> None:
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    receipt = activation_receipt("1" * 64, identity("a"), identity("b"))
+    unsigned = replace(
+        receipt,
+        activation_public_key_hash=sha256(public_key).hexdigest(),
+        signature="0" * 128,
+    )
+    signed = replace(unsigned, signature=private_key.sign(canonical_json_bytes(unsigned.signed_payload())).hex())
+
+    signed.verify_signature(public_key)
+    payload = signed.signed_payload()
+    assert payload["domain"] == "auto-code-repair-activation/v1"
+    assert payload["run_id"] == signed.run_id
+    assert payload["expected_revision"] == signed.expected_revision
+    assert payload["expected_state_hash"] == signed.expected_state_hash
+    assert payload["failure_hash"] == signed.failure_hash
+    assert payload["old_runner_identity"] == signed.old_runner_identity.model_dump(mode="json", round_trip=True)
+    assert payload["new_runner_identity"] == signed.new_runner_identity.model_dump(mode="json", round_trip=True)
+
+
+def test_state_transition_verifies_activation_with_the_old_state_pinned_key(tmp_path: Path) -> None:
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    store = RunStateStore(tmp_path, "run-1")
+    initial_state = preparation_state(runner=identity("a")).model_copy(
+        update={
+            "repair_activation_public_key": public_key.hex(),
+            "repair_activation_public_key_hash": sha256(public_key).hexdigest(),
+        }
+    )
+    initial = store.compare_and_swap(0, EMPTY_STATE_HASH, initial_state)
+    failure = repair_failure()
+    repair = store.compare_and_swap(
+        initial.revision,
+        initial.state_hash,
+        initial.state.model_copy(update={"disposition": RunDisposition.REPAIR_REQUIRED, "failure_history": (failure,)}),
+    )
+    unsigned = replace(
+        activation_receipt("1" * 64, repair.state.runner_identity, identity("b")),
+        expected_revision=repair.revision,
+        expected_state_hash=repair.state_hash,
+        failure_hash=hash_json(failure.model_dump(mode="json", round_trip=True)),
+        project_policy_hash=repair.state.project_policy_hash,
+        activation_public_key_hash=sha256(public_key).hexdigest(),
+        signature="0" * 128,
+    )
+    receipt = replace(
+        unsigned,
+        signature=private_key.sign(canonical_json_bytes(unsigned.signed_payload())).hex(),
+    )
+    receipts = tmp_path / "runner-activations"
+    receipts.mkdir()
+    assert _write_new_json(receipts / f"{receipt.request_hash}.json", receipt.payload())
+    activated = repair.state.model_copy(
+        update={
+            "disposition": RunDisposition.ACTIVE,
+            "runner_identity": receipt.new_runner_identity,
+            "restart_receipt_hash": receipt.content_hash,
+            "restart_receipt_request_hash": receipt.request_hash,
+        }
+    )
+
+    generation = store.compare_and_swap(repair.revision, repair.state_hash, activated)
+    assert generation.state.runner_identity == receipt.new_runner_identity
+
+    forged_store = RunStateStore(tmp_path / "forged", "run-1")
+    forged_initial = forged_store.compare_and_swap(0, EMPTY_STATE_HASH, initial_state)
+    forged_repair = forged_store.compare_and_swap(
+        forged_initial.revision,
+        forged_initial.state_hash,
+        forged_initial.state.model_copy(
+            update={"disposition": RunDisposition.REPAIR_REQUIRED, "failure_history": (failure,)}
+        ),
+    )
+    forged_receipts = forged_store.root / "runner-activations"
+    forged_receipts.mkdir()
+    forged = replace(
+        receipt,
+        expected_revision=forged_repair.revision,
+        expected_state_hash=forged_repair.state_hash,
+    )
+    attacker = Ed25519PrivateKey.generate()
+    forged = replace(forged, signature=attacker.sign(canonical_json_bytes(forged.signed_payload())).hex())
+    assert _write_new_json(forged_receipts / f"{forged.request_hash}.json", forged.payload())
+    with pytest.raises(InvalidStateTransition, match="repair activation"):
+        forged_store.compare_and_swap(
+            forged_repair.revision,
+            forged_repair.state_hash,
+            forged_repair.state.model_copy(
+                update={
+                    "disposition": RunDisposition.ACTIVE,
+                    "runner_identity": forged.new_runner_identity,
+                    "restart_receipt_hash": forged.content_hash,
+                    "restart_receipt_request_hash": forged.request_hash,
+                }
+            ),
+        )
 
 
 def test_installed_protected_prepare_composes_pinned_process_git_and_sandbox(
@@ -1714,7 +2079,10 @@ def test_installed_protected_prepare_composes_pinned_process_git_and_sandbox(
     executable_hash = sha256(executable.read_bytes()).hexdigest()
     for path in (tmp_path / "controlled-home", tmp_path / "secrets", tmp_path / "runner-releases"):
         path.mkdir(exist_ok=True)
-    server = FakeSandboxServer(tmp_path / "launcher-sandbox.sock")
+    server = FakeSandboxServer(
+        tmp_path / "launcher-sandbox.sock",
+        activation_private_key=harness.activation_private_key,
+    )
     private_key = Ed25519PrivateKey.generate()
     public_key = private_key.public_key().public_bytes(
         encoding=serialization.Encoding.Raw,
@@ -1768,7 +2136,7 @@ def test_installed_protected_prepare_composes_pinned_process_git_and_sandbox(
         )
         with pytest.raises(SystemExit) as exit_status:
             repair_entrypoint.entrypoint()
-        runtime = repair_entrypoint.load_protected_runtime(verification_key=public_key)
+        runtime = repair_entrypoint.load_protected_runtime()
         requests_before_recovery = len(server.requests)
         recovered = runtime.prepare(
             "run-1",
@@ -1832,7 +2200,10 @@ def test_installed_protected_apply_builds_reconciles_and_activates_from_descript
     git_hash = sha256(git_executable.read_bytes()).hexdigest()
     for path in (tmp_path / "controlled-home", tmp_path / "secrets", tmp_path / "runner-releases"):
         path.mkdir(exist_ok=True)
-    server = FakeSandboxServer(tmp_path / "launcher-sandbox.sock")
+    server = FakeSandboxServer(
+        tmp_path / "launcher-sandbox.sock",
+        activation_private_key=harness.activation_private_key,
+    )
     private_key = Ed25519PrivateKey.generate()
     public_key = private_key.public_key().public_bytes(
         encoding=serialization.Encoding.Raw,
@@ -1876,7 +2247,8 @@ def test_installed_protected_apply_builds_reconciles_and_activates_from_descript
     prepare_descriptor = signed_descriptor(tmp_path / "prepare.json", prepare_payload, private_key)
     try:
         monkeypatch.setattr(repair_entrypoint, "_REPAIR_DESCRIPTOR_FD", prepare_descriptor)
-        prepare_runtime = repair_entrypoint.load_protected_runtime(verification_key=public_key)
+        monkeypatch.setattr(repair_entrypoint, "_REPAIR_DESCRIPTOR_VERIFICATION_KEY", public_key)
+        prepare_runtime = repair_entrypoint.load_protected_runtime()
         handle = prepare_runtime.prepare(
             "run-1", harness.generation.revision, harness.generation.state_hash, harness.failure_hash
         )
@@ -1947,7 +2319,7 @@ def test_installed_protected_apply_builds_reconciles_and_activates_from_descript
         )
         with pytest.raises(SystemExit) as exit_status:
             repair_entrypoint.entrypoint()
-        runtime = repair_entrypoint.load_protected_runtime(verification_key=public_key)
+        runtime = repair_entrypoint.load_protected_runtime()
         sandbox_requests = len(server.requests)
         recovered = runtime.apply(str(handle.path), request_hash)
     finally:

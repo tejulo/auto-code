@@ -149,6 +149,7 @@ def runner_identity(content_hash: str) -> RunnerIdentity:
         source_sha="b" * 64,
         dependency_lock_hash="c" * 64,
         contract_bundle_hash="d" * 64,
+        runner_archive_hash="e" * 64,
         built_at=NOW,
     )
 
@@ -911,6 +912,7 @@ def test_cas_rejects_unverified_repair_restart_even_with_a_receipt_hash(tmp_path
             "disposition": RunDisposition.ACTIVE,
             "runner_identity": runner_identity("b" * 64),
             "restart_receipt_hash": "e" * 64,
+            "restart_receipt_request_hash": "f" * 64,
         }
     )
 
@@ -980,6 +982,7 @@ def test_cas_rejects_resume_authorization_during_repair_reactivation(tmp_path: P
             "disposition": RunDisposition.ACTIVE,
             "runner_identity": runner_identity("b" * 64),
             "restart_receipt_hash": "e" * 64,
+            "restart_receipt_request_hash": "f" * 64,
             "human_authorizations": (
                 consumed_authorization("run-1", HumanAuthorizationAction.RESUME, "resume-1"),
             ),

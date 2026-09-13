@@ -1,18 +1,24 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
 from datetime import UTC, datetime, timedelta
+import fcntl
 import hashlib
+import io
 import os
 from pathlib import Path, PurePosixPath
 import stat
 from typing import Protocol
 import uuid
+import zipfile
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from .contracts import FailureClass, RunnerIdentity, RunDisposition, Stage
 from .git import RepairSourceManifest
-from .hashing import hash_json
+from .hashing import canonical_json_bytes, hash_json
 from .process import CommandResult, EvidenceSink, ProcessRunner, SandboxPolicy
 from .process import VerifiedExecutable
 from .repair import (
@@ -95,6 +101,10 @@ class TicketInvoker(Protocol):
     def invoke(self, executable: VerifiedExecutable, argv: tuple[str, ...]) -> object: ...
 
 
+class ActivationSigner(Protocol):
+    def sign(self, payload: bytes, public_key_hash: str) -> str: ...
+
+
 class ProtectedRepairService(Protocol):
     """OS-capability service supplied only by the verified repair entrypoint."""
 
@@ -171,6 +181,7 @@ class BuiltRunnerRelease:
     root: Path
     release_manifest: tuple[ReleaseManifestEntry, ...]
     release_manifest_hash: str
+    runner_archive_hash: str
     runner_executable: str
     repair_source_manifest_hash: str
     dependency_lock_hash: str
@@ -196,12 +207,15 @@ class BuiltRunnerRelease:
         if executable_entry is None or executable_entry.kind != "file" or not executable_entry.mode & 0o111:
             raise UnauthorizedRepairError("built runner executable is unavailable")
         for digest in (
+            self.runner_archive_hash,
             self.repair_source_manifest_hash,
             self.dependency_lock_hash,
             self.contract_manifest_hash,
             self.build_evidence_hash,
         ):
             _require_hash(digest, "built runner binding")
+        if hashlib.sha256(_capture_runner_archive(self.root, captured, self.runner_executable)).hexdigest() != self.runner_archive_hash:
+            raise UnauthorizedRepairError("built runner archive does not match its immutable hash")
         if (
             len(self.contract_hashes) > len(Stage)
             or any(not isinstance(stage, Stage) for stage in self.contract_hashes)
@@ -224,6 +238,7 @@ class BuiltRunnerRelease:
             source_sha=self.repair_source_manifest_hash,
             dependency_lock_hash=self.dependency_lock_hash,
             contract_bundle_hash=self.contract_manifest_hash,
+            runner_archive_hash=self.runner_archive_hash,
             built_at=self.built_at,
         )
 
@@ -471,6 +486,7 @@ class PendingRunnerActivation:
     release_root: Path
     release_manifest: tuple[ReleaseManifestEntry, ...]
     release_manifest_hash: str
+    runner_archive_hash: str
     runner_executable: str
     old_runner_identity: RunnerIdentity
     new_runner_identity: RunnerIdentity
@@ -494,18 +510,20 @@ class PendingRunnerActivation:
             (self.regression_evidence_hash, "regression evidence"),
             (self.build_evidence_hash, "build evidence"),
             (self.release_manifest_hash, "release manifest"),
+            (self.runner_archive_hash, "runner archive"),
         ):
             _require_hash(value, description)
         if not self.release_root.is_absolute() or ".." in self.release_root.parts:
             raise ValueError("pending runner release root is invalid")
         if (
             not self.release_manifest
-            or len(self.release_manifest) > 100_000
+            or len(self.release_manifest) > MAX_RELEASE_FILES
             or tuple(sorted(self.release_manifest, key=lambda entry: entry.path)) != self.release_manifest
             or len({entry.path for entry in self.release_manifest}) != len(self.release_manifest)
             or self.release_manifest_hash != hash_json([entry.payload() for entry in self.release_manifest])
             or self.new_runner_identity.content_hash != self.release_manifest_hash
             or self.new_runner_identity.source_sha != self.repair_source_manifest_hash
+            or self.new_runner_identity.runner_archive_hash != self.runner_archive_hash
         ):
             raise ValueError("pending runner release manifest is invalid")
         _require_relative_path(self.runner_executable, "runner executable")
@@ -538,6 +556,7 @@ class PendingRunnerActivation:
             "release_root": str(self.release_root),
             "release_manifest": [entry.payload() for entry in self.release_manifest],
             "release_manifest_hash": self.release_manifest_hash,
+            "runner_archive_hash": self.runner_archive_hash,
             "runner_executable": self.runner_executable,
             "old_runner_identity": self.old_runner_identity.model_dump(mode="json", round_trip=True),
             "new_runner_identity": self.new_runner_identity.model_dump(mode="json", round_trip=True),
@@ -554,7 +573,7 @@ class PendingRunnerActivation:
             "request_hash", "run_id", "expected_revision", "expected_state_hash", "failure_hash",
             "repair_source_manifest_hash", "project_policy_hash", "regression_evidence_hash",
             "build_evidence_hash", "release_root", "release_manifest", "release_manifest_hash",
-            "runner_executable", "old_runner_identity", "new_runner_identity", "previous_contract_hashes",
+            "runner_archive_hash", "runner_executable", "old_runner_identity", "new_runner_identity", "previous_contract_hashes",
             "contract_hashes",
         }
         if (
@@ -581,6 +600,7 @@ class PendingRunnerActivation:
             release_root=release_root,
             release_manifest=tuple(ReleaseManifestEntry.from_payload(entry) for entry in payload["release_manifest"]),
             release_manifest_hash=_require_hash(payload["release_manifest_hash"], "release manifest"),
+            runner_archive_hash=_require_hash(payload["runner_archive_hash"], "runner archive"),
             runner_executable=payload["runner_executable"],
             old_runner_identity=RunnerIdentity.model_validate(payload["old_runner_identity"]),
             new_runner_identity=RunnerIdentity.model_validate(payload["new_runner_identity"]),
@@ -606,6 +626,7 @@ class RunnerActivationReceipt:
     release_root: Path
     release_manifest: tuple[ReleaseManifestEntry, ...]
     release_manifest_hash: str
+    runner_archive_hash: str
     runner_executable: str
     termination_evidence_hash: str
     restart_evidence_hash: str
@@ -615,6 +636,8 @@ class RunnerActivationReceipt:
     compatible_checkpoint_stages: tuple[Stage, ...]
     previous_contract_hashes: Mapping[Stage, str]
     contract_hashes: Mapping[Stage, str]
+    activation_public_key_hash: str
+    signature: str
 
     def __post_init__(self) -> None:
         PendingRunnerActivation(
@@ -624,8 +647,15 @@ class RunnerActivationReceipt:
             (self.termination_evidence_hash, "termination evidence"),
             (self.restart_evidence_hash, "restart evidence"),
             (self.attestation_evidence_hash, "attestation evidence"),
+            (self.activation_public_key_hash, "activation public key"),
         ):
             _require_hash(value, description)
+        if (
+            not isinstance(self.signature, str)
+            or len(self.signature) != 128
+            or any(character not in "0123456789abcdef" for character in self.signature)
+        ):
+            raise ValueError("activation receipt signature is invalid")
         expected_compatible: list[Stage] = []
         for stage in Stage:
             previous = self.previous_contract_hashes.get(stage)
@@ -649,8 +679,29 @@ class RunnerActivationReceipt:
     def content_hash(self) -> str:
         return hash_json(self.payload())
 
-    def payload(self) -> dict[str, object]:
+    def signed_payload(self) -> dict[str, object]:
         return {
+            "domain": "auto-code-repair-activation/v1",
+            **self.payload(include_signature=False),
+        }
+
+    def verify_signature(self, public_key: bytes) -> None:
+        if (
+            not isinstance(public_key, bytes)
+            or len(public_key) != 32
+            or hashlib.sha256(public_key).hexdigest() != self.activation_public_key_hash
+        ):
+            raise UnauthorizedRepairError("activation receipt trust binding is invalid")
+        try:
+            Ed25519PublicKey.from_public_bytes(public_key).verify(
+                bytes.fromhex(self.signature),
+                canonical_json_bytes(self.signed_payload()),
+            )
+        except (InvalidSignature, ValueError):
+            raise UnauthorizedRepairError("activation receipt signature is invalid") from None
+
+    def payload(self, *, include_signature: bool = True) -> dict[str, object]:
+        payload: dict[str, object] = {
             "request_hash": self.request_hash,
             "run_id": self.run_id,
             "expected_revision": self.expected_revision,
@@ -663,6 +714,7 @@ class RunnerActivationReceipt:
             "release_root": str(self.release_root),
             "release_manifest": [entry.payload() for entry in self.release_manifest],
             "release_manifest_hash": self.release_manifest_hash,
+            "runner_archive_hash": self.runner_archive_hash,
             "runner_executable": self.runner_executable,
             "termination_evidence_hash": self.termination_evidence_hash,
             "restart_evidence_hash": self.restart_evidence_hash,
@@ -675,16 +727,21 @@ class RunnerActivationReceipt:
                 for stage, digest in sorted(self.previous_contract_hashes.items(), key=lambda item: item[0].value)
             },
             "contract_hashes": {stage.value: digest for stage, digest in sorted(self.contract_hashes.items(), key=lambda item: item[0].value)},
+            "activation_public_key_hash": self.activation_public_key_hash,
         }
+        if include_signature:
+            payload["signature"] = self.signature
+        return payload
 
     @classmethod
     def from_payload(cls, payload: object) -> RunnerActivationReceipt:
         expected = {
             "request_hash", "run_id", "expected_revision", "expected_state_hash", "failure_hash",
             "repair_source_manifest_hash", "project_policy_hash", "regression_evidence_hash", "build_evidence_hash",
-            "release_root", "release_manifest", "release_manifest_hash", "runner_executable",
+            "release_root", "release_manifest", "release_manifest_hash", "runner_archive_hash", "runner_executable",
             "termination_evidence_hash", "restart_evidence_hash", "attestation_evidence_hash", "old_runner_identity",
             "new_runner_identity", "compatible_checkpoint_stages", "previous_contract_hashes", "contract_hashes",
+            "activation_public_key_hash", "signature",
         }
         if not isinstance(payload, dict) or set(payload) != expected or not isinstance(payload["contract_hashes"], dict):
             raise ValueError("activation receipt is invalid")
@@ -700,6 +757,10 @@ class RunnerActivationReceipt:
                 restart_evidence_hash=_require_hash(payload["restart_evidence_hash"], "restart evidence"),
                 attestation_evidence_hash=_require_hash(payload["attestation_evidence_hash"], "attestation evidence"),
                 compatible_checkpoint_stages=tuple(Stage(stage) for stage in payload["compatible_checkpoint_stages"]),
+                activation_public_key_hash=_require_hash(
+                    payload["activation_public_key_hash"], "activation public key"
+                ),
+                signature=payload["signature"],
             )
         except (TypeError, ValueError):
             raise ValueError("activation receipt is invalid") from None
@@ -763,25 +824,6 @@ class RunnerRegistry:
         if receipt.content_hash != pointer["receipt_hash"] or receipt.new_runner_identity != pointer_identity:
             raise UnauthorizedRepairError("runner activation pointer does not match its receipt")
         return receipt
-
-    def verify_transition(self, previous: StateGeneration, state: object) -> bool:
-        try:
-            restart_hash = getattr(state, "restart_receipt_hash")
-            if not isinstance(restart_hash, str):
-                return False
-            receipt = self.current_activation()
-            return (
-                receipt.content_hash == restart_hash
-                and receipt.run_id == previous.state.run_id
-                and receipt.expected_revision == previous.revision
-                and receipt.expected_state_hash == previous.state_hash
-                and receipt.old_runner_identity == previous.state.runner_identity
-                and receipt.new_runner_identity == getattr(state, "runner_identity")
-                and receipt.project_policy_hash == previous.state.project_policy_hash
-            )
-        except Exception:
-            return False
-
 
 class RepairRunner:
     def __init__(
@@ -914,7 +956,13 @@ class RepairRunner:
                 control_paths=control_paths,
             )
             if request.repository_id == request.repair_repository_id:
-                overlap = {entry.path for entry in source.files}.intersection(request.ticket_owned_paths)
+                repair_paths = {
+                    path
+                    for entry in source.files
+                    for path in (entry.path, entry.old_path)
+                    if path is not None
+                }
+                overlap = repair_paths.intersection(request.ticket_owned_paths)
                 if overlap:
                     raise RepairTicketOverlap(", ".join(sorted(overlap)))
             regression_journal = RepairJournal(
@@ -999,6 +1047,7 @@ class RepairRunner:
                 release_root=built.root,
                 release_manifest=built.release_manifest,
                 release_manifest_hash=built.release_manifest_hash,
+                runner_archive_hash=built.runner_archive_hash,
                 runner_executable=built.runner_executable,
                 old_runner_identity=request.old_runner_identity,
                 new_runner_identity=built.identity,
@@ -1032,10 +1081,9 @@ class TrustedLauncher:
         start_new_runner: LifecycleEffect,
         attest_new_runner: LifecycleEffect,
         repair_service: ProtectedRepairService,
+        activation_signer: ActivationSigner,
         ticket_invoker: TicketInvoker | None = None,
     ) -> None:
-        if store.repair_activation_verifier is not registry:
-            raise ValueError("state store is not bound to the protected activation registry")
         self.store = store
         self.registry = registry
         self.terminate_old_runner = terminate_old_runner
@@ -1043,6 +1091,7 @@ class TrustedLauncher:
         self.attest_new_runner = attest_new_runner
         self.ticket_invoker = ticket_invoker
         self.repair_service = repair_service
+        self.activation_signer = activation_signer
         self._crash_marker: str | None = None
         self._effect_crash_marker: tuple[str, str] | None = None
 
@@ -1058,8 +1107,17 @@ class TrustedLauncher:
         self.repair_service.require_apply(request_hash)
         if run_id != self.store.run_id:
             raise UnauthorizedRepairError("activation run does not match launcher")
+        lock = self.store.root / "locks" / f"repair-activation-{hash_json(run_id)}.lock"
+        with _interprocess_lock(lock):
+            return self._reconcile_activation_locked(request_hash)
+
+    def _reconcile_activation_locked(self, request_hash: str) -> StateGeneration:
+        run_id = self.store.run_id
+        self.repair_service.require_apply(request_hash)
         current = self.store.load()
         if current.state.disposition is RunDisposition.ACTIVE:
+            if current.state.restart_receipt_request_hash != request_hash:
+                raise UnauthorizedRepairError("repair activation request is stale")
             receipt = self.registry.lookup_activation(request_hash)
             if (
                 self.registry.current_activation() == receipt
@@ -1103,13 +1161,25 @@ class TrustedLauncher:
                 break
             compatible_stages.append(stage)
         compatible = tuple(compatible_stages)
-        receipt = RunnerActivationReceipt(
+        public_key_hex = current.state.repair_activation_public_key
+        public_key_hash = current.state.repair_activation_public_key_hash
+        if public_key_hex is None or public_key_hash is None:
+            raise UnauthorizedRepairError("repair activation trust is unavailable")
+        unsigned_receipt = RunnerActivationReceipt(
             **{field: getattr(pending, field) for field in PendingRunnerActivation.__dataclass_fields__},
             termination_evidence_hash=terminated,
             restart_evidence_hash=restarted,
             attestation_evidence_hash=attested,
             compatible_checkpoint_stages=compatible,
+            activation_public_key_hash=public_key_hash,
+            signature="0" * 128,
         )
+        signature = self.activation_signer.sign(
+            canonical_json_bytes(unsigned_receipt.signed_payload()),
+            public_key_hash,
+        )
+        receipt = dataclass_replace(unsigned_receipt, signature=signature)
+        receipt.verify_signature(bytes.fromhex(public_key_hex))
         if receipt.old_runner_identity != pending.old_runner_identity:
             raise UnauthorizedRepairError("activation does not match expected old runner")
         journal.require(
@@ -1131,6 +1201,7 @@ class TrustedLauncher:
                 "checkpoints": checkpoints,
                 "stage_outputs": outputs,
                 "restart_receipt_hash": receipt.content_hash,
+                "restart_receipt_request_hash": receipt.request_hash,
             }
         )
         self.repair_service.require_apply(request_hash)
@@ -1156,6 +1227,7 @@ class TrustedLauncher:
                 root=receipt.release_root,
                 release_manifest=receipt.release_manifest,
                 release_manifest_hash=receipt.release_manifest_hash,
+                runner_archive_hash=receipt.runner_archive_hash,
                 runner_executable=receipt.runner_executable,
                 repair_source_manifest_hash=receipt.repair_source_manifest_hash,
                 dependency_lock_hash=receipt.new_runner_identity.dependency_lock_hash,
@@ -1169,28 +1241,45 @@ class TrustedLauncher:
                 raise UnauthorizedRepairError("active runner release identity is invalid")
         except Exception as error:
             raise PermissionError("ticket runner release is invalid") from error
-        executable_path = receipt.release_root / receipt.runner_executable
-        descriptor = os.open(
-            executable_path,
-            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
-        )
-        executable = VerifiedExecutable(str(executable_path), descriptor)
+        descriptor = -1
         try:
-            metadata = os.fstat(descriptor)
-            entry = next(item for item in receipt.release_manifest if item.path == receipt.runner_executable)
-            digest = hashlib.sha256()
-            while chunk := os.read(descriptor, 65_536):
-                digest.update(chunk)
+            archive = _capture_runner_archive(
+                receipt.release_root,
+                receipt.release_manifest,
+                receipt.runner_executable,
+            )
+            if hashlib.sha256(archive).hexdigest() != receipt.runner_archive_hash:
+                raise PermissionError("ticket runner archive hash is invalid")
+            if not hasattr(os, "memfd_create") or not hasattr(os, "MFD_ALLOW_SEALING"):
+                raise PermissionError("sealed runner archive is unavailable")
+            descriptor = os.memfd_create(
+                "auto-code-runner.pyz",
+                os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
+            )
+            view = memoryview(archive)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise PermissionError("sealed runner archive write failed")
+                view = view[written:]
             os.lseek(descriptor, 0, os.SEEK_SET)
-            if (
-                not stat.S_ISREG(metadata.st_mode)
-                or not metadata.st_mode & 0o111
-                or digest.hexdigest() != entry.content_sha256
-            ):
-                raise PermissionError("ticket runner release executable is invalid")
+            required_seals = fcntl.F_SEAL_SEAL | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE
+            fcntl.fcntl(descriptor, fcntl.F_ADD_SEALS, required_seals)
+            if fcntl.fcntl(descriptor, fcntl.F_GET_SEALS) & required_seals != required_seals:
+                raise PermissionError("sealed runner archive is unavailable")
+        except PermissionError:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise
+        except Exception as error:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise PermissionError("sealed runner archive is unavailable") from error
+        executable = VerifiedExecutable(f"/proc/self/fd/{descriptor}", descriptor)
+        try:
             return self.ticket_invoker.invoke(executable, argv)
         finally:
-            executable.close()
+            os.close(descriptor)
 
     def _maybe_crash(self, marker: str) -> None:
         if self._crash_marker == marker:
@@ -1294,6 +1383,103 @@ def _require_git_object(value: object) -> str:
     ):
         raise ValueError("repair baseline object is invalid")
     return value
+
+
+def capture_runner_archive(
+    root: Path,
+    manifest: tuple[ReleaseManifestEntry, ...],
+    runner_executable: str,
+) -> bytes:
+    return _capture_runner_archive(root, manifest, runner_executable)
+
+
+def _capture_runner_archive(
+    root: Path,
+    manifest: tuple[ReleaseManifestEntry, ...],
+    runner_executable: str,
+) -> bytes:
+    candidate = Path(root)
+    executable = _require_relative_path(runner_executable, "runner executable")
+    if (
+        not candidate.is_absolute()
+        or candidate.is_symlink()
+        or not candidate.is_dir()
+        or not manifest
+        or len(manifest) > MAX_RELEASE_FILES
+        or tuple(sorted(manifest, key=lambda entry: entry.path)) != manifest
+        or len({entry.path for entry in manifest}) != len(manifest)
+    ):
+        raise UnauthorizedRepairError("runner archive release root is invalid")
+    files: dict[str, tuple[int, bytes]] = {}
+    total_bytes = 0
+    root_descriptor = os.open(
+        candidate,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        for entry in manifest:
+            if entry.kind == "directory":
+                continue
+            if entry.kind != "file":
+                raise UnauthorizedRepairError("runner archive cannot contain symbolic links")
+            descriptor = _open_release_file(root_descriptor, entry.path)
+            try:
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != entry.mode:
+                    raise UnauthorizedRepairError("runner archive file metadata changed")
+                if metadata.st_size > MAX_RELEASE_FILE_BYTES or total_bytes + metadata.st_size > MAX_RELEASE_TOTAL_BYTES:
+                    raise UnauthorizedRepairError("runner archive byte limit exceeded")
+                content = bytearray()
+                while chunk := os.read(descriptor, min(65_536, MAX_RELEASE_FILE_BYTES + 1 - len(content))):
+                    content.extend(chunk)
+                    if len(content) > metadata.st_size or total_bytes + len(content) > MAX_RELEASE_TOTAL_BYTES:
+                        raise UnauthorizedRepairError("runner archive file changed during capture")
+                if len(content) != metadata.st_size or hashlib.sha256(content).hexdigest() != entry.content_sha256:
+                    raise UnauthorizedRepairError("runner archive file does not match its manifest")
+                files[entry.path] = (entry.mode, bytes(content))
+                total_bytes += len(content)
+            finally:
+                os.close(descriptor)
+    finally:
+        os.close(root_descriptor)
+    if executable not in files:
+        raise UnauthorizedRepairError("runner archive executable is unavailable")
+    if executable != "__main__.py" and "__main__.py" in files:
+        raise UnauthorizedRepairError("runner archive entrypoint conflicts with release content")
+    files["__main__.py"] = files[executable]
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED, strict_timestamps=True) as archive:
+        for path, (mode, content) in sorted(files.items()):
+            info = zipfile.ZipInfo(path, date_time=(1980, 1, 1, 0, 0, 0))
+            info.create_system = 3
+            info.compress_type = zipfile.ZIP_STORED
+            info.external_attr = (stat.S_IFREG | mode) << 16
+            archive.writestr(info, content)
+    result = output.getvalue()
+    if not result or len(result) > MAX_RELEASE_TOTAL_BYTES + 1_048_576:
+        raise UnauthorizedRepairError("runner archive size is invalid")
+    return result
+
+
+def _open_release_file(root_descriptor: int, relative_path: str) -> int:
+    parts = PurePosixPath(_require_relative_path(relative_path, "runner archive path")).parts
+    directory = os.dup(root_descriptor)
+    try:
+        for part in parts[:-1]:
+            child = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=directory,
+            )
+            os.close(directory)
+            directory = child
+        return os.open(
+            parts[-1],
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=directory,
+        )
+    finally:
+        os.close(directory)
 
 
 def _capture_immutable_release_manifest(root: Path) -> tuple[ReleaseManifestEntry, ...]:

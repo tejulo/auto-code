@@ -24,6 +24,7 @@ from .process import (
     FilesystemEvidenceSink,
     HashVerifiedExecutables,
     LauncherSocketSandbox,
+    PythonArchiveTicketInvoker,
     ProcessRunner,
     SandboxPolicy,
 )
@@ -40,6 +41,7 @@ from .runner import (
     RunnerRegistry,
     TrustedLauncher,
     capture_built_release_manifest,
+    capture_runner_archive,
 )
 from .state import (
     RunStateStore,
@@ -131,6 +133,8 @@ class RepairRuntimeDescriptor:
     release_root: Path
     build_command: tuple[str, ...]
     build_executable_hash: str
+    ticket_interpreter: Path
+    ticket_interpreter_hash: str
     runner_executable: str
     contract_manifest: str
     terminate_command: tuple[str, ...]
@@ -150,7 +154,7 @@ class RepairRuntimeDescriptor:
             "git_executable_hash", "regression_command", "regression_executable_hash", "regression_timeout",
             "environment", "sandbox_policy_hash", "process_runner_version", "sandbox_socket", "sandbox_identity",
             "controlled_home", "secret_paths", "evidence_root", "release_root", "build_command",
-            "build_executable_hash", "runner_executable", "contract_manifest", "terminate_command",
+            "build_executable_hash", "ticket_interpreter", "ticket_interpreter_hash", "runner_executable", "contract_manifest", "terminate_command",
             "terminate_executable_hash", "start_command", "start_executable_hash", "attest_command",
             "attest_executable_hash", "expiry", "nonce",
         }
@@ -260,6 +264,8 @@ class RepairRuntimeDescriptor:
             release_root=_absolute_path(value["release_root"], "runner release root"),
             build_command=tuple(commands["build"]),
             build_executable_hash=_hash(value["build_executable_hash"], "build executable hash"),
+            ticket_interpreter=_absolute_path(value["ticket_interpreter"], "ticket interpreter"),
+            ticket_interpreter_hash=_hash(value["ticket_interpreter_hash"], "ticket interpreter hash"),
             runner_executable=runner_executable,
             contract_manifest=contract_manifest,
             terminate_command=tuple(commands["terminate"]),
@@ -763,6 +769,7 @@ class _ProcessBuilder:
         payload = _read_canonical_json(path, "repair build receipt")
         expected = {
             "effect_id", "root", "release_manifest", "release_manifest_hash", "runner_executable",
+            "runner_archive_hash",
             "repair_source_manifest_hash", "dependency_lock_hash", "contract_hashes",
             "contract_manifest_hash", "build_evidence_hash", "built_at",
         }
@@ -776,6 +783,7 @@ class _ProcessBuilder:
             root=_absolute_path(payload["root"], "built release root"),
             release_manifest=tuple(ReleaseManifestEntry.from_payload(item) for item in manifest),
             release_manifest_hash=_hash(payload["release_manifest_hash"], "release manifest"),
+            runner_archive_hash=_hash(payload["runner_archive_hash"], "runner archive"),
             runner_executable=_relative_path(payload["runner_executable"], "runner executable"),
             repair_source_manifest_hash=_hash(payload["repair_source_manifest_hash"], "repair source manifest"),
             dependency_lock_hash=_hash(payload["dependency_lock_hash"], "dependency lock"),
@@ -857,10 +865,14 @@ class _ProcessBuilder:
         contract_hashes = {Stage(stage): _hash(digest, "built contract") for stage, digest in contracts.items()}
         manifest = capture_built_release_manifest(release)
         manifest_hash = hash_json([entry.payload() for entry in manifest])
+        runner_archive_hash = sha256(
+            capture_runner_archive(release, manifest, self.descriptor.runner_executable)
+        ).hexdigest()
         built = BuiltRunnerRelease(
             root=release,
             release_manifest=manifest,
             release_manifest_hash=manifest_hash,
+            runner_archive_hash=runner_archive_hash,
             runner_executable=self.descriptor.runner_executable,
             repair_source_manifest_hash=source_manifest.content_hash,
             dependency_lock_hash=_hash(dependency_lock_hash, "dependency lock"),
@@ -877,6 +889,7 @@ class _ProcessBuilder:
             "root": str(built.root),
             "release_manifest": [entry.payload() for entry in built.release_manifest],
             "release_manifest_hash": built.release_manifest_hash,
+            "runner_archive_hash": built.runner_archive_hash,
             "runner_executable": built.runner_executable,
             "repair_source_manifest_hash": built.repair_source_manifest_hash,
             "dependency_lock_hash": built.dependency_lock_hash,
@@ -1108,6 +1121,15 @@ class _ProcessLifecycleEffect:
 
 
 @dataclass(frozen=True, slots=True)
+class _LauncherActivationSigner:
+    sandbox: LauncherSocketSandbox
+    timeout: float
+
+    def sign(self, payload: bytes, public_key_hash: str) -> str:
+        return self.sandbox.sign_activation(payload, public_key_hash, timeout=self.timeout)
+
+
+@dataclass(frozen=True, slots=True)
 class ProtectedRepairRuntime:
     descriptor: RepairRuntimeDescriptor
 
@@ -1193,11 +1215,7 @@ class ProtectedRepairRuntime:
             descriptor.registry_root,
             repair_runner_identity=descriptor.repair_runner_identity,
         )
-        store = RunStateStore(
-            descriptor.state_root,
-            descriptor.run_id,
-            repair_activation_verifier=registry,
-        )
+        store = RunStateStore(descriptor.state_root, descriptor.run_id)
         generation = store.load()
         receipt = registry.current_activation()
         journal = RepairJournal(descriptor.state_root, descriptor.request_hash or "")
@@ -1251,6 +1269,8 @@ class ProtectedRepairRuntime:
         if not generation_changed:
             runner.validate_regress_build(request)
         process, evidence, policy, registry = capabilities
+        if not isinstance(process.sandbox, LauncherSocketSandbox):
+            raise RepairRuntimeConfigurationError("ticket runner sandbox is unavailable")
 
         def lifecycle(label: str, command: tuple[str, ...], executable_hash: str) -> _ProcessLifecycleEffect:
             return _ProcessLifecycleEffect(
@@ -1264,11 +1284,7 @@ class ProtectedRepairRuntime:
                 repair_service=repair_service,
             )
 
-        store = RunStateStore(
-            self.descriptor.state_root,
-            self.descriptor.run_id,
-            repair_activation_verifier=registry,
-        )
+        store = RunStateStore(self.descriptor.state_root, self.descriptor.run_id)
         launcher = TrustedLauncher(
             store,
             registry,
@@ -1280,6 +1296,18 @@ class ProtectedRepairRuntime:
                 "attest", self.descriptor.attest_command, self.descriptor.attest_executable_hash
             ),
             repair_service=repair_service,
+            activation_signer=_LauncherActivationSigner(
+                LauncherSocketSandbox(self.descriptor.sandbox_socket, self.descriptor.sandbox_identity),
+                self.descriptor.regression_timeout,
+            ),
+            ticket_invoker=PythonArchiveTicketInvoker(
+                interpreter=self.descriptor.ticket_interpreter,
+                interpreter_hash=self.descriptor.ticket_interpreter_hash,
+                sandbox=process.sandbox,
+                timeout=self.descriptor.regression_timeout,
+                cwd=self.descriptor.repair_repository_root,
+                policy=policy,
+            ),
         )
         activated = launcher.reconcile_activation(self.descriptor.run_id, request.content_hash)
         transaction.complete(activated.state_hash)
@@ -1339,7 +1367,6 @@ class ProtectedRepairRuntime:
             repair_workspace_root=descriptor.repair_workspace_root,
             repair_service=repair_service,
         )
-
     def _compose_process_capabilities(
         self,
         *,
@@ -1366,6 +1393,7 @@ class ProtectedRepairRuntime:
             descriptor.git_executable: descriptor.git_executable_hash,
             Path(descriptor.regression_command[0]): descriptor.regression_executable_hash,
             Path(descriptor.build_command[0]): descriptor.build_executable_hash,
+            descriptor.ticket_interpreter: descriptor.ticket_interpreter_hash,
             Path(descriptor.terminate_command[0]): descriptor.terminate_executable_hash,
             Path(descriptor.start_command[0]): descriptor.start_executable_hash,
             Path(descriptor.attest_command[0]): descriptor.attest_executable_hash,
@@ -1415,7 +1443,7 @@ class ProtectedRepairRuntime:
         )
 
 
-def load_protected_runtime(*, verification_key: bytes | None = None) -> ProtectedRepairRuntime:
+def load_protected_runtime() -> ProtectedRepairRuntime:
     """Authenticate a one-operation launcher descriptor from fixed read-only FD 3."""
     try:
         descriptor = os.dup(_REPAIR_DESCRIPTOR_FD)
@@ -1441,7 +1469,7 @@ def load_protected_runtime(*, verification_key: bytes | None = None) -> Protecte
         signature = envelope["signature"]
         if not isinstance(signature, str) or len(signature) != 128:
             raise ValueError
-        key = _REPAIR_DESCRIPTOR_VERIFICATION_KEY if verification_key is None else verification_key
+        key = _REPAIR_DESCRIPTOR_VERIFICATION_KEY
         if not isinstance(key, bytes) or len(key) != 32:
             raise ValueError
         Ed25519PublicKey.from_public_bytes(key).verify(bytes.fromhex(signature), canonical_json_bytes(payload))
@@ -1471,12 +1499,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(
     argv: Sequence[str] | None = None,
-    *,
-    runtime: ProtectedRepairRuntime | None = None,
 ) -> int:
     try:
         args = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
-        protected = runtime if runtime is not None else load_protected_runtime()
+        protected = load_protected_runtime()
         if args.command == "prepare":
             revision = int(args.expected_revision)
             handle = protected.prepare(args.run, revision, args.expected_hash, args.failure)

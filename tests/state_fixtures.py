@@ -255,6 +255,7 @@ def activation_request(
                 source_sha="5" * 64,
                 dependency_lock_hash="6" * 64,
                 contract_bundle_hash="7" * 64,
+                runner_archive_hash="8" * 64,
                 built_at=NOW,
             ),
         )

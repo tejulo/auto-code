@@ -3,11 +3,13 @@ from __future__ import annotations
 from dataclasses import replace
 from hashlib import sha256
 import array
+import fcntl
 import json
 import os
 from pathlib import Path
 import socket
 import subprocess
+import sys
 import threading
 
 import pytest
@@ -27,6 +29,7 @@ from auto_code.process import (
     ManagedProcessStartError,
     ProcessConfigurationError,
     ProcessRunner,
+    PythonArchiveTicketInvoker,
     SandboxCompleted,
     SandboxStartError,
     SandboxPolicyHandoff,
@@ -445,6 +448,70 @@ def test_launcher_socket_executes_the_verified_descriptor_after_path_replacement
     assert result.returncode == 0
     assert result.stdout_text == "trusted-descriptor"
     assert executable.read_bytes() == b"#!/bin/sh\nprintf mutable-path"
+
+
+def test_production_ticket_invoker_uses_pinned_interpreter_sealed_archive_and_sanitized_environment(
+    tmp_path: Path,
+    sandbox_policy: SandboxPolicy,
+) -> None:
+    socket_path = tmp_path / "ticket-launcher.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(1)
+    observed: dict[str, object] = {}
+
+    def serve() -> None:
+        connection, _ = listener.accept()
+        with connection:
+            descriptors = array.array("i")
+            raw, ancillary, _, _ = connection.recvmsg(
+                65_536,
+                socket.CMSG_SPACE(2 * descriptors.itemsize),
+            )
+            for level, kind, data in ancillary:
+                if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                    descriptors.frombytes(data[: len(data) - (len(data) % descriptors.itemsize)])
+            while not raw.endswith(b"\n"):
+                raw += connection.recv(65_536)
+            observed.update(json.loads(raw))
+            observed["descriptor_count"] = len(descriptors)
+            observed["archive"] = os.pread(descriptors[1], 64, 0) if len(descriptors) == 2 else b""
+            for descriptor in descriptors:
+                os.close(descriptor)
+            connection.sendall(canonical_json_bytes({"returncode": 0, "stdout": "ok", "stderr": ""}) + b"\n")
+
+    thread = threading.Thread(target=serve)
+    thread.start()
+    archive_descriptor = os.memfd_create("runner.pyz", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+    os.write(archive_descriptor, b"immutable archive")
+    required_seals = fcntl.F_SEAL_SEAL | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE
+    fcntl.fcntl(archive_descriptor, fcntl.F_ADD_SEALS, required_seals)
+    interpreter = Path(sys.executable).resolve()
+    try:
+        result = PythonArchiveTicketInvoker(
+            interpreter=interpreter,
+            interpreter_hash=sha256(interpreter.read_bytes()).hexdigest(),
+            sandbox=LauncherSocketSandbox(socket_path, "launcher"),
+            timeout=3,
+            cwd=sandbox_policy.project_root,
+            policy=sandbox_policy,
+        ).invoke(VerifiedExecutable("/proc/self/fd/archive", archive_descriptor), ("status",))
+    finally:
+        os.close(archive_descriptor)
+        thread.join(timeout=3)
+        listener.close()
+
+    assert result == SandboxCompleted(0, "ok", "")
+    assert observed["operation"] == "run_python_archive"
+    assert observed["argv"] == ["status"]
+    assert observed["descriptor_count"] == 2
+    assert observed["archive"] == b"immutable archive"
+    assert observed["environment"] == {
+        "HOME": str(sandbox_policy.controlled_home),
+        "PIP_NO_INDEX": "1",
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+        "npm_config_offline": "true",
+    }
 
 
 def test_runner_rejects_a_working_directory_symlink_to_authoritative_state(sandbox_policy: SandboxPolicy) -> None:

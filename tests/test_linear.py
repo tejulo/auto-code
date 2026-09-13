@@ -254,6 +254,7 @@ def preparation_generation(
             source_sha="5" * 64,
             dependency_lock_hash="6" * 64,
             contract_bundle_hash="7" * 64,
+            runner_archive_hash="8" * 64,
             built_at=NOW,
         ),
     )
@@ -1822,6 +1823,7 @@ def test_activation_rejects_a_forged_bridge_reference_before_journal_or_state_pu
             source_sha="5" * 64,
             dependency_lock_hash="6" * 64,
             contract_bundle_hash="7" * 64,
+            runner_archive_hash="8" * 64,
             built_at=NOW,
         ),
     )

@@ -465,7 +465,6 @@ def _make_store_receipt_authority_binding() -> tuple[
 
 
 _BIND_STORE_RECEIPT_AUTHORITY, _RESOLVE_STORE_RECEIPT_AUTHORITY = _make_store_receipt_authority_binding()
-_BIND_REPAIR_ACTIVATION_VERIFIER, _RESOLVE_REPAIR_ACTIVATION_VERIFIER = _make_store_receipt_authority_binding()
 
 
 class RunStateStore:
@@ -478,7 +477,6 @@ class RunStateStore:
         *,
         authorization_verifier: AuthorizationVerifier | None = None,
         receipt_authority: BridgeReceiptAuthority | None = None,
-        repair_activation_verifier: object | None = None,
     ) -> None:
         self.root = _normalize_state_root(root)
         if receipt_authority is not None and (
@@ -495,15 +493,10 @@ class RunStateStore:
         self.current_path = self.run_dir / "current.json"
         self.lock_path = self.locks_dir / f"run-{hash_json(self.run_id)}.lock"
         _BIND_STORE_RECEIPT_AUTHORITY(self, receipt_authority)
-        _BIND_REPAIR_ACTIVATION_VERIFIER(self, repair_activation_verifier)
 
     @property
     def receipt_authority(self) -> BridgeReceiptAuthority | None:
         return _RESOLVE_STORE_RECEIPT_AUTHORITY(self)
-
-    @property
-    def repair_activation_verifier(self) -> object | None:
-        return _RESOLVE_REPAIR_ACTIVATION_VERIFIER(self)
 
     @classmethod
     def load_read_only(cls, root: Path, run_id: str) -> StateGeneration:
@@ -517,7 +510,6 @@ class RunStateStore:
         store.generations_dir = _ensure_directory(store.root, store.run_dir / "generations", create=False)
         store.current_path = store.run_dir / "current.json"
         _BIND_STORE_RECEIPT_AUTHORITY(store, None)
-        _BIND_REPAIR_ACTIVATION_VERIFIER(store, None)
         return store.load_locked()
 
     def generation_path(self, revision: int, state_hash: str) -> Path:
@@ -671,7 +663,14 @@ class RunStateStore:
             self._validate_initial_state(state)
             return state
         self._validate_pending_lifecycle(previous_generation, state)
-        for field in ("run_id", "ticket_id", "repository_id", "max_crew_iterations"):
+        for field in (
+            "run_id",
+            "ticket_id",
+            "repository_id",
+            "max_crew_iterations",
+            "repair_activation_public_key",
+            "repair_activation_public_key_hash",
+        ):
             if getattr(previous, field) != getattr(state, field):
                 raise InvalidStateTransition(f"immutable field {field} cannot change")
         if previous.has_preparation_binding != state.has_preparation_binding:
@@ -707,15 +706,58 @@ class RunStateStore:
             return state
         appended_authorizations = self._validate_appended_authorizations(previous, state)
         if previous.disposition is RunDisposition.REPAIR_REQUIRED and state.disposition is RunDisposition.ACTIVE:
-            verifier = _RESOLVE_REPAIR_ACTIVATION_VERIFIER(self)
-            verify = getattr(verifier, "verify_transition", None)
-            if not callable(verify) or not verify(previous_generation, state):
-                raise InvalidStateTransition("repair activation transition is not verified")
+            self._verify_repair_activation(previous_generation, state)
         self._validate_iteration_transition(previous, state)
         self._validate_task_transition(previous, state)
         self._validate_disposition_transition(previous, state, appended_authorizations)
         self._validate_preparation_transition(previous, state, appended_authorizations)
         return state
+
+    def _verify_repair_activation(self, previous: StateGeneration, state: RunState) -> None:
+        error = "repair activation transition is not verified"
+        try:
+            from .runner import RunnerActivationReceipt
+
+            old = previous.state
+            request_hash = state.restart_receipt_request_hash
+            if (
+                old.repair_activation_public_key is None
+                or old.repair_activation_public_key_hash is None
+                or request_hash is None
+                or state.restart_receipt_hash is None
+                or old.runner_identity is None
+                or state.runner_identity is None
+                or not old.failure_history
+            ):
+                raise ValueError
+            public_key = bytes.fromhex(old.repair_activation_public_key)
+            if hashlib.sha256(public_key).hexdigest() != old.repair_activation_public_key_hash:
+                raise ValueError
+            receipt = RunnerActivationReceipt.from_payload(
+                _read_canonical_json(
+                    self.root / "runner-activations" / f"{_require_sha256(request_hash, 'repair request')}.json",
+                    "runner activation receipt",
+                )
+            )
+            receipt.verify_signature(public_key)
+            failure_hash = hash_json(
+                old.failure_history[-1].model_dump(mode="json", round_trip=True)
+            )
+            if (
+                receipt.content_hash != state.restart_receipt_hash
+                or receipt.request_hash != request_hash
+                or receipt.run_id != old.run_id
+                or receipt.expected_revision != previous.revision
+                or receipt.expected_state_hash != previous.state_hash
+                or receipt.failure_hash != failure_hash
+                or receipt.old_runner_identity != old.runner_identity
+                or receipt.new_runner_identity != state.runner_identity
+                or receipt.project_policy_hash != old.project_policy_hash
+                or receipt.activation_public_key_hash != old.repair_activation_public_key_hash
+            ):
+                raise ValueError
+        except Exception:
+            raise InvalidStateTransition(error) from None
 
     @staticmethod
     def _validate_initial_state(state: RunState, *, require_preparation_binding: bool = False) -> None:
@@ -739,7 +781,14 @@ class RunStateStore:
                     "runner_identity": state.runner_identity,
                 }
             )
-        elif state.preparation_phase is PreparationPhase.SELECTED and state.disposition is RunDisposition.HUMAN_REVIEW:
+        if state.repair_activation_public_key is not None:
+            values.update(
+                {
+                    "repair_activation_public_key": state.repair_activation_public_key,
+                    "repair_activation_public_key_hash": state.repair_activation_public_key_hash,
+                }
+            )
+        if state.preparation_phase is PreparationPhase.SELECTED and state.disposition is RunDisposition.HUMAN_REVIEW:
             values["disposition"] = RunDisposition.HUMAN_REVIEW
         initial = RunState(**values)
         if state != initial:

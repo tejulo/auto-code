@@ -4,6 +4,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 import array
+import fcntl
 import hashlib
 import hmac
 import json
@@ -305,12 +306,81 @@ class LauncherSocketSandbox:
         receipt = _require_effect_hash(payload["receipt_hash"])
         return SandboxCompleted(payload["returncode"], payload["stdout"], payload["stderr"]), receipt
 
+    def sign_activation(self, payload: bytes, public_key_hash: str, *, timeout: float) -> str:
+        if not isinstance(payload, bytes) or not payload or len(payload) > 65_536:
+            raise ProcessConfigurationError("Activation signing payload is invalid")
+        _require_effect_hash(public_key_hash)
+        response = self._exchange(
+            {
+                "schema_version": "v1",
+                "sandbox_identity": self.identity,
+                "operation": "sign_activation",
+                "payload_hex": payload.hex(),
+                "public_key_hash": public_key_hash,
+            },
+            timeout,
+        )
+        if (
+            not isinstance(response, dict)
+            or set(response) != {"public_key_hash", "signature"}
+            or response.get("public_key_hash") != public_key_hash
+            or not isinstance(response.get("signature"), str)
+            or len(response["signature"]) != 128
+            or any(character not in "0123456789abcdef" for character in response["signature"])
+        ):
+            raise ProcessConfigurationError("Activation signing response is invalid")
+        return response["signature"]
+
+    def run_python_archive(
+        self,
+        interpreter: VerifiedExecutable,
+        archive: VerifiedExecutable,
+        argv: tuple[str, ...],
+        *,
+        timeout: float,
+        env: Mapping[str, str],
+        policy: SandboxPolicyHandoff,
+    ) -> SandboxCompleted:
+        response = self._exchange(
+            {
+                "schema_version": "v1",
+                "sandbox_identity": self.identity,
+                "operation": "run_python_archive",
+                "argv": list(argv),
+                "interpreter_via_fd": True,
+                "archive_via_fd": True,
+                "timeout": timeout,
+                "environment": dict(env),
+                "policy": {
+                    "cwd": str(policy.cwd.path),
+                    "project_root": str(policy.project_root.path),
+                    "readable_roots": [str(directory.path) for directory in policy.readable_roots],
+                    "writable_roots": [str(directory.path) for directory in policy.writable_roots],
+                    "controlled_home": str(policy.controlled_home.path),
+                    "dynamic_downloads_disabled": policy.dynamic_downloads_disabled,
+                },
+            },
+            timeout,
+            executable_descriptors=(interpreter.descriptor, archive.descriptor),
+        )
+        if (
+            not isinstance(response, dict)
+            or set(response) != {"returncode", "stdout", "stderr"}
+            or isinstance(response["returncode"], bool)
+            or not isinstance(response["returncode"], int)
+            or not isinstance(response["stdout"], (str, bytes))
+            or not isinstance(response["stderr"], (str, bytes))
+        ):
+            raise ProcessConfigurationError("Python archive response is invalid")
+        return SandboxCompleted(response["returncode"], response["stdout"], response["stderr"])
+
     def _exchange(
         self,
         request: Mapping[str, object],
         timeout: float,
         *,
         executable_descriptor: int | None = None,
+        executable_descriptors: tuple[int, ...] = (),
     ) -> object:
         metadata = os.lstat(self.socket_path)
         if not stat.S_ISSOCK(metadata.st_mode) or (metadata.st_dev, metadata.st_ino) != (self._device, self._inode):
@@ -319,10 +389,15 @@ class LauncherSocketSandbox:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as transport:
             transport.settimeout(timeout)
             transport.connect(str(self.socket_path))
-            if executable_descriptor is None:
+            descriptors_to_send = (
+                executable_descriptors
+                if executable_descriptor is None
+                else (executable_descriptor, *executable_descriptors)
+            )
+            if not descriptors_to_send:
                 transport.sendall(raw)
             else:
-                descriptors = array.array("i", (executable_descriptor,))
+                descriptors = array.array("i", descriptors_to_send)
                 sent = transport.sendmsg(
                     (raw,),
                     ((socket.SOL_SOCKET, socket.SCM_RIGHTS, descriptors),),
@@ -646,6 +721,57 @@ class HashVerifiedExecutables:
         except BaseException:
             os.close(descriptor)
             raise
+
+
+class PythonArchiveTicketInvoker:
+    """Execute a sealed runner archive through a pinned interpreter and launcher sandbox."""
+
+    def __init__(
+        self,
+        *,
+        interpreter: Path,
+        interpreter_hash: str,
+        sandbox: LauncherSocketSandbox,
+        timeout: float,
+        cwd: Path,
+        policy: SandboxPolicy,
+    ) -> None:
+        if not isinstance(sandbox, LauncherSocketSandbox):
+            raise ProcessConfigurationError("Ticket archive sandbox is invalid")
+        self.interpreter = str(_absolute_policy_path(interpreter))
+        self.executables = HashVerifiedExecutables({interpreter: interpreter_hash})
+        self.sandbox = sandbox
+        self.timeout = _positive_timeout(timeout)
+        self.cwd = policy.command_cwd(cwd)
+        self.policy = policy
+
+    def invoke(self, archive: VerifiedExecutable, argv: tuple[str, ...]) -> SandboxCompleted:
+        required_seals = fcntl.F_SEAL_SEAL | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE
+        try:
+            if fcntl.fcntl(archive.descriptor, fcntl.F_GET_SEALS) & required_seals != required_seals:
+                raise ProcessConfigurationError("Ticket runner archive is not sealed")
+        except OSError as error:
+            raise ProcessConfigurationError("Ticket runner archive is not sealed") from error
+        command = _command_argv(argv)
+        if len(command) > 64 or any(len(argument) > 4_096 for argument in command):
+            raise ProcessConfigurationError("Ticket runner arguments are invalid")
+        interpreter = self.executables.require_absolute_verified(self.interpreter)
+        handoff = self.policy.prepare_handoff(self.cwd)
+        try:
+            completed = self.sandbox.run_python_archive(
+                interpreter,
+                archive,
+                command,
+                timeout=self.timeout,
+                env=self.policy.command_environment({}),
+                policy=handoff,
+            )
+            if completed.returncode != 0:
+                raise ProcessBoundaryError(f"Ticket runner failed with status {completed.returncode}")
+            return completed
+        finally:
+            handoff.close()
+            interpreter.close()
 
 
 class ProcessRunner:

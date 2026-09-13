@@ -2233,9 +2233,12 @@ class RunnerIdentity(ContractModel):
     source_sha: Sha256
     dependency_lock_hash: Sha256
     contract_bundle_hash: Sha256
+    runner_archive_hash: Sha256
     built_at: datetime
 
-    @field_validator("content_hash", "source_sha", "dependency_lock_hash", "contract_bundle_hash")
+    @field_validator(
+        "content_hash", "source_sha", "dependency_lock_hash", "contract_bundle_hash", "runner_archive_hash"
+    )
     @classmethod
     def normalize_runner_hashes(cls, value: str) -> str:
         return canonical_text(value, "Runner identity hash").lower()
@@ -2666,7 +2669,10 @@ class RunState(ContractModel):
     human_authorizations: tuple[HumanAuthorization, ...] = ()
     runner_identity: RunnerIdentity | None = None
     repair_runner_identity: RepairRunnerIdentity | None = None
+    repair_activation_public_key: Sha256 | None = None
+    repair_activation_public_key_hash: Sha256 | None = None
     restart_receipt_hash: RestartReceiptHash | None = None
+    restart_receipt_request_hash: RestartReceiptHash | None = None
     pending_external_request: PendingExternalRequest | None = None
     prefinalization_ticket_projection: str | None = None
     commit_sha: str | None = None
@@ -2682,6 +2688,9 @@ class RunState(ContractModel):
         "ticket_snapshot_hash",
         "compatibility_receipt_hash",
         "product_change_manifest_hash",
+        "repair_activation_public_key",
+        "repair_activation_public_key_hash",
+        "restart_receipt_request_hash",
     )
     @classmethod
     def normalize_preparation_binding_hashes(cls, value: str | None) -> str | None:
@@ -2726,8 +2735,17 @@ class RunState(ContractModel):
                 raise ValueError("Compatibility receipt hash does not match its reference")
         elif self.preparation_phase is not PreparationPhase.SELECTED or self.compensated:
             raise ValueError("Preparation state requires a complete preparation binding")
+        if (self.repair_activation_public_key is None) != (self.repair_activation_public_key_hash is None):
+            raise ValueError("Repair activation trust binding must be complete")
+        if self.repair_activation_public_key is not None and (
+            hashlib.sha256(bytes.fromhex(self.repair_activation_public_key)).hexdigest()
+            != self.repair_activation_public_key_hash
+        ):
+            raise ValueError("Repair activation public key hash does not match")
         if (self.product_change_manifest is None) != (self.product_change_manifest_hash is None):
             raise ValueError("Product Change Manifest reference and hash must be bound together")
+        if (self.restart_receipt_hash is None) != (self.restart_receipt_request_hash is None):
+            raise ValueError("Repair activation receipt reference and hash must be bound together")
         if self.crew_iteration_count > self.authorized_iteration_limit:
             raise ValueError("Crew Iteration count exceeds authorized limit")
         if self.iteration_open and self.crew_iteration_count == 0:
@@ -2930,6 +2948,8 @@ class SelectedActivationClaimRequest(ContractModel):
     ticket_snapshot: TicketSnapshot
     original_state_id: str
     original_external_revision: str
+    repair_activation_public_key: Sha256
+    repair_activation_public_key_hash: Sha256
 
     @field_validator("expected_index_hash")
     @classmethod
@@ -2956,6 +2976,11 @@ class SelectedActivationClaimRequest(ContractModel):
             reject_unsafe_persisted_value(self.original_external_revision)
         except ValueError:
             raise ValueError("Selected activation claim is invalid") from None
+        if (
+            hashlib.sha256(bytes.fromhex(self.repair_activation_public_key)).hexdigest()
+            != self.repair_activation_public_key_hash
+        ):
+            raise ValueError("Selected activation repair trust binding is invalid")
         return self
 
 
