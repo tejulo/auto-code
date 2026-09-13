@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+import os
 from pathlib import Path
 import socket
 from typing import Protocol
@@ -130,6 +131,8 @@ class FinalizationArtifactAuthority:
             "design": Stage.ARCHITECT_DESIGN,
             "tasks": Stage.ARCHITECT_TASKS,
         }
+        if len({output.stage for output in state.stage_outputs}) != len(state.stage_outputs):
+            raise FinalizationArtifactError("duplicate OpenSpec stage outputs")
         outputs = {output.stage: output.content_hash for output in state.stage_outputs}
         artifact_hashes = {name: outputs.get(stage) for name, stage in stages.items()}
         if any(value is None for value in artifact_hashes.values()) or artifact_hashes != dict(review.artifact_hashes):
@@ -192,9 +195,19 @@ class FinalizationLauncher:
 
     def serve(self, run_id: str, expected_revision: int, expected_generation_hash: str) -> None:
         generation = self._load_exact(run_id, expected_revision, expected_generation_hash)
-        self._finalizer_for(generation).advance(generation)
+        self._service_for(generation).invoke_launcher(
+            FinalizationRequest(
+                operation="finalize",
+                run_id=generation.state.run_id,
+                expected_revision=generation.revision,
+                expected_state_hash=generation.state_hash,
+                request_id=None,
+                nonce=os.urandom(32).hex(),
+            )
+        )
 
     def _service_for(self, generation: StateGeneration) -> _LauncherFinalizationService:
+        self._require_active_run(generation)
         key_hash = generation.state.finalization_public_key_hash
         if key_hash is None or generation.state.finalization_public_key is None:
             raise FinalizationLauncherError("finalization trust is unavailable")
@@ -210,6 +223,26 @@ class FinalizationLauncher:
                 receipt=lambda request: self._handle_receipt(generation, request),
             ),
         )
+
+    def _require_active_run(self, generation: StateGeneration) -> None:
+        index = self._runtime.active_run_index
+        lookup = getattr(index, "lookup", None)
+        if not callable(lookup):
+            raise FinalizationLauncherError("Active Run Index is unavailable")
+        active = lookup(generation.state.repository_id)
+        index_hash = getattr(active, "index_hash", None)
+        if (
+            active is None
+            or getattr(active, "repository_id", None) != generation.state.repository_id
+            or getattr(active, "run_id", None) != generation.state.run_id
+            or not isinstance(getattr(active, "index_revision", None), int)
+            or getattr(active, "index_revision") < 1
+            or not isinstance(index_hash, str)
+            or len(index_hash) != 64
+            or any(character not in "0123456789abcdef" for character in index_hash)
+            or Path(getattr(active, "state_root", "")) != self._state_root
+        ):
+            raise FinalizationLauncherError("Active Run Index does not match finalization state")
 
     def _handle_finalize(self, generation: StateGeneration, request: FinalizationRequest) -> StepResult:
         self._require_request(generation, request)

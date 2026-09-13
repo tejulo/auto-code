@@ -651,6 +651,17 @@ class _LauncherFinalizationService:
             if record["status"] != "issued":
                 raise FinalizationServiceError("capability is replayed")
             _atomic_replace_json(self._record_path(request.nonce), {"descriptor": descriptor.payload(), "status": "consumed", "response": None})
+        result = self.invoke_launcher(request)
+        response = self._response(request, result=result, error=None)
+        with _interprocess_lock(self._record_root / "lock"):
+            _atomic_replace_json(self._record_path(request.nonce), {"descriptor": descriptor.payload(), "status": "completed", "response": response.payload()})
+        return response
+
+    def invoke_launcher(self, request: FinalizationRequest) -> StepResult:
+        """Run a launcher-originated request through the same handler validation as IPC."""
+
+        if not isinstance(request, FinalizationRequest):
+            raise FinalizationServiceError("finalization request is invalid")
         handler = self._handlers.finalize if request.operation == "finalize" else self._handlers.receipt
         try:
             result = handler(request)
@@ -658,10 +669,7 @@ class _LauncherFinalizationService:
             raise FinalizationServiceError("finalization operation is unavailable") from error
         if not isinstance(result, StepResult):
             raise FinalizationServiceError("finalization response is invalid")
-        response = self._response(request, result=result, error=None)
-        with _interprocess_lock(self._record_root / "lock"):
-            _atomic_replace_json(self._record_path(request.nonce), {"descriptor": descriptor.payload(), "status": "completed", "response": response.payload()})
-        return response
+        return result
 
     def _record_path(self, nonce: str) -> Path:
         return self._record_root / f"{nonce}.json"

@@ -18,6 +18,7 @@ from auto_code.finalization_service import (
     FinalizationCapabilityDescriptor,
     FinalizationCapabilityError,
     FinalizationKeyAuthority,
+    FinalizationRequest,
     FinalizationServiceError,
     FinalizationTrustMaterial,
     _FinalizationHandlers as FinalizationHandlers,
@@ -763,3 +764,24 @@ def test_finalization_commands_do_not_accept_composition_callbacks() -> None:
 
     with pytest.raises(TypeError):
         main(["finalize"], finalizer_factory=lambda _: object())
+
+
+def test_launcher_internal_dispatch_uses_the_protected_handler_path(
+    service: FinalizationService,
+    handlers: RecordingHandlers,
+) -> None:
+    """Bypassing service handler validation would let the launcher invoke a finalizer directly."""
+
+    result = service.invoke_launcher(
+        FinalizationRequest(
+            operation="finalize",
+            run_id="run-1",
+            expected_revision=3,
+            expected_state_hash="a" * 64,
+            request_id=None,
+            nonce="b" * 64,
+        )
+    )
+
+    assert result.kind is StepKind.READY_TO_FINALIZE
+    assert handlers.calls == [("finalize", "run-1", 3, "a" * 64, None)]
