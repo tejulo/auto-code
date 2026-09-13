@@ -33,6 +33,7 @@ from auto_code.contracts import (
 )
 from auto_code.hashing import canonical_json_bytes, hash_json
 from auto_code.compatibility import CompatibilityPreflightError, CompatibilityPreflightResult, CompatibilityReceiptAuthority
+from auto_code.finalization_service import FinalizationKeyAuthority
 from auto_code.linear import LinearGateway
 from auto_code.mcp_bridge import McpToolResult, TrustedLinearBridge, _sign
 from auto_code.git import BranchBinding, BranchReuseError
@@ -59,12 +60,6 @@ TEST_REPAIR_ACTIVATION_PUBLIC_KEY = Ed25519PrivateKey.generate().public_key().pu
     encoding=serialization.Encoding.Raw,
     format=serialization.PublicFormat.Raw,
 )
-TEST_FINALIZATION_PUBLIC_KEY = Ed25519PrivateKey.generate().public_key().public_bytes(
-    encoding=serialization.Encoding.Raw,
-    format=serialization.PublicFormat.Raw,
-)
-
-
 @pytest.fixture
 def verified_context() -> PreparationContext:
     ticket_snapshot = TicketSnapshot.from_untrusted(
@@ -452,6 +447,7 @@ def test_selected_activation_with_real_index_publishes_context_with_its_initial_
         reservation_owner=lambda: ReservationOwner(host="test-host", pid=1),
         now=lambda: NOW,
         repair_activation_public_key=repair_activation_public_key,
+        finalization_keys=FinalizationKeyAuthority(tmp_path),
     )
 
     probe = coordinator.probe(repository)
@@ -484,6 +480,7 @@ def test_selected_activation_with_real_index_publishes_context_with_its_initial_
         reservation_owner=lambda: ReservationOwner(host="test-host", pid=1),
         now=lambda: NOW,
         repair_activation_public_key=repair_activation_public_key,
+        finalization_keys=FinalizationKeyAuthority(tmp_path),
     )
 
     assert restarted.activate_reservation(tmp_path / reference.relative_path, reference.input_hash, probe.challenge) == result
@@ -517,7 +514,7 @@ def test_malformed_external_revision_rejects_before_compatibility_preflight(tmp_
     index = ActiveRunIndex(tmp_path, preparation_input_verifier=bridge)
     runner = RunnerIdentity(content_hash="1" * 64, source_sha="2" * 64, dependency_lock_hash="3" * 64, contract_bundle_hash="4" * 64, runner_archive_hash="5" * 64, built_at=NOW)
     compatibility = FakeCompatibilityVerifier(FakeCompatibilityResult(FakeCompatibilityReceipt("5" * 64, "6" * 64, runner), EvidenceRef(relative_path="trusted-launcher/compatibility/11111111-1111-4111-8111-111111111111.json", sha256="5" * 64, media_type="application/json", creator="trusted-launcher")))
-    coordinator = PrepareCoordinator(index=index, bridge=bridge, git=FakeGitGuard(repository), compatibility=compatibility, runtime_config="runtime-config", role_config="role-config", reservation_owner=lambda: ReservationOwner(host="test-host", pid=1), now=lambda: NOW, repair_activation_public_key=TEST_REPAIR_ACTIVATION_PUBLIC_KEY)
+    coordinator = PrepareCoordinator(index=index, bridge=bridge, git=FakeGitGuard(repository), compatibility=compatibility, runtime_config="runtime-config", role_config="role-config", reservation_owner=lambda: ReservationOwner(host="test-host", pid=1), now=lambda: NOW, repair_activation_public_key=TEST_REPAIR_ACTIVATION_PUBLIC_KEY, finalization_keys=FinalizationKeyAuthority(tmp_path))
     probe = coordinator.probe(repository)
     assert probe.challenge is not None
     reference = bridge.query_preparation(probe.challenge, {"operation": "prepare"}, repository_id="repo-1", reservation_id=probe.reservation_id or "")
@@ -552,6 +549,7 @@ def test_probe_reports_a_real_index_reservation_as_blocked_without_loading_input
         reservation_owner=lambda: ReservationOwner(host="this-host", pid=1),
         now=lambda: NOW,
         repair_activation_public_key=TEST_REPAIR_ACTIVATION_PUBLIC_KEY,
+        finalization_keys=FinalizationKeyAuthority(tmp_path),
     )
 
     result = coordinator.probe(repository)
@@ -612,7 +610,7 @@ def test_public_activation_rejects_malformed_bridge_backed_selection_inputs_befo
             invalid_input = PreparationInput.model_construct(**{**preparation_input.model_dump(round_trip=True), "max_crew_iterations": 0})
             return invalid_reference, invalid_input
 
-    coordinator = PrepareCoordinator(index=index, bridge=MalformedBridge(), git=FakeGitGuard(repository), compatibility=compatibility, runtime_config="runtime-config", role_config="role-config", reservation_owner=lambda: ReservationOwner(host="test-host", pid=1), now=lambda: NOW, repair_activation_public_key=TEST_REPAIR_ACTIVATION_PUBLIC_KEY)
+    coordinator = PrepareCoordinator(index=index, bridge=MalformedBridge(), git=FakeGitGuard(repository), compatibility=compatibility, runtime_config="runtime-config", role_config="role-config", reservation_owner=lambda: ReservationOwner(host="test-host", pid=1), now=lambda: NOW, repair_activation_public_key=TEST_REPAIR_ACTIVATION_PUBLIC_KEY, finalization_keys=FinalizationKeyAuthority(tmp_path))
     probe = coordinator.probe(repository)
     assert probe.challenge is not None
     reference = bridge.query_preparation(probe.challenge, {"operation": "prepare"}, repository_id="repo-1", reservation_id=probe.reservation_id or "")
@@ -681,6 +679,7 @@ def test_index_owned_preflight_complete_claim_allows_a_fresh_coordinator_to_publ
             receipt_ref=receipt_ref,
         )
     )
+    finalization_keys = FinalizationKeyAuthority(tmp_path)
     first = PrepareCoordinator(
         index=index,
         bridge=bridge,
@@ -691,6 +690,7 @@ def test_index_owned_preflight_complete_claim_allows_a_fresh_coordinator_to_publ
         reservation_owner=lambda: ReservationOwner(host="test-host", pid=1),
         now=lambda: NOW,
         repair_activation_public_key=TEST_REPAIR_ACTIVATION_PUBLIC_KEY,
+        finalization_keys=finalization_keys,
     )
     probe = first.probe(repository)
     assert probe.challenge is not None
@@ -711,6 +711,7 @@ def test_index_owned_preflight_complete_claim_allows_a_fresh_coordinator_to_publ
         pagination_complete=True,
         source_page_hashes=loaded_reference.source_page_hashes,
     )
+    finalization_binding = finalization_keys.provision(probe.reservation_id or "")
     claim_request = SelectedActivationClaimRequest(
         reservation_id=probe.reservation_id or "",
         repository_id="repo-1",
@@ -722,8 +723,8 @@ def test_index_owned_preflight_complete_claim_allows_a_fresh_coordinator_to_publ
         original_external_revision="revision-1",
         repair_activation_public_key=TEST_REPAIR_ACTIVATION_PUBLIC_KEY.hex(),
         repair_activation_public_key_hash=hashlib.sha256(TEST_REPAIR_ACTIVATION_PUBLIC_KEY).hexdigest(),
-        finalization_public_key=TEST_FINALIZATION_PUBLIC_KEY.hex(),
-        finalization_public_key_hash=hashlib.sha256(TEST_FINALIZATION_PUBLIC_KEY).hexdigest(),
+        finalization_public_key=finalization_binding.public_key,
+        finalization_public_key_hash=finalization_binding.public_key_hash,
     )
 
     claim = index.claim_selected_activation(claim_request)
@@ -750,7 +751,7 @@ def test_index_owned_preflight_complete_claim_allows_a_fresh_coordinator_to_publ
         reservation_owner=lambda: ReservationOwner(host="other-host", pid=2),
         now=lambda: NOW.replace(day=12),
         repair_activation_public_key=TEST_REPAIR_ACTIVATION_PUBLIC_KEY,
-        finalization_public_key=TEST_FINALIZATION_PUBLIC_KEY,
+        finalization_keys=finalization_keys,
     )
     result = restarted.activate_reservation(tmp_path / reference.relative_path, reference.input_hash, probe.challenge)
 
@@ -855,7 +856,7 @@ def test_concurrent_selected_activation_waits_without_a_second_compatibility_pre
     index = ActiveRunIndex(tmp_path, preparation_input_verifier=bridge)
     compatibility = BlockingCompatibility()
     def coordinator(owner: ReservationOwner) -> PrepareCoordinator:
-        return PrepareCoordinator(index=index, bridge=bridge, git=FakeGitGuard(repository), compatibility=compatibility, runtime_config="runtime-config", role_config="role-config", reservation_owner=lambda: owner, now=lambda: NOW, repair_activation_public_key=TEST_REPAIR_ACTIVATION_PUBLIC_KEY, finalization_public_key=TEST_FINALIZATION_PUBLIC_KEY)
+        return PrepareCoordinator(index=index, bridge=bridge, git=FakeGitGuard(repository), compatibility=compatibility, runtime_config="runtime-config", role_config="role-config", reservation_owner=lambda: owner, now=lambda: NOW, repair_activation_public_key=TEST_REPAIR_ACTIVATION_PUBLIC_KEY, finalization_keys=FinalizationKeyAuthority(tmp_path))
 
     first = coordinator(ReservationOwner(host="first-host", pid=1))
     probe = first.probe(repository)
@@ -1004,6 +1005,7 @@ class PreparationReconciliationHarness:
             reservation_owner=lambda: ReservationOwner(host="test-host", pid=1),
             now=lambda: NOW,
             repair_activation_public_key=TEST_REPAIR_ACTIVATION_PUBLIC_KEY,
+            finalization_keys=FinalizationKeyAuthority(self.root),
             linear=linear,
             context=context,
         )

@@ -8,8 +8,6 @@ import hmac
 from pathlib import Path
 from typing import Literal, Protocol
 
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from pydantic import ValidationError
 
 from .contracts import (
@@ -42,6 +40,7 @@ from .contracts import (
 )
 from .git import BranchBinding, BranchReuseError
 from .compatibility import CompatibilityPreflightError, load_descriptor_bound_policy
+from .finalization_service import FinalizationKeyAuthority
 from .hashing import hash_json
 from .linear import LinearGateway, select_ticket
 from .run_index import ActivationResult, IndexProbeResult, PreparationReservation, ReservationOwner, SelectedActivationClaim
@@ -185,7 +184,7 @@ class PrepareCoordinator:
         reservation_owner: Callable[[], ReservationOwner],
         now: Callable[[], datetime],
         repair_activation_public_key: bytes,
-        finalization_public_key: bytes | None = None,
+        finalization_keys: FinalizationKeyAuthority,
         linear: LinearGateway | None = None,
         context: PreparationContextAuthority | None = None,
     ) -> None:
@@ -200,18 +199,9 @@ class PrepareCoordinator:
         if not isinstance(repair_activation_public_key, bytes) or len(repair_activation_public_key) != 32:
             raise ValueError("repair activation public key is invalid")
         self.repair_activation_public_key = bytes(repair_activation_public_key)
-        if finalization_public_key is None:
-            finalization_public_key = Ed25519PrivateKey.generate().public_key().public_bytes(
-                serialization.Encoding.Raw,
-                serialization.PublicFormat.Raw,
-            )
-        if (
-            not isinstance(finalization_public_key, bytes)
-            or len(finalization_public_key) != 32
-            or finalization_public_key == self.repair_activation_public_key
-        ):
-            raise ValueError("finalization public key is invalid")
-        self.finalization_public_key = bytes(finalization_public_key)
+        if not isinstance(finalization_keys, FinalizationKeyAuthority):
+            raise ValueError("finalization key authority is invalid")
+        self.finalization_keys = finalization_keys
         self.linear = linear
         self.context = context
 
@@ -255,6 +245,9 @@ class PrepareCoordinator:
             pagination_complete=True,
             source_page_hashes=reference.source_page_hashes,
         )
+        finalization_binding = self.finalization_keys.provision(reservation.reservation_id)
+        if finalization_binding.public_key == self.repair_activation_public_key.hex():
+            raise PrepareError("finalization public key is invalid")
         claim = self.index.claim_selected_activation(
             SelectedActivationClaimRequest(
                 reservation_id=reservation.reservation_id,
@@ -267,8 +260,8 @@ class PrepareCoordinator:
                 original_external_revision=original_external_revision,
                 repair_activation_public_key=self.repair_activation_public_key.hex(),
                 repair_activation_public_key_hash=hashlib.sha256(self.repair_activation_public_key).hexdigest(),
-                finalization_public_key=self.finalization_public_key.hex(),
-                finalization_public_key_hash=hashlib.sha256(self.finalization_public_key).hexdigest(),
+                finalization_public_key=finalization_binding.public_key,
+                finalization_public_key_hash=finalization_binding.public_key_hash,
             )
         )
         if claim.outcome == "wait":

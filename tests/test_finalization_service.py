@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 import os
 from pathlib import Path
 import socket
+import stat
 import threading
 import time
 
@@ -16,6 +17,7 @@ from auto_code.contracts import RunState, StepKind, StepResult
 from auto_code.finalization_service import (
     FinalizationCapabilityDescriptor,
     FinalizationCapabilityError,
+    FinalizationKeyAuthority,
     FinalizationServiceError,
     FinalizationTrustMaterial,
     _FinalizationHandlers as FinalizationHandlers,
@@ -96,6 +98,23 @@ def descriptor(
 
 def trust(service: FinalizationService) -> FinalizationTrustMaterial:
     return FinalizationTrustMaterial(public_key=service.public_key, state_root=service.state_root)
+
+
+def test_finalization_key_authority_persists_a_reloadable_private_key_outside_ticket_workspace(tmp_path: Path) -> None:
+    """Discarding the private key or writing it below the ticket workspace leaves no launcher signing authority."""
+
+    state_root = tmp_path / "launcher-state"
+    ticket_workspace = tmp_path / "ticket-workspace"
+    ticket_workspace.mkdir()
+    authority = FinalizationKeyAuthority(state_root)
+
+    binding = authority.provision("reservation-1")
+    private_key = authority.load_private_key(binding.public_key_hash)
+    key_path = state_root / "finalization-keys" / f"{binding.public_key_hash}.json"
+
+    assert private_key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex() == binding.public_key
+    assert stat.S_IMODE(key_path.stat().st_mode) == 0o600
+    assert not tuple(ticket_workspace.iterdir())
 
 
 def test_forged_descriptor_signature_is_rejected(service: FinalizationService, tmp_path: Path) -> None:
