@@ -2685,6 +2685,16 @@ class RunState(ContractModel):
     finalization: str | None = None
     finalization_evidence: FinalizationEvidence | None = None
     finalization_index_released: bool = False
+    finalization_index_release_binding: Sha256 | None = None
+    finalization_retry_wait_seconds: float = Field(default=0, ge=0)
+    finalization_next_eligible_at: datetime | None = None
+
+    @field_validator("finalization_next_eligible_at")
+    @classmethod
+    def validate_finalization_eligibility_time(cls, value: datetime | None) -> datetime | None:
+        if value is not None and (value.tzinfo is None or value.utcoffset() is None):
+            raise ValueError("Finalization eligibility time must include a timezone")
+        return value
 
     @field_validator(
         "project_policy_hash",
@@ -2695,6 +2705,7 @@ class RunState(ContractModel):
         "repair_activation_public_key",
         "repair_activation_public_key_hash",
         "restart_receipt_request_hash",
+        "finalization_index_release_binding",
     )
     @classmethod
     def normalize_preparation_binding_hashes(cls, value: str | None) -> str | None:

@@ -4,6 +4,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -58,23 +59,35 @@ class _Deadline:
 class FinalizationTrustMaterial:
     public_key: str
     state_root: Path
+    descriptor_hash: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.public_key, str) or re.fullmatch(r"[0-9a-f]{64}", self.public_key) is None:
             raise ValueError("finalization trust public key is invalid")
         object.__setattr__(self, "state_root", _normalize_state_root(self.state_root))
+        if self.descriptor_hash is not None:
+            _require_hash(self.descriptor_hash, "finalization descriptor hash")
 
     def payload(self) -> dict[str, object]:
-        return {"domain": "auto-code-finalization-trust/v1", "public_key": self.public_key, "state_root": str(self.state_root)}
+        return {
+            "domain": "auto-code-finalization-trust/v1",
+            "public_key": self.public_key,
+            "state_root": str(self.state_root),
+            "descriptor_hash": self.descriptor_hash,
+        }
 
     def to_bytes(self) -> bytes:
         return canonical_json_bytes(self.payload())
 
     @classmethod
     def from_payload(cls, value: object) -> FinalizationTrustMaterial:
-        if not isinstance(value, dict) or set(value) != {"domain", "public_key", "state_root"} or value["domain"] != "auto-code-finalization-trust/v1":
+        if not isinstance(value, dict) or set(value) != {"domain", "public_key", "state_root", "descriptor_hash"} or value["domain"] != "auto-code-finalization-trust/v1":
             raise ValueError("finalization trust material is invalid")
-        return cls(public_key=value["public_key"], state_root=Path(value["state_root"]))
+        return cls(
+            public_key=value["public_key"],
+            state_root=Path(value["state_root"]),
+            descriptor_hash=value["descriptor_hash"],
+        )
 
 
 def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -396,7 +409,7 @@ class FinalizationResponse:
 
 
 @dataclass(frozen=True, slots=True)
-class FinalizationHandlers:
+class _FinalizationHandlers:
     finalize: Callable[[FinalizationRequest], StepResult]
     receipt: Callable[[FinalizationRequest], StepResult]
 
@@ -405,11 +418,11 @@ class FinalizationHandlers:
             raise ValueError("finalization handlers are invalid")
 
 
-class FinalizationService:
+class _LauncherFinalizationService:
     """Launcher-owned finalizer and receipt composition behind a one-use local capability."""
 
-    def __init__(self, *, signing_key: Ed25519PrivateKey, state_root: Path, handlers: FinalizationHandlers, peer_uid: int | None = None) -> None:
-        if not isinstance(signing_key, Ed25519PrivateKey) or not isinstance(handlers, FinalizationHandlers):
+    def __init__(self, *, signing_key: Ed25519PrivateKey, state_root: Path, handlers: _FinalizationHandlers, peer_uid: int | None = None) -> None:
+        if not isinstance(signing_key, Ed25519PrivateKey) or not isinstance(handlers, _FinalizationHandlers):
             raise ValueError("finalization service is invalid")
         self._signing_key = signing_key
         self._public_key = signing_key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
@@ -622,10 +635,36 @@ def load_finalization_trust_from_protected_fd() -> FinalizationTrustMaterial:
         raise FinalizationServiceError("launcher finalization trust is invalid") from error
 
 
-def load_capability_from_protected_fd(trust: FinalizationTrustMaterial) -> FinalizationCapabilityDescriptor:
+def load_capability_from_protected_fd(
+    trust: FinalizationTrustMaterial,
+    *,
+    expected_state_root: Path | None = None,
+) -> FinalizationCapabilityDescriptor:
     try:
         capability = FinalizationCapabilityDescriptor.from_payload(_load_protected_json(_LAUNCHER_FINALIZATION_FD, "capability"))
         capability.verify(trust.public_key)
+        if expected_state_root is not None:
+            if (
+                trust.descriptor_hash != hashlib.sha256(capability.to_bytes()).hexdigest()
+                or _normalize_state_root(expected_state_root) != trust.state_root
+            ):
+                raise FinalizationServiceError("launcher finalization trust binding is invalid")
+            from .state import RunStateStore
+
+            generation = RunStateStore.load_read_only(trust.state_root, capability.run_id)
+            state = generation.state
+            if (
+                generation.revision != capability.expected_revision
+                or generation.state_hash != capability.expected_state_hash
+                or (
+                    state.repair_activation_public_key is not None
+                    and (
+                        state.repair_activation_public_key != trust.public_key
+                        or state.repair_activation_public_key_hash != hashlib.sha256(bytes.fromhex(trust.public_key)).hexdigest()
+                    )
+                )
+            ):
+                raise FinalizationServiceError("launcher finalization trust binding is invalid")
         if capability.socket_uid != os.getuid() or _socket_identity(capability.socket_path) != (capability.socket_device, capability.socket_inode, capability.socket_uid, capability.socket_mode, capability.socket_ctime_ns):
             raise FinalizationServiceError("launcher socket identity is invalid")
         return capability
@@ -662,9 +701,11 @@ def invoke_protected_capability(
     expected_revision: int,
     expected_state_hash: str,
     request_id: str | None,
+    *,
+    expected_state_root: Path | None = None,
 ) -> FinalizationResponse:
     trust = load_finalization_trust_from_protected_fd()
-    descriptor = load_capability_from_protected_fd(trust)
+    descriptor = load_capability_from_protected_fd(trust, expected_state_root=expected_state_root)
     request = FinalizationRequest(
         operation=operation,
         run_id=run_id,
@@ -703,10 +744,8 @@ def _read_frame(connection: socket.socket, deadline: _Deadline) -> object:
 
 __all__ = [
     "FinalizationCapabilityDescriptor",
-    "FinalizationHandlers",
     "FinalizationRequest",
     "FinalizationResponse",
-    "FinalizationService",
     "FinalizationServiceError",
     "FinalizationTrustMaterial",
     "invoke_descriptor",

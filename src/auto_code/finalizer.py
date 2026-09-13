@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from datetime import timedelta
+import re
 import uuid
 
 from .contracts import (
@@ -52,7 +54,7 @@ class FinalizationError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class FinalizationArtifacts:
+class _FinalizationArtifacts:
     """The immutable artifacts that were reviewed for one finalization."""
 
     ticket_snapshot: TicketSnapshot
@@ -73,13 +75,13 @@ class FinalizationArtifacts:
 
 
 @dataclass(frozen=True)
-class FinalizerDependencies:
+class _FinalizerDependencies:
     store: RunStateStore
     linear: LinearGateway
     git_guard: object
     active_run_index: object
     project_policy: ProjectConfig
-    load_artifacts: Callable[[RunState], FinalizationArtifacts]
+    load_artifacts: Callable[[RunState], _FinalizationArtifacts]
 
     def __post_init__(self) -> None:
         if not isinstance(self.store, RunStateStore) or not isinstance(self.linear, LinearGateway):
@@ -88,11 +90,11 @@ class FinalizerDependencies:
             raise ValueError("Finalizer requires trusted approval inputs")
 
 
-class Finalizer:
+class _Finalizer:
     """Advance approved work through durable, one-way finalization effects."""
 
-    def __init__(self, dependencies: FinalizerDependencies) -> None:
-        if not isinstance(dependencies, FinalizerDependencies):
+    def __init__(self, dependencies: _FinalizerDependencies) -> None:
+        if not isinstance(dependencies, _FinalizerDependencies):
             raise ValueError("Finalizer requires typed dependencies")
         self.dependencies = dependencies
         self.store = dependencies.store
@@ -105,6 +107,8 @@ class Finalizer:
                 return self._pending_result(generation)
             if state.disposition is not RunDisposition.ACTIVE:
                 return self._gated_result(generation)
+            if state.finalization_next_eligible_at is not None and datetime.now(UTC) < state.finalization_next_eligible_at:
+                return self._ready_result(generation)
             try:
                 artifacts = self._verify_approval(state)
             except Exception:
@@ -175,6 +179,10 @@ class Finalizer:
                 pushed_sha=state.pushed_sha,
                 linear_done_receipt=state.linear_done_receipt,
             )
+            try:
+                release_binding = self._active_index_release_binding(generation)
+            except Exception:
+                return self._human_review(generation)
             done = self.store.compare_and_swap(
                 generation.revision,
                 generation.state_hash,
@@ -183,6 +191,7 @@ class Finalizer:
                         "disposition": RunDisposition.DONE,
                         "finalization": "approved-finalization",
                         "finalization_evidence": evidence,
+                        "finalization_index_release_binding": release_binding,
                     }
                 ),
             )
@@ -215,14 +224,43 @@ class Finalizer:
                 if accepted.observed_state_id != artifacts.project_policy.linear.completed_state_id:
                     return self._failed_state(state)
                 return state.model_copy(update={"linear_done_receipt": accepted.content_hash})
+            if accepted.outcome is not EffectOutcome.SUCCESS and wait_seconds:
+                cumulative_wait = state.finalization_retry_wait_seconds + wait_seconds
+                if cumulative_wait > artifacts.project_policy.finalization.total_retry_wait_seconds:
+                    return self._failed_state(state)
+                return state.model_copy(
+                    update={
+                        "finalization_retry_wait_seconds": cumulative_wait,
+                        "finalization_next_eligible_at": accepted.observed_at + timedelta(seconds=wait_seconds),
+                    }
+                )
             return state
 
-        return self.dependencies.linear.consume_receipt(generation, receipt, state_update=update)
+        wait_seconds = self._retry_after_seconds(receipt)
+        return self.dependencies.linear.consume_receipt(
+            generation,
+            receipt,
+            state_update=update,
+            wait_seconds=wait_seconds,
+        )
 
-    def _verify_approval(self, state: RunState) -> FinalizationArtifacts:
+    def _verify_approval(self, state: RunState) -> _FinalizationArtifacts:
         artifacts = self.dependencies.load_artifacts(state)
-        if not isinstance(artifacts, FinalizationArtifacts):
+        if not isinstance(artifacts, _FinalizationArtifacts):
             raise FinalizationError("finalization artifacts are unavailable")
+        if artifacts.ticket_snapshot.ticket_id != state.ticket_id:
+            raise FinalizationError("ticket baseline changed")
+        if state.has_preparation_binding:
+            from .prepare import PreparationContextAuthority
+
+            context = PreparationContextAuthority(self.store.root).load_verified(state.run_id)
+            if (
+                context.ticket_snapshot != artifacts.ticket_snapshot
+                or context.ticket_snapshot_hash != state.ticket_snapshot_hash
+                or context.original_state_id != artifacts.original_state_id
+                or context.original_external_revision != artifacts.original_external_revision
+            ):
+                raise FinalizationError("ticket baseline changed")
         review = artifacts.review_manifest
         if (
             not state.finalization_eligible
@@ -275,7 +313,7 @@ class Finalizer:
             raise FinalizationError("Reviewer checkpoint changed")
         return artifacts
 
-    def _verify_git_position(self, state: RunState, artifacts: FinalizationArtifacts) -> None:
+    def _verify_git_position(self, state: RunState, artifacts: _FinalizationArtifacts) -> None:
         git = self.dependencies.git_guard
         if not state.branch or self._call(git, "refresh_finalization", state.branch, artifacts.product_manifest.baseline_sha) is not True:
             raise FinalizationError("ticket branch or remote base changed")
@@ -284,7 +322,7 @@ class Finalizer:
         if state.pushed_sha is not None and self._call(git, "reconcile_product_push", state.branch, state.pushed_sha) != state.pushed_sha:
             raise FinalizationError("remote ticket branch changed")
 
-    def _invoke_commit(self, generation: StateGeneration, artifacts: FinalizationArtifacts) -> StateGeneration:
+    def _invoke_commit(self, generation: StateGeneration, artifacts: _FinalizationArtifacts) -> StateGeneration:
         intended, effect_id = self._intend(generation, "commit", generation.state.ticket_id)
         try:
             commit = self._call(
@@ -299,7 +337,7 @@ class Finalizer:
         except Exception:
             return self._record_local_result(intended, effect_id, "commit", EffectOutcome.FAILURE, None, {})
 
-    def _invoke_push(self, generation: StateGeneration, artifacts: FinalizationArtifacts) -> StateGeneration:
+    def _invoke_push(self, generation: StateGeneration, artifacts: _FinalizationArtifacts) -> StateGeneration:
         del artifacts
         intended, effect_id = self._intend(generation, "push", generation.state.ticket_id)
         try:
@@ -314,7 +352,7 @@ class Finalizer:
         self,
         generation: StateGeneration,
         operation: str,
-        artifacts: FinalizationArtifacts,
+        artifacts: _FinalizationArtifacts,
     ) -> StateGeneration:
         intentions, phases = generation.state.validate_effect_ledger()
         unresolved = [
@@ -427,6 +465,14 @@ class Finalizer:
         return hash_json(projection.model_dump(mode="json", round_trip=True))
 
     @staticmethod
+    def _retry_after_seconds(receipt: TrustedMcpReceipt) -> float:
+        for observation in receipt.observations:
+            matched = re.fullmatch(r"retry-after=([0-9]+(?:\.[0-9]+)?)", observation.strip().lower())
+            if matched is not None:
+                return float(matched.group(1))
+        return 0
+
+    @staticmethod
     def _attempts(state: RunState, operation: str) -> int:
         return sum(
             isinstance(event, EffectIntention) and event.payload.operation == operation
@@ -485,20 +531,54 @@ class Finalizer:
             raise FinalizationError("Active Run Index is unavailable")
         active = lookup(generation.state.repository_id)
         if active is None:
+            if (
+                generation.state.disposition is RunDisposition.DONE
+                and generation.state.finalization_evidence is not None
+                and generation.state.finalization_index_release_binding is not None
+            ):
+                return self.store.compare_and_swap(
+                    generation.revision,
+                    generation.state_hash,
+                    generation.state.model_copy(update={"finalization_index_released": True}),
+                )
             raise FinalizationError("Active Run Index entry is missing")
         if getattr(active, "run_id", None) != generation.state.run_id:
             raise FinalizationError("Active Run Index entry belongs to another run")
-        index.release(
-            generation.state.repository_id,
-            generation.state.run_id,
-            active.index_revision,
-            active.index_hash,
-            generation.state_hash,
-        )
+        try:
+            index.release(
+                generation.state.repository_id,
+                generation.state.run_id,
+                active.index_revision,
+                active.index_hash,
+                generation.state_hash,
+            )
+        except Exception:
+            # A release may have committed before its caller observes a crash. Re-read the
+            # authoritative index; only a terminal state for this same run may reconcile it.
+            if lookup(generation.state.repository_id) is not None:
+                raise
         return self.store.compare_and_swap(
             generation.revision,
             generation.state_hash,
             generation.state.model_copy(update={"finalization_index_released": True}),
+        )
+
+    def _active_index_release_binding(self, generation: StateGeneration) -> str:
+        index = self.dependencies.active_run_index
+        lookup = getattr(index, "lookup", None)
+        if not callable(lookup):
+            raise FinalizationError("Active Run Index is unavailable")
+        active = lookup(generation.state.repository_id)
+        if active is None or getattr(active, "run_id", None) != generation.state.run_id:
+            raise FinalizationError("Active Run Index entry is unavailable")
+        return hash_json(
+            {
+                "repository_id": generation.state.repository_id,
+                "run_id": generation.state.run_id,
+                "index_revision": active.index_revision,
+                "index_hash": active.index_hash,
+                "state_hash": generation.state_hash,
+            }
         )
 
     def _require_generation(self, generation: StateGeneration) -> None:
@@ -516,4 +596,4 @@ class Finalizer:
         return callback(*args)
 
 
-__all__ = ["FinalizationArtifacts", "FinalizationError", "Finalizer", "FinalizerDependencies"]
+__all__ = ["FinalizationError"]

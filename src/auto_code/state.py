@@ -889,7 +889,7 @@ class RunStateStore:
             not isinstance(invocation, EffectInvocation)
             or not isinstance(observation, EffectObservation)
             or not isinstance(reconciliation, EffectReconciliation)
-            or invocation.payload != EffectInvocationPayload()
+            or invocation.payload.wait_seconds < 0
             or invocation.effect_id != pending.effect_id
             or observation.effect_id != pending.effect_id
             or reconciliation.effect_id != pending.effect_id
