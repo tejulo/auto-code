@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from datetime import timedelta
@@ -81,12 +81,12 @@ class _FinalizerDependencies:
     git_guard: object
     active_run_index: object
     project_policy: ProjectConfig
-    load_artifacts: Callable[[RunState], _FinalizationArtifacts]
+    artifacts: _FinalizationArtifacts
 
     def __post_init__(self) -> None:
         if not isinstance(self.store, RunStateStore) or not isinstance(self.linear, LinearGateway):
             raise ValueError("Finalizer requires a state store and Linear gateway")
-        if not isinstance(self.project_policy, ProjectConfig) or not callable(self.load_artifacts):
+        if not isinstance(self.project_policy, ProjectConfig) or not isinstance(self.artifacts, _FinalizationArtifacts):
             raise ValueError("Finalizer requires trusted approval inputs")
 
 
@@ -245,7 +245,7 @@ class _Finalizer:
         )
 
     def _verify_approval(self, state: RunState) -> _FinalizationArtifacts:
-        artifacts = self.dependencies.load_artifacts(state)
+        artifacts = self.dependencies.artifacts
         if not isinstance(artifacts, _FinalizationArtifacts):
             raise FinalizationError("finalization artifacts are unavailable")
         if artifacts.ticket_snapshot.ticket_id != state.ticket_id:

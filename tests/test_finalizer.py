@@ -46,6 +46,7 @@ from auto_code.finalizer import (
 )
 from auto_code import finalization_service
 from auto_code.finalization_service import (
+    FinalizationKeyAuthority,
     FinalizationTrustMaterial,
     _FinalizationHandlers as FinalizationHandlers,
     _LauncherFinalizationService as FinalizationService,
@@ -405,10 +406,18 @@ def harness(tmp_path: Path) -> FinalizerHarness:
         client=client,
     )
     store = RunStateStore(tmp_path, "run-1", receipt_authority=bridge.receipt_authority)
+    finalization_binding = FinalizationKeyAuthority(tmp_path).provision("finalization-test-reservation")
     initial = store.compare_and_swap(
         0,
         EMPTY_STATE_HASH,
-        RunState(run_id="run-1", ticket_id="ENG-1", repository_id="repo-1", max_crew_iterations=3),
+        RunState(
+            run_id="run-1",
+            ticket_id="ENG-1",
+            repository_id="repo-1",
+            max_crew_iterations=3,
+            finalization_public_key=finalization_binding.public_key,
+            finalization_public_key_hash=finalization_binding.public_key_hash,
+        ),
     )
     definitions = store.compare_and_swap(
         initial.revision,
@@ -472,7 +481,7 @@ def harness(tmp_path: Path) -> FinalizerHarness:
             git_guard=git,
             active_run_index=index,
             project_policy=policy(),
-            load_artifacts=lambda _: approved,
+            artifacts=approved,
         )
     )
     return FinalizerHarness(store, finalizer, bridge, git, client, index, approved, generation)
@@ -518,7 +527,7 @@ def test_artifact_loader_cannot_substitute_the_ticket_baseline(harness: Finalize
             source_page_hashes={"page-1": digest("ticket-page")},
         ),
     )
-    harness.finalizer = Finalizer(replace(harness.finalizer.dependencies, load_artifacts=lambda _: substituted))
+    harness.finalizer = Finalizer(replace(harness.finalizer.dependencies, artifacts=substituted))
 
     result = harness.finalizer.advance(harness.generation)
 
@@ -686,7 +695,7 @@ def test_post_review_binding_drift_requires_human_review_before_effects(
             ),
         )
     harness.finalizer = Finalizer(
-        replace(harness.finalizer.dependencies, load_artifacts=lambda _: changed)
+        replace(harness.finalizer.dependencies, artifacts=changed)
     )
 
     result = harness.finalizer.advance(harness.generation)
@@ -709,7 +718,9 @@ def test_finalize_and_receipt_cli_dispatch_only_through_the_launcher_socket(
     listener.bind(str(socket_path))
     listener.listen(2)
     service = FinalizationService(
-        signing_key=Ed25519PrivateKey.generate(),
+        signing_key=FinalizationKeyAuthority(harness.store.root).load_private_key(
+            harness.store.load().state.finalization_public_key_hash
+        ),
         state_root=harness.store.root,
         handlers=FinalizationHandlers(
             finalize=lambda _: harness.finalizer.advance(harness.store.load()),
