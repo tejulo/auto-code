@@ -16,12 +16,18 @@ from auto_code.contracts import (
     BrowserResult,
     BuildIdentity,
     ChangeOutline,
+    FailureClass,
+    FailureRecord,
+    FailureSource,
+    FindingKind,
     ProductChangeManifest,
     RequirementsPackage,
     ReviewManifest,
     ReviewResult,
+    RunDisposition,
     RunState,
     Stage,
+    StepKind,
     StepResult,
     VerificationResult,
 )
@@ -35,6 +41,7 @@ from auto_code.finalizer import _FinalizationArtifacts, _Finalizer, _FinalizerDe
 from auto_code.hashing import hash_json
 from auto_code.hashing import canonical_json_bytes
 from auto_code.linear import LinearGateway
+from auto_code.mcp_bridge import TrustedLinearBridge
 from auto_code.prepare import PreparationContextAuthority
 from auto_code.project_config import ProjectConfig
 from auto_code.state import RunStateStore, StateGeneration, _read_canonical_json
@@ -151,6 +158,7 @@ class _LauncherRuntime:
 
     state_root: Path
     linear: LinearGateway | None = None
+    bridge: TrustedLinearBridge | None = None
     git_guard: object | None = None
     active_run_index: object | None = None
     artifact_authority: FinalizationArtifactAuthority | None = None
@@ -178,18 +186,20 @@ class FinalizationLauncher:
         expected_generation_hash: str,
         *,
         socket_path: Path,
+        operation: str = "finalize",
+        request_id: str | None = None,
     ) -> FinalizationCapabilityDescriptor:
         generation = self._load_exact(run_id, expected_revision, expected_generation_hash)
         service = self._service_for(generation)
         descriptor = service.issue_descriptor(
-            operation="finalize",
+            operation=operation,
             run_id=run_id,
             expected_revision=expected_revision,
             expected_state_hash=expected_generation_hash,
-            request_id=None,
+            request_id=request_id,
             socket_path=socket_path,
             expires_at=datetime.now(UTC) + timedelta(minutes=1),
-            timeout_seconds=1.0,
+            timeout_seconds=5.0,
         )
         self._services[descriptor.nonce] = service
         return descriptor
@@ -200,12 +210,17 @@ class FinalizationLauncher:
         expected_revision: int,
         expected_generation_hash: str,
         ticket_argv: tuple[str, ...],
+        *,
+        operation: str = "finalize",
+        request_id: str | None = None,
     ) -> int:
         """Run one ticket command against one launcher-owned IPC capability."""
 
         if not ticket_argv or any(not isinstance(argument, str) or not argument for argument in ticket_argv):
             raise FinalizationLauncherError("ticket command is invalid")
-        socket_path = self._state_root / f"finalization-{os.urandom(12).hex()}.sock"
+        socket_directory = Path(tempfile.mkdtemp(prefix="auto-code-finalization-"))
+        socket_directory.chmod(0o700)
+        socket_path = socket_directory / "service.sock"
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         descriptors: list[int] = []
         process: subprocess.Popen[str] | None = None
@@ -217,6 +232,8 @@ class FinalizationLauncher:
                 expected_revision,
                 expected_generation_hash,
                 socket_path=socket_path,
+                operation=operation,
+                request_id=request_id,
             )
             service = self._services[descriptor.nonce]
             descriptors = [
@@ -241,13 +258,15 @@ class FinalizationLauncher:
             ]
             process = subprocess.Popen(
                 ticket_argv,
-                pass_fds=tuple(descriptors),
+                # Keep the target slots through close_fds; preexec replaces the
+                # inherited bootstrap descriptors with finalization-only data.
+                pass_fds=(*descriptors, 4, 5, 6),
                 preexec_fn=lambda: (_dup_to(descriptors[0], 4), _dup_to(descriptors[1], 5), _dup_to(descriptors[2], 6)),
                 text=True,
             )
             service._peer_pid = process.pid
             service.serve_once(listener)
-            return process.wait(timeout=2)
+            return process.wait(timeout=descriptor.timeout_seconds)
         except Exception as error:
             if process is not None:
                 process.kill()
@@ -261,6 +280,7 @@ class FinalizationLauncher:
                 socket_path.unlink()
             except FileNotFoundError:
                 pass
+            socket_directory.rmdir()
 
     def _service_for(self, generation: StateGeneration) -> _LauncherFinalizationServiceInternal:
         self._require_active_run(generation)
@@ -304,34 +324,63 @@ class FinalizationLauncher:
 
     def _handle_finalize(self, generation: StateGeneration, request: FinalizationRequest) -> StepResult:
         self._require_request(generation, request)
+        if generation.state.disposition is RunDisposition.HUMAN_REVIEW:
+            failure = generation.state.failure_history[-1] if generation.state.failure_history else FailureRecord(
+                failure_class=FailureClass.ORCHESTRATION,
+                failure_source=FailureSource.FINALIZATION,
+                finding_kind=FindingKind.INVALID_ROUTING,
+            )
+            return StepResult(
+                kind=StepKind.HUMAN_REVIEW,
+                run_id=generation.state.run_id,
+                state_revision=generation.revision,
+                state_hash=generation.state_hash,
+                failure=failure,
+            )
         return self._finalizer_for(generation).advance(generation)
 
     def _handle_receipt(self, generation: StateGeneration, request: FinalizationRequest) -> StepResult:
         self._require_request(generation, request)
-        raise FinalizationLauncherError("finalization receipt composition is unavailable")
+        if request.request_id is None or not isinstance(self._runtime.bridge, TrustedLinearBridge):
+            raise FinalizationLauncherError("finalization receipt composition is unavailable")
+        linear = self._linear_for(generation)
+        pending = linear.replay_pending(generation)
+        if pending is None or pending.request_id != request.request_id:
+            raise FinalizationLauncherError("finalization receipt does not match the Active Run")
+        receipt = self._runtime.bridge.execute(pending)
+        accepted = self._finalizer_for(generation).accept_trusted_receipt(generation, receipt)
+        return self._finalizer_for(accepted).advance(accepted)
 
     def _finalizer_for(self, generation: StateGeneration) -> _Finalizer:
         if (
-            not isinstance(self._runtime.linear, LinearGateway)
+            not isinstance(self._runtime.bridge, TrustedLinearBridge)
             or self._runtime.git_guard is None
             or self._runtime.active_run_index is None
         ):
             raise FinalizationLauncherError("finalization launcher capabilities are unavailable")
-        store = RunStateStore(
-            self._state_root,
-            generation.state.run_id,
-            receipt_authority=self._runtime.linear._receipt_authority,
-        )
+        store = RunStateStore(self._state_root, generation.state.run_id, receipt_authority=self._runtime.bridge.receipt_authority)
         artifacts = self._artifacts.load_for(generation.state)
         return _Finalizer(
             _FinalizerDependencies(
                 store=store,
-                linear=self._runtime.linear,
+                linear=self._linear_for(generation),
                 git_guard=self._runtime.git_guard,
                 active_run_index=self._runtime.active_run_index,
                 project_policy=artifacts.project_policy,
                 artifacts=artifacts,
             )
+        )
+
+    def _linear_for(self, generation: StateGeneration) -> LinearGateway:
+        if not isinstance(self._runtime.bridge, TrustedLinearBridge):
+            raise FinalizationLauncherError("finalization bridge capability is unavailable")
+        return LinearGateway(
+            RunStateStore(
+                self._state_root,
+                generation.state.run_id,
+                receipt_authority=self._runtime.bridge.receipt_authority,
+            ),
+            self._runtime.bridge.receipt_authority,
         )
 
     @staticmethod

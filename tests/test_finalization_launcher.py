@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import json
+import os
 from pathlib import Path
 import socket
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -18,7 +21,10 @@ from auto_code.contracts import (
     StageOutput,
     TicketSnapshot,
     TrustedPreparationInputRef,
+    RunDisposition,
 )
+from auto_code.hashing import canonical_json_bytes
+from auto_code.run_index import ActiveRunIndex
 from launcher_finalization import (
     FinalizationArtifactAuthority,
     FinalizationArtifactError,
@@ -29,6 +35,9 @@ from launcher_finalization import (
 from auto_code.finalization_service import FinalizationCapabilityError
 from auto_code.prepare import PreparationContext, PreparationContextAuthority
 from auto_code.state import EMPTY_STATE_HASH, RunStateStore
+
+
+_BOOTSTRAP_TEST_KEY = Ed25519PrivateKey.from_private_bytes(bytes.fromhex("11" * 32))
 
 
 def _runner_identity() -> RunnerIdentity:
@@ -293,3 +302,153 @@ def test_artifact_authority_rejects_a_preparation_baseline_for_another_ticket(tm
 
     with pytest.raises(FinalizationArtifactError, match="ticket baseline"):
         FinalizationArtifactAuthority(tmp_path).load_for(generation.state)
+
+
+def _write_bootstrap_descriptor(path: Path, payload: object) -> int:
+    path.write_bytes(canonical_json_bytes(payload))
+    path.chmod(0o600)
+    return os.open(path, os.O_RDONLY)
+
+
+def _installed_launcher_result(
+    tmp_path: Path,
+    *,
+    mutate_bootstrap: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    state_root = tmp_path / "state"
+    state_root.mkdir(mode=0o700)
+    repository = tmp_path / "repository"
+    repository.mkdir(mode=0o700)
+    signing_key = Ed25519PrivateKey.generate()
+    state = RunState(
+        run_id="run-1",
+        ticket_id="ENG-1",
+        repository_id="repo-1",
+        max_crew_iterations=1,
+        disposition=RunDisposition.HUMAN_REVIEW,
+        finalization_public_key=signing_key.public_key().public_bytes_raw().hex(),
+        finalization_public_key_hash=__import__("hashlib").sha256(signing_key.public_key().public_bytes_raw()).hexdigest(),
+    )
+    from tests.state_fixtures import DeterministicPreparationInputVerifier
+
+    index = ActiveRunIndex(
+        state_root,
+        finalization_signing_key=signing_key,
+        preparation_input_verifier=DeterministicPreparationInputVerifier(),
+    )
+    reservation = index.reserve("repo-1")
+    from tests.state_fixtures import activation_request
+
+    active = index.activate_reservation(activation_request(reservation, initial_state=state))
+    generation = RunStateStore(state_root, active.run_id).load()
+    key_hash = __import__("hashlib").sha256(signing_key.public_key().public_bytes_raw()).hexdigest()
+    bridge_client, bridge_server = socket.socketpair()
+    descriptor_paths = [tmp_path / f"bootstrap-{number}.json" for number in range(3, 9)]
+    key_path = tmp_path / "finalization-key.bin"
+    key_path.write_bytes(signing_key.private_bytes_raw())
+    key_path.chmod(0o600)
+    descriptors: list[int] = []
+    try:
+        config = {
+            "domain": "auto-code-launcher-bootstrap/v1",
+            "state_root": str(state_root),
+            "repository_root": str(repository),
+            "bridge_identity": "launcher-bridge",
+            "mcp_server_identity": "linear-mcp",
+            "bridge_fd": 6,
+            "state_fd": 4,
+            "index_fd": 5,
+            "git_fd": 7,
+            "key_fd": 8,
+            "finalization_public_key_hash": key_hash,
+        }
+        config["signature"] = _BOOTSTRAP_TEST_KEY.sign(canonical_json_bytes(config)).hex()
+        state_descriptor = {"domain": "auto-code-launcher-state/v1", "state_root": str(state_root)}
+        index_descriptor = {
+            "domain": "auto-code-launcher-index/v1",
+            "state_root": str(state_root),
+            "finalization_public_key_hash": key_hash,
+        }
+        bridge_descriptor = {
+            "domain": "auto-code-launcher-bridge/v1",
+            "state_root": str(state_root),
+            "bridge_identity": "launcher-bridge",
+            "mcp_server_identity": "linear-mcp",
+            "receipt_signing_key": "22" * 16,
+            "transport_fd": 9,
+        }
+        git_descriptor = {
+            "domain": "auto-code-launcher-git/v1",
+            "repository_root": str(repository),
+            "remote": "origin",
+            "base_branch": None,
+            "protected_paths": [],
+            "commit_excluded_paths": [],
+        }
+        payloads = (config, state_descriptor, index_descriptor, bridge_descriptor, git_descriptor)
+        if mutate_bootstrap:
+            payloads = ({"domain": "attacker"}, *payloads[1:])
+        for path, payload in zip(descriptor_paths[:5], payloads, strict=True):
+            descriptors.append(_write_bootstrap_descriptor(path, payload))
+        descriptors.append(os.open(key_path, os.O_RDONLY))
+        wrapper = (
+            "import os, sys; sources=[os.dup(int(source)) for source in sys.argv[1:8]]; "
+            "[(os.dup2(source, target, inheritable=True)) for target, source in enumerate(sources[:6], 3)]; "
+            "os.dup2(sources[6], 9, inheritable=True); "
+            "[(os.set_inheritable(target, True)) for target in (*range(3, 9), 9)]; "
+            "os.execv(sys.argv[8], sys.argv[8:])"
+        )
+        return subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                wrapper,
+                *(str(descriptor) for descriptor in descriptors),
+                str(bridge_client.fileno()),
+                str(Path(sys.executable).with_name("auto-code-launcher")),
+                "finalize",
+                "--run",
+                "run-1",
+                "--expected-revision",
+                str(generation.revision),
+                "--expected-hash",
+                generation.state_hash,
+            ],
+            capture_output=True,
+            check=False,
+            text=True,
+            pass_fds=(*descriptors, bridge_client.fileno()),
+        )
+    finally:
+        for descriptor in descriptors:
+            os.close(descriptor)
+        bridge_client.close()
+        bridge_server.close()
+
+
+def test_installed_launcher_serves_a_finalization_child_from_protected_bootstrap(tmp_path: Path) -> None:
+    """Returning the stub error instead of serving protected IPC would fail this real console boundary."""
+
+    result = _installed_launcher_result(tmp_path)
+
+    assert result.returncode == 0
+    assert result.stderr == ""
+
+
+def test_protected_bootstrap_accepts_a_real_socketpair_transport(tmp_path: Path) -> None:
+    """Rejecting a valid inherited socketpair prevents launcher-owned bridge composition."""
+
+    result = _installed_launcher_result(tmp_path)
+
+    assert result.returncode == 0
+    assert result.stderr == ""
+
+
+def test_installed_launcher_rejects_a_replaced_bootstrap_descriptor(tmp_path: Path) -> None:
+    """Accepting substituted bootstrap data would let a ticket replace launcher authority."""
+
+    result = _installed_launcher_result(tmp_path, mutate_bootstrap=True)
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr == "auto-code-launcher: protected runtime unavailable\n"

@@ -787,6 +787,7 @@ def test_launcher_replays_completed_nonce_without_second_git_effect(harness: Fin
         FinalizationLauncherRuntime(
             state_root=harness.store.root,
             linear=harness.finalizer.dependencies.linear,
+            bridge=harness.bridge,
             git_guard=harness.git,
             active_run_index=harness.index,
             artifact_authority=SimpleNamespace(load_for=lambda _: harness.artifacts),
@@ -823,6 +824,7 @@ def test_launcher_replays_completed_nonce_without_second_git_effect(harness: Fin
             FinalizationLauncherRuntime(
                 state_root=harness.store.root,
                 linear=harness.finalizer.dependencies.linear,
+                bridge=harness.bridge,
                 git_guard=harness.git,
                 active_run_index=harness.index,
                 artifact_authority=SimpleNamespace(load_for=lambda _: harness.artifacts),
