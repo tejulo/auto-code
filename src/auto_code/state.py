@@ -704,8 +704,10 @@ class RunStateStore:
                 raise InvalidStateTransition(f"append-only collection {field} must preserve its prefix")
         if previous.disposition in {RunDisposition.DONE, RunDisposition.ABANDONED}:
             if previous.disposition is RunDisposition.DONE:
-                marked_released = previous.model_copy(update={"finalization_index_released": True})
-                if not previous.finalization_index_released and state == marked_released:
+                if not previous.finalization_index_released and self._is_exact_release_marker(
+                    previous_generation,
+                    state,
+                ):
                     return state
                 escalated = previous.model_copy(
                     update={
@@ -730,6 +732,21 @@ class RunStateStore:
         self._validate_disposition_transition(previous, state, appended_authorizations)
         self._validate_preparation_transition(previous, state, appended_authorizations)
         return state
+
+    @staticmethod
+    def _is_exact_release_marker(previous_generation: StateGeneration, state: RunState) -> bool:
+        previous = previous_generation.state
+        binding = previous.finalization_index_release_binding
+        receipt = state.finalization_index_release_receipt
+        if binding is None or receipt is None:
+            return False
+        marker = previous.model_copy(
+            update={
+                "finalization_index_released": True,
+                "finalization_index_release_receipt": receipt,
+            }
+        )
+        return state == marker and receipt == binding.receipt_for(previous_generation.state_hash)
 
     def _verify_repair_activation(self, previous: StateGeneration, state: RunState) -> None:
         error = "repair activation transition is not verified"
@@ -1393,6 +1410,15 @@ class RunStateStore:
         ):
             if getattr(state, field) != getattr(evidence, field):
                 raise InvalidStateTransition("finalization evidence does not bind the completed state")
+        binding = state.finalization_index_release_binding
+        if (
+            binding is None
+            or state.finalization_index_release_receipt is not None
+            or state.finalization_index_released
+            or binding.repository_id != state.repository_id
+            or binding.run_id != state.run_id
+        ):
+            raise InvalidStateTransition("DONE requires an exact Active Run Index release binding")
 
     def _validate_identifiers(self, state: RunState) -> None:
         _require_identifier(state.run_id, "state run ID")

@@ -25,6 +25,8 @@ from .contracts import (
     FailureSource,
     FinalizationEvidence,
     FindingKind,
+    IndexReleaseBinding,
+    IndexReleaseReceipt,
     McpActionRequest,
     ProductChangeManifest,
     RequirementsPackage,
@@ -531,21 +533,19 @@ class _Finalizer:
             raise FinalizationError("Active Run Index is unavailable")
         active = lookup(generation.state.repository_id)
         if active is None:
-            if (
-                generation.state.disposition is RunDisposition.DONE
-                and generation.state.finalization_evidence is not None
-                and generation.state.finalization_index_release_binding is not None
-            ):
-                return self.store.compare_and_swap(
-                    generation.revision,
-                    generation.state_hash,
-                    generation.state.model_copy(update={"finalization_index_released": True}),
-                )
-            raise FinalizationError("Active Run Index entry is missing")
+            return self._reconcile_released_index(generation, index)
         if getattr(active, "run_id", None) != generation.state.run_id:
             raise FinalizationError("Active Run Index entry belongs to another run")
+        binding = generation.state.finalization_index_release_binding
+        if not isinstance(binding, IndexReleaseBinding) or binding != IndexReleaseBinding(
+            repository_id=generation.state.repository_id,
+            run_id=generation.state.run_id,
+            prior_revision=active.index_revision,
+            prior_hash=active.index_hash,
+        ):
+            raise FinalizationError("Active Run Index release binding is unavailable")
         try:
-            index.release(
+            receipt = index.release(
                 generation.state.repository_id,
                 generation.state.run_id,
                 active.index_revision,
@@ -553,17 +553,43 @@ class _Finalizer:
                 generation.state_hash,
             )
         except Exception:
-            # A release may have committed before its caller observes a crash. Re-read the
-            # authoritative index; only a terminal state for this same run may reconcile it.
             if lookup(generation.state.repository_id) is not None:
                 raise
+            return self._reconcile_released_index(generation, index)
+        if not isinstance(receipt, IndexReleaseReceipt) or receipt != binding.receipt_for(generation.state_hash):
+            raise FinalizationError("Active Run Index release receipt is invalid")
+        verifier = getattr(index, "verify_release", None)
+        if not callable(verifier):
+            raise FinalizationError("Active Run Index receipt verifier is unavailable")
+        verifier(receipt)
+        return self._mark_index_released(generation, receipt)
+
+    def _reconcile_released_index(self, generation: StateGeneration, index: object) -> StateGeneration:
+        if generation.state.disposition is not RunDisposition.DONE:
+            raise FinalizationError("Active Run Index entry is missing")
+        binding = generation.state.finalization_index_release_binding
+        if not isinstance(binding, IndexReleaseBinding):
+            raise FinalizationError("Active Run Index release binding is unavailable")
+        receipt = binding.receipt_for(generation.state_hash)
+        verifier = getattr(index, "verify_release", None)
+        if not callable(verifier):
+            raise FinalizationError("Active Run Index receipt verifier is unavailable")
+        verifier(receipt)
+        return self._mark_index_released(generation, receipt)
+
+    def _mark_index_released(self, generation: StateGeneration, receipt: IndexReleaseReceipt) -> StateGeneration:
         return self.store.compare_and_swap(
             generation.revision,
             generation.state_hash,
-            generation.state.model_copy(update={"finalization_index_released": True}),
+            generation.state.model_copy(
+                update={
+                    "finalization_index_released": True,
+                    "finalization_index_release_receipt": receipt,
+                }
+            ),
         )
 
-    def _active_index_release_binding(self, generation: StateGeneration) -> str:
+    def _active_index_release_binding(self, generation: StateGeneration) -> IndexReleaseBinding:
         index = self.dependencies.active_run_index
         lookup = getattr(index, "lookup", None)
         if not callable(lookup):
@@ -571,14 +597,11 @@ class _Finalizer:
         active = lookup(generation.state.repository_id)
         if active is None or getattr(active, "run_id", None) != generation.state.run_id:
             raise FinalizationError("Active Run Index entry is unavailable")
-        return hash_json(
-            {
-                "repository_id": generation.state.repository_id,
-                "run_id": generation.state.run_id,
-                "index_revision": active.index_revision,
-                "index_hash": active.index_hash,
-                "state_hash": generation.state_hash,
-            }
+        return IndexReleaseBinding(
+            repository_id=generation.state.repository_id,
+            run_id=generation.state.run_id,
+            prior_revision=active.index_revision,
+            prior_hash=active.index_hash,
         )
 
     def _require_generation(self, generation: StateGeneration) -> None:

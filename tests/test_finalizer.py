@@ -24,6 +24,7 @@ from auto_code.contracts import (
     ProductChangeFile,
     ProductChangeManifest,
     RequirementsPackage,
+    IndexReleaseReceipt,
     ReviewManifest,
     ReviewResult,
     RunState,
@@ -353,17 +354,36 @@ class FakeActiveRunIndex:
     index_revision: int = 1
     index_hash: str = "a" * 64
     fail_after_release: bool = False
+    crash_before_release_marker: bool = False
+    write_release_receipt: bool = True
+    release_receipt: IndexReleaseReceipt | None = None
 
     def lookup(self, repository_id: str) -> FakeActiveRunIndex | None:
         assert repository_id == "repo-1"
         return self if self.active else None
 
-    def release(self, *args: object) -> None:
+    def release(self, *args: object) -> IndexReleaseReceipt:
         assert args[1] == self.run_id
         self.release_calls += 1
+        receipt = IndexReleaseReceipt.create(
+            repository_id=str(args[0]),
+            run_id=str(args[1]),
+            prior_revision=int(args[2]),
+            prior_hash=str(args[3]),
+            terminal_generation_hash=str(args[4]),
+        )
+        if self.write_release_receipt:
+            self.release_receipt = receipt
         self.active = False
+        if self.crash_before_release_marker:
+            raise KeyboardInterrupt("crash after index release")
         if self.fail_after_release:
             raise RuntimeError("crash after index release")
+        return receipt
+
+    def verify_release(self, receipt: IndexReleaseReceipt) -> None:
+        if self.release_receipt != receipt:
+            raise RuntimeError("release receipt is missing")
 
 
 @dataclass
@@ -597,6 +617,43 @@ def test_crash_after_index_release_recovers_done_without_human_review(harness: F
     assert first.kind is StepKind.DONE
     assert resumed.kind is StepKind.DONE
     assert harness.store.load().state.disposition.value == "done"
+
+
+def test_done_recovery_marks_released_only_after_verifying_the_exact_receipt(
+    harness: FinalizerHarness,
+) -> None:
+    """A restart may finish the marker CAS after an interrupted index release."""
+
+    action = harness.request_done()
+    generation = harness.accept(action)
+    harness.index.crash_before_release_marker = True
+
+    with pytest.raises(KeyboardInterrupt, match="crash after index release"):
+        harness.finalizer.advance(generation)
+
+    resumed = harness.finalizer.advance(harness.store.load())
+
+    assert resumed.kind is StepKind.DONE
+    assert harness.store.load().state.finalization_index_released is True
+
+
+def test_done_recovery_rejects_missing_index_without_a_verified_release_receipt(
+    harness: FinalizerHarness,
+) -> None:
+    """A missing index is not proof of a completed Active Run release."""
+
+    action = harness.request_done()
+    generation = harness.accept(action)
+    harness.index.crash_before_release_marker = True
+    harness.index.write_release_receipt = False
+
+    with pytest.raises(KeyboardInterrupt, match="crash after index release"):
+        harness.finalizer.advance(generation)
+
+    resumed = harness.finalizer.advance(harness.store.load())
+
+    assert resumed.kind is StepKind.HUMAN_REVIEW
+    assert harness.store.load().state.disposition.value == "human_review"
 
 
 @pytest.mark.parametrize("effect", ("commit", "push", "linear_done"))

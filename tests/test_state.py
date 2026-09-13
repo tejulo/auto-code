@@ -32,6 +32,7 @@ from auto_code.contracts import (
     FindingKind,
     HumanAuthorization,
     HumanAuthorizationAction,
+    IndexReleaseBinding,
     PreparationPhase,
     RunnerIdentity,
     RunDisposition,
@@ -415,6 +416,12 @@ def finalization_ready_state() -> RunState:
         pushed_sha="a" * 40,
         linear_done_receipt="linear-receipt-1",
         finalization_evidence=complete_finalization_evidence(),
+        finalization_index_release_binding=IndexReleaseBinding(
+            repository_id="repo-1",
+            run_id="run-1",
+            prior_revision=1,
+            prior_hash="a" * 64,
+        ),
     )
 
 

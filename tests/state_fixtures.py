@@ -14,6 +14,7 @@ from auto_code.contracts import (
     EffectIntention,
     EffectIntentionPayload,
     FinalizationEvidence,
+    IndexReleaseBinding,
     HumanAuthorization,
     HumanAuthorizationAction,
     IdentityResolution,
@@ -310,7 +311,16 @@ def persist_terminal_generation(active: ActivationResult, disposition: RunDispos
         ready.revision,
         ready.state_hash,
         ready.state.model_copy(
-            update={"disposition": RunDisposition.DONE, "finalization_evidence": evidence}
+            update={
+                "disposition": RunDisposition.DONE,
+                "finalization_evidence": evidence,
+                "finalization_index_release_binding": IndexReleaseBinding(
+                    repository_id=active.repository_id,
+                    run_id=active.run_id,
+                    prior_revision=active.index_revision,
+                    prior_hash=active.index_hash,
+                ),
+            }
         ),
     )
 

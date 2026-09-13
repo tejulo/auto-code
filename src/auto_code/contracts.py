@@ -2628,6 +2628,92 @@ class FinalizationEvidence(ContractModel):
         return reject_unsafe_persisted_value(value)
 
 
+class IndexReleaseBinding(ContractModel):
+    repository_id: str
+    run_id: str
+    prior_revision: int = Field(ge=1)
+    prior_hash: Sha256
+
+    @field_validator("repository_id", "run_id")
+    @classmethod
+    def validate_identifiers(cls, value: str) -> str:
+        validated = _safe_snapshot_identifier(value, "Index release identifier")
+        assert validated is not None
+        return validated
+
+    @field_validator("prior_hash")
+    @classmethod
+    def normalize_prior_hash(cls, value: str) -> str:
+        return value.lower()
+
+    def receipt_for(self, terminal_generation_hash: str) -> IndexReleaseReceipt:
+        return IndexReleaseReceipt.create(
+            repository_id=self.repository_id,
+            run_id=self.run_id,
+            prior_revision=self.prior_revision,
+            prior_hash=self.prior_hash,
+            terminal_generation_hash=terminal_generation_hash,
+        )
+
+
+class IndexReleaseReceipt(ContractModel):
+    repository_id: str
+    run_id: str
+    prior_revision: int = Field(ge=1)
+    prior_hash: Sha256
+    terminal_generation_hash: Sha256
+    receipt_hash: Sha256
+
+    @field_validator("repository_id", "run_id")
+    @classmethod
+    def validate_identifiers(cls, value: str) -> str:
+        validated = _safe_snapshot_identifier(value, "Index release identifier")
+        assert validated is not None
+        return validated
+
+    @field_validator("prior_hash", "terminal_generation_hash", "receipt_hash")
+    @classmethod
+    def normalize_hashes(cls, value: str) -> str:
+        return value.lower()
+
+    @model_validator(mode="after")
+    def validate_receipt_hash(self) -> IndexReleaseReceipt:
+        if self.receipt_hash != hash_json(self._receipt_payload()):
+            raise ValueError("Index release receipt hash does not match its binding")
+        return self
+
+    def _receipt_payload(self) -> dict[str, object]:
+        return self.model_dump(mode="json", round_trip=True, exclude={"receipt_hash"})
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        repository_id: str,
+        run_id: str,
+        prior_revision: int,
+        prior_hash: str,
+        terminal_generation_hash: str,
+    ) -> IndexReleaseReceipt:
+        payload = {
+            "repository_id": repository_id,
+            "run_id": run_id,
+            "prior_revision": prior_revision,
+            "prior_hash": prior_hash,
+            "terminal_generation_hash": terminal_generation_hash,
+        }
+        return cls(**payload, receipt_hash=hash_json(payload))
+
+    @property
+    def binding(self) -> IndexReleaseBinding:
+        return IndexReleaseBinding(
+            repository_id=self.repository_id,
+            run_id=self.run_id,
+            prior_revision=self.prior_revision,
+            prior_hash=self.prior_hash,
+        )
+
+
 class StageOutput(ContractModel):
     stage: Stage
     content_hash: Sha256
@@ -2687,7 +2773,8 @@ class RunState(ContractModel):
     finalization: str | None = None
     finalization_evidence: FinalizationEvidence | None = None
     finalization_index_released: bool = False
-    finalization_index_release_binding: Sha256 | None = None
+    finalization_index_release_binding: IndexReleaseBinding | None = None
+    finalization_index_release_receipt: IndexReleaseReceipt | None = None
     finalization_retry_wait_seconds: float = Field(default=0, ge=0)
     finalization_next_eligible_at: datetime | None = None
 
@@ -2709,7 +2796,6 @@ class RunState(ContractModel):
         "finalization_public_key",
         "finalization_public_key_hash",
         "restart_receipt_request_hash",
-        "finalization_index_release_binding",
     )
     @classmethod
     def normalize_preparation_binding_hashes(cls, value: str | None) -> str | None:
@@ -2770,6 +2856,15 @@ class RunState(ContractModel):
             raise ValueError("Finalization public key hash does not match")
         if self.finalization_public_key == self.repair_activation_public_key and self.finalization_public_key is not None:
             raise ValueError("Finalization public key must be dedicated")
+        if self.finalization_index_release_receipt is not None and (
+            self.finalization_index_release_binding is None
+            or self.finalization_index_release_receipt.binding != self.finalization_index_release_binding
+        ):
+            raise ValueError("Index release receipt does not match its binding")
+        if self.finalization_index_released and (
+            self.finalization_index_release_binding is None or self.finalization_index_release_receipt is None
+        ):
+            raise ValueError("Released finalization requires an exact index release receipt")
         if (self.product_change_manifest is None) != (self.product_change_manifest_hash is None):
             raise ValueError("Product Change Manifest reference and hash must be bound together")
         if (self.restart_receipt_hash is None) != (self.restart_receipt_request_hash is None):
