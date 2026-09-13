@@ -422,7 +422,7 @@ def test_trusted_fd_rejects_attacker_descriptor_before_connect(
         os.close(trust_fd)
 
 
-def test_protected_capability_rejects_an_attacker_fd4_fd5_key_pair(
+def test_attacker_cannot_finalize_with_replaced_fd4_and_fd5(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

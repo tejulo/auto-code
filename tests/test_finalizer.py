@@ -7,6 +7,7 @@ from pathlib import Path
 import os
 import socket
 import threading
+from types import SimpleNamespace
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -51,7 +52,9 @@ from auto_code.finalization_service import (
     FinalizationTrustMaterial,
     _FinalizationHandlers as FinalizationHandlers,
     _LauncherFinalizationService as FinalizationService,
+    invoke_descriptor,
 )
+from auto_code.finalization_launcher import FinalizationLauncher, FinalizationLauncherRuntime
 from auto_code.hashing import canonical_json_bytes, hash_json
 from auto_code.linear import LinearGateway
 from auto_code.mcp_bridge import McpToolResult, TrustedLinearBridge
@@ -692,6 +695,86 @@ def test_done_recovery_rejects_an_attacker_signed_release_receipt(
 
     assert resumed.kind is StepKind.HUMAN_REVIEW
     assert harness.store.load().state.disposition.value == "human_review"
+
+
+def test_index_tombstone_cannot_authorize_another_run(harness: FinalizerHarness) -> None:
+    """A signed receipt for another Active Run cannot complete this run's release marker."""
+
+    action = harness.request_done()
+    generation = harness.accept(action)
+    harness.index.crash_before_release_marker = True
+
+    with pytest.raises(KeyboardInterrupt, match="crash after index release"):
+        harness.finalizer.advance(generation)
+
+    assert harness.index.signing_key is not None
+    unsigned = IndexReleaseReceipt.create(
+        repository_id="repo-1",
+        run_id="run-2",
+        prior_revision=1,
+        prior_hash="a" * 64,
+        terminal_generation_hash=harness.store.load().state_hash,
+    )
+    harness.index.release_receipt = unsigned.with_signature(
+        harness.index.signing_key.sign(canonical_json_bytes(unsigned.signing_payload())).hex()
+    )
+
+    resumed = harness.finalizer.advance(harness.store.load())
+
+    assert resumed.kind is StepKind.HUMAN_REVIEW
+    assert harness.store.load().state.disposition.value == "human_review"
+
+
+def test_launcher_replays_completed_nonce_without_second_git_effect(harness: FinalizerHarness) -> None:
+    """Replaying a launcher capability returns its durable response without another Git effect."""
+
+    projection = harness.finalizer.advance(harness.generation)
+    generation = harness.accept(projection)
+    harness.index.repository_id = "repo-1"
+    harness.index.state_root = harness.store.root
+    launcher = FinalizationLauncher.from_runtime(
+        FinalizationLauncherRuntime(
+            state_root=harness.store.root,
+            linear=harness.finalizer.dependencies.linear,
+            git_guard=harness.git,
+            active_run_index=harness.index,
+            artifact_authority=SimpleNamespace(load_for=lambda _: harness.artifacts),
+        )
+    )
+    socket_path = harness.store.root / "launcher.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(2)
+    descriptor = launcher.serve_descriptor(
+        "run-1",
+        generation.revision,
+        generation.state_hash,
+        socket_path=socket_path,
+    )
+    service = launcher._services[descriptor.nonce]
+    trust = FinalizationTrustMaterial(
+        public_key=generation.state.finalization_public_key,
+        state_root=harness.store.root,
+        descriptor_hash=sha256(descriptor.to_bytes()).hexdigest(),
+    )
+
+    def invoke_once() -> object:
+        worker = threading.Thread(target=service.serve_once, args=(listener,), daemon=True)
+        worker.start()
+        try:
+            return invoke_descriptor(descriptor, trust=trust)
+        finally:
+            worker.join(timeout=2)
+
+    try:
+        first = invoke_once()
+        replayed = invoke_once()
+    finally:
+        listener.close()
+
+    assert replayed == first
+    assert harness.git.commit_calls == 1
+    assert harness.git.push_calls == 1
 
 
 @pytest.mark.parametrize("effect", ("commit", "push", "linear_done"))
