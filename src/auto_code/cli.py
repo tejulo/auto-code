@@ -363,7 +363,6 @@ def _run_step(
 
 def _run_finalize(
     args: argparse.Namespace,
-    runtime: TrustedRuntimeConfig | None,
 ) -> int:
     if not args.run or args.expected_revision is None or args.expected_hash is None:
         print("finalize: invalid arguments", file=sys.stderr)
@@ -372,18 +371,12 @@ def _run_finalize(
         revision = int(args.expected_revision)
         if revision < 1 or _CANONICAL_SHA256.fullmatch(args.expected_hash) is None:
             raise ValueError
-        trusted_runtime = runtime if runtime is not None else load_launcher_runtime_from_protected_fd()
-        state = RunStateStore.load_read_only(trusted_runtime.state_root, args.run).state
-        if state.finalization_public_key_hash is None:
-            raise ValueError("finalization trust is unavailable")
         response = invoke_protected_capability(
             "finalize",
             args.run,
             revision,
             args.expected_hash,
             None,
-            expected_state_root=trusted_runtime.state_root,
-            expected_finalization_key_hash=state.finalization_public_key_hash,
         )
         assert response.result is not None
         result = response.result
@@ -399,7 +392,6 @@ def _run_finalize(
 
 def _run_receipt(
     args: argparse.Namespace,
-    runtime: TrustedRuntimeConfig | None,
 ) -> int:
     if not args.run or args.expected_revision is None or args.expected_hash is None or not args.request_id:
         print("receipt: invalid arguments", file=sys.stderr)
@@ -410,18 +402,12 @@ def _run_receipt(
             raise ValueError
         if str(uuid.UUID(args.request_id)) != args.request_id:
             raise ValueError
-        trusted_runtime = runtime if runtime is not None else load_launcher_runtime_from_protected_fd()
-        state = RunStateStore.load_read_only(trusted_runtime.state_root, args.run).state
-        if state.finalization_public_key_hash is None:
-            raise ValueError("finalization trust is unavailable")
         invoke_protected_capability(
             "receipt",
             args.run,
             revision,
             args.expected_hash,
             args.request_id,
-            expected_state_root=trusted_runtime.state_root,
-            expected_finalization_key_hash=state.finalization_public_key_hash,
         )
     except (FinalizationServiceError, ValueError):
         print("receipt: operation unavailable", file=sys.stderr)
@@ -542,9 +528,9 @@ def main(
     if args.command == "step":
         return _run_step(args, runtime, supervisor_factory)
     if args.command == "finalize":
-        return _run_finalize(args, runtime)
+        return _run_finalize(args)
     if args.command == "receipt":
-        return _run_receipt(args, runtime)
+        return _run_receipt(args)
     if args.command == "repair-request":
         return _run_repair_request(args, runtime, repair_request_coordinator_factory)
     if args.command != "status":

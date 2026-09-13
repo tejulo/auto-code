@@ -26,7 +26,7 @@ from auto_code.contracts import (
     RunState,
     TrustedPreparationInputRef,
 )
-from auto_code.finalization_service import FinalizationKeyAuthority
+from auto_code.finalization_service import _FinalizationKeyAuthority as FinalizationKeyAuthority
 from auto_code.hashing import hash_json
 from auto_code.run_index import ActivationResult, ActiveRunIndex, PreparationReservation
 from auto_code.state import EMPTY_STATE_HASH, CompareAndSwapConflict, RunStateStore, StateGeneration

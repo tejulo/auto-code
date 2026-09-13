@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -48,13 +48,13 @@ from auto_code.finalizer import (
 )
 from auto_code import finalization_service
 from auto_code.finalization_service import (
-    FinalizationKeyAuthority,
     FinalizationTrustMaterial,
-    _FinalizationHandlers as FinalizationHandlers,
-    _LauncherFinalizationService as FinalizationService,
+    _FinalizationHandlersInternal as FinalizationHandlers,
+    _LauncherFinalizationServiceInternal as FinalizationService,
     invoke_descriptor,
 )
-from auto_code.finalization_launcher import FinalizationLauncher, FinalizationLauncherRuntime
+from auto_code.finalization_service import _FinalizationKeyAuthority as FinalizationKeyAuthority
+from launcher_finalization import FinalizationLauncher, _LauncherRuntime as FinalizationLauncherRuntime
 from auto_code.hashing import canonical_json_bytes, hash_json
 from auto_code.linear import LinearGateway
 from auto_code.mcp_bridge import McpToolResult, TrustedLinearBridge
@@ -265,10 +265,14 @@ class FakeGitGuard:
     pushed_sha: str | None = None
     fail_commit: bool = False
     fail_push: bool = False
+    lose_push_response: bool = False
     commit_calls: int = 0
     push_calls: int = 0
     fresh: bool = True
     refresh_calls: int = 0
+    reconcile_commit_calls: int = 0
+    reconcile_push_calls: int = 0
+    effect_calls: list[str] = field(default_factory=list)
 
     def remote_base_sha(self) -> str:
         return self.baseline_sha
@@ -280,6 +284,7 @@ class FakeGitGuard:
         assert manifest is not None
         assert message == "ENG-1: Finalize safely"
         self.commit_calls += 1
+        self.effect_calls.append("commit")
         if self.fail_commit:
             raise RuntimeError("commit failed")
         self.commit_sha = "c" * 40
@@ -287,10 +292,13 @@ class FakeGitGuard:
 
     def push(self, commit_sha: str) -> str:
         self.push_calls += 1
+        self.effect_calls.append("push")
         if self.fail_push:
             raise RuntimeError("push failed")
         assert commit_sha == self.commit_sha
         self.pushed_sha = commit_sha
+        if self.lose_push_response:
+            raise RuntimeError("push response was lost")
         return commit_sha
 
     def observe_commit(self) -> str | None:
@@ -311,11 +319,15 @@ class FakeGitGuard:
 
     def reconcile_product_commit(self, manifest: object, commit_sha: str | None) -> str | None:
         del manifest
+        self.reconcile_commit_calls += 1
+        self.effect_calls.append("reconcile_commit")
         if self.commit_sha is None or (commit_sha is not None and self.commit_sha != commit_sha):
             return None
         return self.commit_sha
 
     def reconcile_product_push(self, branch: str, commit_sha: str) -> str | None:
+        self.reconcile_push_calls += 1
+        self.effect_calls.append("reconcile_push")
         return self.pushed_sha if branch == self.branch and self.pushed_sha == commit_sha else None
 
 
@@ -548,6 +560,44 @@ def test_linear_failure_after_push_never_creates_second_commit(harness: Finalize
     assert harness.git.push_calls == 1
 
 
+def test_reconciled_commit_failure_is_observed_before_a_retry(harness: FinalizerHarness) -> None:
+    """A terminal failure record cannot permit a fresh commit before its result is re-observed."""
+
+    projection = harness.finalizer.advance(harness.generation)
+    generation = harness.accept(projection)
+    harness.git.fail_commit = True
+
+    first = harness.finalizer.advance(generation)
+    assert first.kind is StepKind.READY_TO_FINALIZE
+    assert harness.git.commit_calls == 1
+    harness.git.fail_commit = False
+
+    second = harness.finalizer.advance(harness.store.load())
+
+    assert second.kind is StepKind.MCP_ACTION
+    assert harness.git.commit_calls == 2
+    assert harness.git.effect_calls.index("reconcile_commit") < harness.git.effect_calls.index("commit", 1)
+
+
+def test_lost_push_response_is_reconciled_without_a_second_push(harness: FinalizerHarness) -> None:
+    """A push that reached the remote but lost its response must not be sent again."""
+
+    projection = harness.finalizer.advance(harness.generation)
+    generation = harness.accept(projection)
+    harness.git.lose_push_response = True
+
+    first = harness.finalizer.advance(generation)
+    assert first.kind is StepKind.READY_TO_FINALIZE
+    assert harness.git.push_calls == 1
+
+    resumed = harness.finalizer.advance(harness.store.load())
+
+    assert resumed.kind is StepKind.MCP_ACTION
+    assert harness.git.push_calls == 1
+    assert harness.git.reconcile_push_calls >= 1
+    assert harness.store.load().state.pushed_sha == "c" * 40
+
+
 def test_prefinalization_projection_binds_original_revision_and_state(harness: FinalizerHarness) -> None:
     action = harness.finalizer.advance(harness.generation)
 
@@ -732,7 +782,7 @@ def test_launcher_replays_completed_nonce_without_second_git_effect(harness: Fin
     generation = harness.accept(projection)
     harness.index.repository_id = "repo-1"
     harness.index.state_root = harness.store.root
-    launcher = FinalizationLauncher.from_runtime(
+    launcher = FinalizationLauncher(
         FinalizationLauncherRuntime(
             state_root=harness.store.root,
             linear=harness.finalizer.dependencies.linear,
@@ -768,7 +818,7 @@ def test_launcher_replays_completed_nonce_without_second_git_effect(harness: Fin
     try:
         first = invoke_once(launcher._services[descriptor.nonce])
         del launcher
-        restarted = FinalizationLauncher.from_runtime(
+        restarted = FinalizationLauncher(
             FinalizationLauncherRuntime(
                 state_root=harness.store.root,
                 linear=harness.finalizer.dependencies.linear,

@@ -7,7 +7,7 @@ from pathlib import Path
 import socket
 from typing import Protocol
 
-from .contracts import (
+from auto_code.contracts import (
     BrowserResult,
     BuildIdentity,
     ChangeOutline,
@@ -20,19 +20,19 @@ from .contracts import (
     StepResult,
     VerificationResult,
 )
-from .finalization_service import (
+from auto_code.finalization_service import (
     FinalizationCapabilityDescriptor,
-    FinalizationKeyAuthority,
+    _FinalizationKeyAuthority,
     FinalizationRequest,
-    _FinalizationHandlers,
-    _LauncherFinalizationService,
+    _FinalizationHandlersInternal,
+    _LauncherFinalizationServiceInternal,
 )
-from .finalizer import _FinalizationArtifacts, _Finalizer, _FinalizerDependencies
-from .hashing import hash_json
-from .linear import LinearGateway
-from .prepare import PreparationContextAuthority
-from .project_config import ProjectConfig
-from .state import RunStateStore, StateGeneration, _read_canonical_json
+from auto_code.finalizer import _FinalizationArtifacts, _Finalizer, _FinalizerDependencies
+from auto_code.hashing import hash_json
+from auto_code.linear import LinearGateway
+from auto_code.prepare import PreparationContextAuthority
+from auto_code.project_config import ProjectConfig
+from auto_code.state import RunStateStore, StateGeneration, _read_canonical_json
 
 
 class FinalizationArtifactError(RuntimeError):
@@ -141,7 +141,7 @@ class FinalizationArtifactAuthority:
 
 
 @dataclass(frozen=True)
-class FinalizationLauncherRuntime:
+class _LauncherRuntime:
     """Launcher-owned capabilities; never constructed by the target CLI."""
 
     state_root: Path
@@ -157,18 +157,14 @@ class FinalizationLauncherRuntime:
 class FinalizationLauncher:
     """Compose finalization only from launcher-held state and capabilities."""
 
-    def __init__(self, runtime: FinalizationLauncherRuntime) -> None:
-        if not isinstance(runtime, FinalizationLauncherRuntime):
+    def __init__(self, runtime: _LauncherRuntime) -> None:
+        if not isinstance(runtime, _LauncherRuntime):
             raise ValueError("finalization launcher runtime is invalid")
         self._runtime = runtime
         self._state_root = runtime.state_root
-        self._keys = FinalizationKeyAuthority(self._state_root)
+        self._keys = _FinalizationKeyAuthority(self._state_root)
         self._artifacts = runtime.artifact_authority or FinalizationArtifactAuthority(self._state_root)
-        self._services: dict[str, _LauncherFinalizationService] = {}
-
-    @classmethod
-    def from_runtime(cls, runtime: FinalizationLauncherRuntime) -> FinalizationLauncher:
-        return cls(runtime)
+        self._services: dict[str, _LauncherFinalizationServiceInternal] = {}
 
     def serve_descriptor(
         self,
@@ -193,20 +189,7 @@ class FinalizationLauncher:
         self._services[descriptor.nonce] = service
         return descriptor
 
-    def serve(self, run_id: str, expected_revision: int, expected_generation_hash: str) -> None:
-        generation = self._load_exact(run_id, expected_revision, expected_generation_hash)
-        self._service_for(generation).invoke_launcher(
-            FinalizationRequest(
-                operation="finalize",
-                run_id=generation.state.run_id,
-                expected_revision=generation.revision,
-                expected_state_hash=generation.state_hash,
-                request_id=None,
-                nonce=os.urandom(32).hex(),
-            )
-        )
-
-    def _service_for(self, generation: StateGeneration) -> _LauncherFinalizationService:
+    def _service_for(self, generation: StateGeneration) -> _LauncherFinalizationServiceInternal:
         self._require_active_run(generation)
         key_hash = generation.state.finalization_public_key_hash
         if key_hash is None or generation.state.finalization_public_key is None:
@@ -215,10 +198,10 @@ class FinalizationLauncher:
         public_key = key.public_key().public_bytes_raw().hex()
         if public_key != generation.state.finalization_public_key:
             raise FinalizationLauncherError("finalization trust is invalid")
-        return _LauncherFinalizationService(
+        return _LauncherFinalizationServiceInternal(
             signing_key=key,
             state_root=self._state_root,
-            handlers=_FinalizationHandlers(
+            handlers=_FinalizationHandlersInternal(
                 finalize=lambda request: self._handle_finalize(generation, request),
                 receipt=lambda request: self._handle_receipt(generation, request),
             ),
@@ -303,5 +286,4 @@ __all__ = [
     "FinalizationArtifactError",
     "FinalizationLauncher",
     "FinalizationLauncherError",
-    "FinalizationLauncherRuntime",
 ]

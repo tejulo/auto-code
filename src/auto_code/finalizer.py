@@ -357,14 +357,38 @@ class _Finalizer:
         artifacts: _FinalizationArtifacts,
     ) -> StateGeneration:
         intentions, phases = generation.state.validate_effect_ledger()
-        unresolved = [
+        effects = [
             (effect_id, intention)
             for effect_id, intention in intentions.items()
-            if intention.payload.operation == operation and phases[effect_id] != "reconciled"
+            if intention.payload.operation == operation
         ]
-        if not unresolved:
+        if not effects:
             return generation
-        effect_id, _ = unresolved[-1]
+        effect_id, _ = effects[-1]
+        if phases[effect_id] != "reconciled":
+            return self._observe_local_effect(generation, effect_id, operation, artifacts)
+        if any(
+            intention.payload.operation == f"reconcile_{operation}"
+            and intention.payload.target == effect_id
+            and phases[reconciliation_id] == "reconciled"
+            for reconciliation_id, intention in intentions.items()
+        ):
+            return generation
+        intended, reconciliation_id = self._intend(generation, f"reconcile_{operation}", effect_id)
+        return self._observe_local_effect(
+            intended,
+            reconciliation_id,
+            operation,
+            artifacts,
+        )
+
+    def _observe_local_effect(
+        self,
+        generation: StateGeneration,
+        effect_id: str,
+        operation: str,
+        artifacts: _FinalizationArtifacts,
+    ) -> StateGeneration:
         observed = (
             self._call(self.dependencies.git_guard, "reconcile_product_commit", artifacts.product_manifest, generation.state.commit_sha)
             if operation == "commit"

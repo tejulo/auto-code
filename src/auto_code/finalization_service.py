@@ -66,7 +66,7 @@ class FinalizationTrustBinding:
             raise ValueError("finalization public key hash is invalid")
 
 
-class FinalizationKeyAuthority:
+class _FinalizationKeyAuthority:
     """Persist finalization private keys exclusively below the launcher-owned state root."""
 
     def __init__(self, state_root: Path) -> None:
@@ -541,7 +541,7 @@ class FinalizationResponse:
 
 
 @dataclass(frozen=True, slots=True)
-class _FinalizationHandlers:
+class _FinalizationHandlersInternal:
     finalize: Callable[[FinalizationRequest], StepResult]
     receipt: Callable[[FinalizationRequest], StepResult]
 
@@ -550,11 +550,11 @@ class _FinalizationHandlers:
             raise ValueError("finalization handlers are invalid")
 
 
-class _LauncherFinalizationService:
+class _LauncherFinalizationServiceInternal:
     """Launcher-owned finalizer and receipt composition behind a one-use local capability."""
 
-    def __init__(self, *, signing_key: Ed25519PrivateKey, state_root: Path, handlers: _FinalizationHandlers, peer_uid: int | None = None) -> None:
-        if not isinstance(signing_key, Ed25519PrivateKey) or not isinstance(handlers, _FinalizationHandlers):
+    def __init__(self, *, signing_key: Ed25519PrivateKey, state_root: Path, handlers: _FinalizationHandlersInternal, peer_uid: int | None = None, peer_pid: int | None = None) -> None:
+        if not isinstance(signing_key, Ed25519PrivateKey) or not isinstance(handlers, _FinalizationHandlersInternal):
             raise ValueError("finalization service is invalid")
         self._signing_key = signing_key
         self._public_key = signing_key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
@@ -564,6 +564,9 @@ class _LauncherFinalizationService:
         self._peer_uid = os.getuid() if peer_uid is None else peer_uid
         if not isinstance(self._peer_uid, int) or self._peer_uid < 0:
             raise ValueError("launcher peer UID is invalid")
+        self._peer_pid = peer_pid
+        if self._peer_pid is not None and (not isinstance(self._peer_pid, int) or self._peer_pid < 1):
+            raise ValueError("launcher peer PID is invalid")
         self._lock = threading.Lock()
         self._io_timeout_seconds: float | None = None
 
@@ -651,13 +654,13 @@ class _LauncherFinalizationService:
             if record["status"] != "issued":
                 raise FinalizationServiceError("capability is replayed")
             _atomic_replace_json(self._record_path(request.nonce), {"descriptor": descriptor.payload(), "status": "consumed", "response": None})
-        result = self.invoke_launcher(request)
+        result = self._dispatch_handler(request)
         response = self._response(request, result=result, error=None)
         with _interprocess_lock(self._record_root / "lock"):
             _atomic_replace_json(self._record_path(request.nonce), {"descriptor": descriptor.payload(), "status": "completed", "response": response.payload()})
         return response
 
-    def invoke_launcher(self, request: FinalizationRequest) -> StepResult:
+    def _dispatch_handler(self, request: FinalizationRequest) -> StepResult:
         """Run a launcher-originated request through the same handler validation as IPC."""
 
         if not isinstance(request, FinalizationRequest):
@@ -706,10 +709,10 @@ class _LauncherFinalizationService:
     def _authenticated_peer(self, connection: socket.socket) -> bool:
         try:
             credentials = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
-            _, uid, _ = struct.unpack("3i", credentials)
+            pid, uid, _ = struct.unpack("3i", credentials)
         except (AttributeError, OSError, struct.error):
             return False
-        return uid == self._peer_uid
+        return uid == self._peer_uid and (self._peer_pid is None or pid == self._peer_pid)
 
     def _response(
         self,
@@ -778,28 +781,25 @@ def load_finalization_trust_from_protected_fd() -> FinalizationTrustMaterial:
 def validate_finalization_capability(
     capability: FinalizationCapabilityDescriptor,
     trust: FinalizationTrustMaterial,
-    expected_state_root: Path,
-    expected_finalization_key_hash: str,
 ) -> None:
     try:
         capability.verify(trust.public_key)
-        expected_root = _normalize_state_root(expected_state_root)
-        expected_key_hash = _require_hash(expected_finalization_key_hash, "expected finalization key hash")
+        expected_root = trust.state_root
         if (
             trust.descriptor_hash != hashlib.sha256(capability.to_bytes()).hexdigest()
-            or trust.state_root != expected_root
-            or hashlib.sha256(bytes.fromhex(trust.public_key)).hexdigest() != expected_key_hash
         ):
             raise FinalizationCapabilityError("finalization trust binding is invalid")
         from .state import RunStateStore
 
         generation = RunStateStore.load_read_only(expected_root, capability.run_id)
         state = generation.state
+        expected_key_hash = state.finalization_public_key_hash
         if (
-            generation.revision != capability.expected_revision
+            expected_key_hash is None
+            or hashlib.sha256(bytes.fromhex(trust.public_key)).hexdigest() != expected_key_hash
+            or generation.revision != capability.expected_revision
             or generation.state_hash != capability.expected_state_hash
             or state.finalization_public_key != trust.public_key
-            or state.finalization_public_key_hash != expected_key_hash
         ):
             raise FinalizationCapabilityError("finalization trust binding is invalid")
         if capability.socket_uid != os.getuid() or _socket_identity(capability.socket_path) != (capability.socket_device, capability.socket_inode, capability.socket_uid, capability.socket_mode, capability.socket_ctime_ns):
@@ -810,17 +810,12 @@ def validate_finalization_capability(
 
 def load_capability_from_protected_fd(
     trust: FinalizationTrustMaterial,
-    *,
-    expected_state_root: Path,
-    expected_finalization_key_hash: str,
 ) -> FinalizationCapabilityDescriptor:
     try:
         capability = FinalizationCapabilityDescriptor.from_payload(_load_protected_json(_LAUNCHER_FINALIZATION_FD, "capability"))
         validate_finalization_capability(
             capability,
             trust,
-            expected_state_root,
-            expected_finalization_key_hash,
         )
         return capability
     except (TypeError, ValueError, FinalizationServiceError) as error:
@@ -856,16 +851,9 @@ def invoke_protected_capability(
     expected_revision: int,
     expected_state_hash: str,
     request_id: str | None,
-    *,
-    expected_state_root: Path,
-    expected_finalization_key_hash: str,
 ) -> FinalizationResponse:
     trust = load_finalization_trust_from_protected_fd()
-    descriptor = load_capability_from_protected_fd(
-        trust,
-        expected_state_root=expected_state_root,
-        expected_finalization_key_hash=expected_finalization_key_hash,
-    )
+    descriptor = load_capability_from_protected_fd(trust)
     request = FinalizationRequest(
         operation=operation,
         run_id=run_id,
@@ -905,12 +893,10 @@ def _read_frame(connection: socket.socket, deadline: _Deadline) -> object:
 __all__ = [
     "FinalizationCapabilityDescriptor",
     "FinalizationCapabilityError",
-    "FinalizationKeyAuthority",
     "FinalizationRequest",
     "FinalizationResponse",
     "FinalizationServiceError",
     "FinalizationTrustMaterial",
-    "FinalizationTrustBinding",
     "invoke_descriptor",
     "invoke_protected_capability",
     "load_capability_from_protected_fd",

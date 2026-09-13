@@ -17,14 +17,14 @@ from auto_code.contracts import (
     TicketSnapshot,
     TrustedPreparationInputRef,
 )
-from auto_code.finalization_launcher import (
+from launcher_finalization import (
     FinalizationArtifactAuthority,
     FinalizationArtifactError,
     FinalizationLauncher,
     FinalizationLauncherError,
-    FinalizationLauncherRuntime,
+    _LauncherRuntime as FinalizationLauncherRuntime,
 )
-from auto_code.finalization_service import FinalizationCapabilityError, FinalizationKeyAuthority
+from auto_code.finalization_service import FinalizationCapabilityError, _FinalizationKeyAuthority as FinalizationKeyAuthority
 from auto_code.prepare import PreparationContext, PreparationContextAuthority
 from auto_code.state import EMPTY_STATE_HASH, RunStateStore
 
@@ -126,7 +126,7 @@ def test_launcher_issues_a_finalize_descriptor_from_the_exact_active_run(tmp_pat
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(socket_path))
     try:
-        launcher = FinalizationLauncher.from_runtime(
+        launcher = FinalizationLauncher(
             FinalizationLauncherRuntime(state_root=tmp_path, active_run_index=ActiveIndexHarness(tmp_path))
         )
 
@@ -153,7 +153,7 @@ def test_launcher_rejects_descriptor_issuance_after_the_active_run_index_is_rele
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(socket_path))
     try:
-        launcher = FinalizationLauncher.from_runtime(
+        launcher = FinalizationLauncher(
             FinalizationLauncherRuntime(state_root=tmp_path, active_run_index=ActiveIndexHarness(tmp_path, active=False))
         )
 
@@ -163,30 +163,14 @@ def test_launcher_rejects_descriptor_issuance_after_the_active_run_index_is_rele
         listener.close()
 
 
-def test_launcher_serve_validates_the_persisted_finalization_key_before_finalizer_effects(tmp_path: Path) -> None:
-    """Bypassing the protected service path would reach finalizer construction with a forged trust binding."""
+def test_launcher_exposes_no_direct_finalizer_invocation(tmp_path: Path) -> None:
+    """All launcher execution enters through an issued descriptor and durable nonce lifecycle."""
 
-    _, generation = _persisted_run(tmp_path)
-    key_path = tmp_path / "finalization-keys" / f"{generation.state.finalization_public_key_hash}.json"
-    key_path.write_text("{}", encoding="ascii")
-    launcher = FinalizationLauncher.from_runtime(
+    launcher = FinalizationLauncher(
         FinalizationLauncherRuntime(state_root=tmp_path, active_run_index=ActiveIndexHarness(tmp_path))
     )
 
-    with pytest.raises(FinalizationCapabilityError, match="private key"):
-        launcher.serve("run-1", generation.revision, generation.state_hash)
-
-
-def test_launcher_serve_rejects_a_released_active_run_before_finalizer_effects(tmp_path: Path) -> None:
-    """A direct finalizer call would run after the Active Run Index had been released."""
-
-    _, generation = _persisted_run(tmp_path)
-    launcher = FinalizationLauncher.from_runtime(
-        FinalizationLauncherRuntime(state_root=tmp_path, active_run_index=ActiveIndexHarness(tmp_path, active=False))
-    )
-
-    with pytest.raises(FinalizationLauncherError, match="Active Run Index"):
-        launcher.serve("run-1", generation.revision, generation.state_hash)
+    assert not hasattr(launcher, "serve")
 
 
 @pytest.mark.parametrize(
@@ -208,7 +192,7 @@ def test_launcher_rejects_nonexact_active_run_index_bindings(
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(socket_path))
     try:
-        launcher = FinalizationLauncher.from_runtime(
+        launcher = FinalizationLauncher(
             FinalizationLauncherRuntime(state_root=tmp_path, active_run_index=index(tmp_path))
         )
 

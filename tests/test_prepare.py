@@ -33,7 +33,7 @@ from auto_code.contracts import (
 )
 from auto_code.hashing import canonical_json_bytes, hash_json
 from auto_code.compatibility import CompatibilityPreflightError, CompatibilityPreflightResult, CompatibilityReceiptAuthority
-from auto_code.finalization_service import FinalizationKeyAuthority
+from auto_code.finalization_service import _FinalizationKeyAuthority as FinalizationKeyAuthority
 from auto_code.linear import LinearGateway
 from auto_code.mcp_bridge import McpToolResult, TrustedLinearBridge, _sign
 from auto_code.git import BranchBinding, BranchReuseError

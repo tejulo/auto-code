@@ -19,17 +19,17 @@ from auto_code.contracts import RunState, StepKind, StepResult
 from auto_code.finalization_service import (
     FinalizationCapabilityDescriptor,
     FinalizationCapabilityError,
-    FinalizationKeyAuthority,
     FinalizationRequest,
     FinalizationServiceError,
     FinalizationTrustMaterial,
-    _FinalizationHandlers as FinalizationHandlers,
-    _LauncherFinalizationService as FinalizationService,
+    _FinalizationHandlersInternal as FinalizationHandlers,
+    _LauncherFinalizationServiceInternal as FinalizationService,
     invoke_descriptor,
     invoke_protected_capability,
     load_capability_from_protected_fd,
     validate_finalization_capability,
 )
+from auto_code.finalization_service import _FinalizationKeyAuthority as FinalizationKeyAuthority
 from auto_code import finalization_service
 from auto_code.hashing import canonical_json_bytes
 from auto_code.state import EMPTY_STATE_HASH, RunStateStore
@@ -173,8 +173,6 @@ def test_capability_descriptor_requires_a_signed_fixed_fd(
                 state_root=service.state_root,
                 descriptor_hash=__import__("hashlib").sha256(issued.to_bytes()).hexdigest(),
             ),
-            expected_state_root=service.state_root,
-            expected_finalization_key_hash=generation.state.finalization_public_key_hash,
         ) == issued
     finally:
         os.close(fd)
@@ -413,8 +411,6 @@ def test_trusted_fd_rejects_attacker_descriptor_before_connect(
                 3,
                 "a" * 64,
                 None,
-                expected_state_root=service.state_root,
-                expected_finalization_key_hash="f" * 64,
             )
         with pytest.raises(TimeoutError):
             listener.accept()
@@ -517,8 +513,6 @@ try:
         int(sys.argv[5]),
         sys.argv[6],
         None,
-        expected_state_root=Path(sys.argv[3]),
-        expected_finalization_key_hash=sys.argv[4],
     )
 except (FinalizationCapabilityError, FinalizationServiceError):
     raise SystemExit(0)
@@ -531,10 +525,11 @@ raise SystemExit("attacker-controlled inherited FDs reached finalization")
                 str(generation.revision),
                 generation.state_hash,
             ),
-            pass_fds=(descriptor_fd, trust_fd),
-            capture_output=True,
-            text=True,
-        )
+                pass_fds=(descriptor_fd, trust_fd),
+                capture_output=True,
+                text=True,
+                env={**os.environ, "PYTHONPATH": str(Path.cwd() / "src")},
+            )
         assert child.returncode == 0, child.stderr
         with pytest.raises(TimeoutError):
             listener.accept()
@@ -607,8 +602,6 @@ def test_capability_rejects_replaced_descriptor_and_trust_fds(tmp_path: Path) ->
             validate_finalization_capability(
                 attacker_descriptor,
                 attacker_trust,
-                state_root,
-                generation.state.finalization_public_key_hash,
             )
     finally:
         listener.close()
@@ -794,22 +787,11 @@ def test_finalization_commands_do_not_accept_composition_callbacks() -> None:
         main(["finalize"], finalizer_factory=lambda _: object())
 
 
-def test_launcher_internal_dispatch_uses_the_protected_handler_path(
+def test_service_exposes_no_direct_launcher_dispatch(
     service: FinalizationService,
     handlers: RecordingHandlers,
 ) -> None:
-    """Bypassing service handler validation would let the launcher invoke a finalizer directly."""
+    """The launcher has no public bypass around the durable nonce lifecycle."""
 
-    result = service.invoke_launcher(
-        FinalizationRequest(
-            operation="finalize",
-            run_id="run-1",
-            expected_revision=3,
-            expected_state_hash="a" * 64,
-            request_id=None,
-            nonce="b" * 64,
-        )
-    )
-
-    assert result.kind is StepKind.READY_TO_FINALIZE
-    assert handlers.calls == [("finalize", "run-1", 3, "a" * 64, None)]
+    assert not hasattr(service, "invoke_launcher")
+    assert handlers.calls == []

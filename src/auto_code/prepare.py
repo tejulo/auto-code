@@ -40,7 +40,6 @@ from .contracts import (
 )
 from .git import BranchBinding, BranchReuseError
 from .compatibility import CompatibilityPreflightError, load_descriptor_bound_policy
-from .finalization_service import FinalizationKeyAuthority
 from .hashing import hash_json
 from .linear import LinearGateway, select_ticket
 from .run_index import ActivationResult, IndexProbeResult, PreparationReservation, ReservationOwner, SelectedActivationClaim
@@ -129,6 +128,10 @@ class _CompatibilityVerifier(Protocol):
     def verify(self, runtime_config: object, role_config: object) -> object: ...
 
 
+class _FinalizationKeyProvisioner(Protocol):
+    def provision(self, reservation_id: str) -> object: ...
+
+
 @dataclass(frozen=True)
 class PrepareProbeResult:
     kind: Literal["RESUME", "BLOCKED", "INPUT_REQUIRED"]
@@ -184,7 +187,7 @@ class PrepareCoordinator:
         reservation_owner: Callable[[], ReservationOwner],
         now: Callable[[], datetime],
         repair_activation_public_key: bytes,
-        finalization_keys: FinalizationKeyAuthority,
+        finalization_keys: _FinalizationKeyProvisioner,
         linear: LinearGateway | None = None,
         context: PreparationContextAuthority | None = None,
     ) -> None:
@@ -199,7 +202,7 @@ class PrepareCoordinator:
         if not isinstance(repair_activation_public_key, bytes) or len(repair_activation_public_key) != 32:
             raise ValueError("repair activation public key is invalid")
         self.repair_activation_public_key = bytes(repair_activation_public_key)
-        if not isinstance(finalization_keys, FinalizationKeyAuthority):
+        if not callable(getattr(finalization_keys, "provision", None)):
             raise ValueError("finalization key authority is invalid")
         self.finalization_keys = finalization_keys
         self.linear = linear

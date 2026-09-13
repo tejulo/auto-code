@@ -578,9 +578,9 @@ class ActiveRunIndex:
         try:
             if state.finalization_public_key is None or state.finalization_public_key_hash is None:
                 raise ValueError
-            from .finalization_service import FinalizationKeyAuthority
+            from .finalization_service import _FinalizationKeyAuthority
 
-            key = FinalizationKeyAuthority(self.root).load_private_key(state.finalization_public_key_hash)
+            key = _FinalizationKeyAuthority(self.root).load_private_key(state.finalization_public_key_hash)
             if key.public_key().public_bytes_raw().hex() != state.finalization_public_key:
                 raise ValueError
             return receipt.with_signature(key.sign(canonical_json_bytes(receipt.signing_payload())).hex())
