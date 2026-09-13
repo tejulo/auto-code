@@ -27,7 +27,7 @@ from .contracts import (
     TicketSnapshot,
     TrustedPreparationInputRef,
 )
-from .hashing import hash_json
+from .hashing import canonical_json_bytes, hash_json
 from .state import (
     EMPTY_STATE_HASH,
     AuthoritativeStateCorrupt,
@@ -518,12 +518,15 @@ class ActiveRunIndex:
                     pass
                 else:
                     raise NonTerminalRunRelease("only terminal authorized generations may release an Active Run")
-                receipt = IndexReleaseReceipt.create(
-                    repository_id=repository_id,
-                    run_id=run_id,
-                    prior_revision=entry.revision,
-                    prior_hash=entry.index_hash,
-                    terminal_generation_hash=terminal_generation_hash,
+                receipt = self._sign_release_receipt(
+                    IndexReleaseReceipt.create(
+                        repository_id=repository_id,
+                        run_id=run_id,
+                        prior_revision=entry.revision,
+                        prior_hash=entry.index_hash,
+                        terminal_generation_hash=terminal_generation_hash,
+                    ),
+                    state,
                 )
                 path = self._release_path(receipt)
                 payload = receipt.model_dump(mode="json", round_trip=True)
@@ -534,6 +537,11 @@ class ActiveRunIndex:
 
     def verify_release(self, receipt: IndexReleaseReceipt) -> None:
         """Verify an fsynced tombstone still proves one exact terminal index removal."""
+
+        self.load_verified_release(receipt)
+
+    def load_verified_release(self, receipt: IndexReleaseReceipt) -> IndexReleaseReceipt:
+        """Load the signed tombstone matching one expected release binding."""
 
         if not isinstance(receipt, IndexReleaseReceipt):
             raise ValueError("index release receipt is invalid")
@@ -546,7 +554,7 @@ class ActiveRunIndex:
                 )
             except Exception as error:
                 raise AuthoritativeIndexCorrupt("Active Run release receipt is missing or corrupt") from error
-            if stored != receipt:
+            if not stored.matches(receipt):
                 raise AuthoritativeIndexCorrupt("Active Run release receipt does not match the release binding")
             store = RunStateStore(self.root, receipt.run_id, authorization_verifier=self.authorization_verifier)
             with store.interprocess_lock():
@@ -557,6 +565,27 @@ class ActiveRunIndex:
                     or generation.state.disposition not in {RunDisposition.DONE, RunDisposition.ABANDONED}
                 ):
                     raise TerminalGenerationMismatch("release receipt does not match the terminal Active Run state")
+                try:
+                    state = generation.state
+                    if state.finalization_public_key is None or state.finalization_public_key_hash is None:
+                        raise ValueError
+                    stored.verify_signature(state.finalization_public_key, state.finalization_public_key_hash)
+                except ValueError as error:
+                    raise AuthoritativeIndexCorrupt("Active Run release receipt signature is invalid") from error
+            return stored
+
+    def _sign_release_receipt(self, receipt: IndexReleaseReceipt, state: RunState) -> IndexReleaseReceipt:
+        try:
+            if state.finalization_public_key is None or state.finalization_public_key_hash is None:
+                raise ValueError
+            from .finalization_service import FinalizationKeyAuthority
+
+            key = FinalizationKeyAuthority(self.root).load_private_key(state.finalization_public_key_hash)
+            if key.public_key().public_bytes_raw().hex() != state.finalization_public_key:
+                raise ValueError
+            return receipt.with_signature(key.sign(canonical_json_bytes(receipt.signing_payload())).hex())
+        except Exception as error:
+            raise AuthoritativeIndexCorrupt("Active Run release signing key is unavailable") from error
 
     @contextmanager
     def _repository_lock(self, repository_id: str) -> Iterator[None]:

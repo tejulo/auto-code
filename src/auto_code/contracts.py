@@ -10,6 +10,8 @@ from typing import Annotated, Any, Literal, Mapping, Protocol, Self, TypeAlias
 from urllib.parse import urlsplit, urlunsplit
 import uuid
 
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -2663,6 +2665,7 @@ class IndexReleaseReceipt(ContractModel):
     prior_hash: Sha256
     terminal_generation_hash: Sha256
     receipt_hash: Sha256
+    signature: str | None = None
 
     @field_validator("repository_id", "run_id")
     @classmethod
@@ -2682,8 +2685,15 @@ class IndexReleaseReceipt(ContractModel):
             raise ValueError("Index release receipt hash does not match its binding")
         return self
 
+    @field_validator("signature")
+    @classmethod
+    def validate_signature(cls, value: str | None) -> str | None:
+        if value is not None and re.fullmatch(r"[0-9a-f]{128}", value) is None:
+            raise ValueError("Index release signature is invalid")
+        return value
+
     def _receipt_payload(self) -> dict[str, object]:
-        return self.model_dump(mode="json", round_trip=True, exclude={"receipt_hash"})
+        return self.model_dump(mode="json", round_trip=True, exclude={"receipt_hash", "signature"})
 
     @classmethod
     def create(
@@ -2703,6 +2713,30 @@ class IndexReleaseReceipt(ContractModel):
             "terminal_generation_hash": terminal_generation_hash,
         }
         return cls(**payload, receipt_hash=hash_json(payload))
+
+    def signing_payload(self) -> dict[str, object]:
+        return {
+            "domain": "auto-code-index-release/v1",
+            **self.model_dump(mode="json", round_trip=True, exclude={"signature"}),
+        }
+
+    def with_signature(self, signature: str) -> IndexReleaseReceipt:
+        return self.model_copy(update={"signature": signature})
+
+    def matches(self, expected: IndexReleaseReceipt) -> bool:
+        return self._receipt_payload() == expected._receipt_payload() and self.receipt_hash == expected.receipt_hash
+
+    def verify_signature(self, public_key: str, public_key_hash: str) -> None:
+        try:
+            public_key_bytes = bytes.fromhex(public_key)
+            if hashlib.sha256(public_key_bytes).hexdigest() != public_key_hash or self.signature is None:
+                raise ValueError
+            Ed25519PublicKey.from_public_bytes(public_key_bytes).verify(
+                bytes.fromhex(self.signature),
+                canonical_json_bytes(self.signing_payload()),
+            )
+        except (InvalidSignature, ValueError):
+            raise ValueError("Index release signature is invalid") from None
 
     @property
     def binding(self) -> IndexReleaseBinding:
@@ -2862,7 +2896,9 @@ class RunState(ContractModel):
         ):
             raise ValueError("Index release receipt does not match its binding")
         if self.finalization_index_released and (
-            self.finalization_index_release_binding is None or self.finalization_index_release_receipt is None
+            self.finalization_index_release_binding is None
+            or self.finalization_index_release_receipt is None
+            or self.finalization_index_release_receipt.signature is None
         ):
             raise ValueError("Released finalization requires an exact index release receipt")
         if (self.product_change_manifest is None) != (self.product_change_manifest_hash is None):

@@ -1497,9 +1497,7 @@ def test_corrupt_referenced_generation_never_rewinds(tmp_path: Path) -> None:
 
 
 def test_active_run_blocks_new_claim_until_done(tmp_path: Path) -> None:
-    index = preparation_index(tmp_path)
-    reservation = index.reserve("repo-1")
-    active = index.activate_reservation(activation_request(reservation, run_id="run-1"))
+    index, active = activated_index(tmp_path)
 
     with pytest.raises(ActiveRunExists):
         index.reserve("repo-1")

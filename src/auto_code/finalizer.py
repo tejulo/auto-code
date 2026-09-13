@@ -556,7 +556,7 @@ class _Finalizer:
             if lookup(generation.state.repository_id) is not None:
                 raise
             return self._reconcile_released_index(generation, index)
-        if not isinstance(receipt, IndexReleaseReceipt) or receipt != binding.receipt_for(generation.state_hash):
+        if not isinstance(receipt, IndexReleaseReceipt) or not receipt.matches(binding.receipt_for(generation.state_hash)):
             raise FinalizationError("Active Run Index release receipt is invalid")
         verifier = getattr(index, "verify_release", None)
         if not callable(verifier):
@@ -570,11 +570,13 @@ class _Finalizer:
         binding = generation.state.finalization_index_release_binding
         if not isinstance(binding, IndexReleaseBinding):
             raise FinalizationError("Active Run Index release binding is unavailable")
-        receipt = binding.receipt_for(generation.state_hash)
-        verifier = getattr(index, "verify_release", None)
-        if not callable(verifier):
+        expected = binding.receipt_for(generation.state_hash)
+        loader = getattr(index, "load_verified_release", None)
+        if not callable(loader):
             raise FinalizationError("Active Run Index receipt verifier is unavailable")
-        verifier(receipt)
+        receipt = loader(expected)
+        if not isinstance(receipt, IndexReleaseReceipt) or not receipt.matches(expected):
+            raise FinalizationError("Active Run Index release receipt is invalid")
         return self._mark_index_released(generation, receipt)
 
     def _mark_index_released(self, generation: StateGeneration, receipt: IndexReleaseReceipt) -> StateGeneration:

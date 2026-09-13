@@ -738,7 +738,12 @@ class RunStateStore:
         previous = previous_generation.state
         binding = previous.finalization_index_release_binding
         receipt = state.finalization_index_release_receipt
-        if binding is None or receipt is None:
+        if (
+            binding is None
+            or receipt is None
+            or previous.finalization_public_key is None
+            or previous.finalization_public_key_hash is None
+        ):
             return False
         marker = previous.model_copy(
             update={
@@ -746,7 +751,11 @@ class RunStateStore:
                 "finalization_index_release_receipt": receipt,
             }
         )
-        return state == marker and receipt == binding.receipt_for(previous_generation.state_hash)
+        try:
+            receipt.verify_signature(previous.finalization_public_key, previous.finalization_public_key_hash)
+        except ValueError:
+            return False
+        return state == marker and receipt.matches(binding.receipt_for(previous_generation.state_hash))
 
     def _verify_repair_activation(self, previous: StateGeneration, state: RunState) -> None:
         error = "repair activation transition is not verified"

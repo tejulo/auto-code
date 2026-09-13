@@ -52,7 +52,7 @@ from auto_code.finalization_service import (
     _FinalizationHandlers as FinalizationHandlers,
     _LauncherFinalizationService as FinalizationService,
 )
-from auto_code.hashing import hash_json
+from auto_code.hashing import canonical_json_bytes, hash_json
 from auto_code.linear import LinearGateway
 from auto_code.mcp_bridge import McpToolResult, TrustedLinearBridge
 from auto_code.project_config import (
@@ -357,6 +357,8 @@ class FakeActiveRunIndex:
     crash_before_release_marker: bool = False
     write_release_receipt: bool = True
     release_receipt: IndexReleaseReceipt | None = None
+    signing_key: Ed25519PrivateKey | None = None
+    sign_with_attacker_key: bool = False
 
     def lookup(self, repository_id: str) -> FakeActiveRunIndex | None:
         assert repository_id == "repo-1"
@@ -365,12 +367,17 @@ class FakeActiveRunIndex:
     def release(self, *args: object) -> IndexReleaseReceipt:
         assert args[1] == self.run_id
         self.release_calls += 1
-        receipt = IndexReleaseReceipt.create(
+        unsigned = IndexReleaseReceipt.create(
             repository_id=str(args[0]),
             run_id=str(args[1]),
             prior_revision=int(args[2]),
             prior_hash=str(args[3]),
             terminal_generation_hash=str(args[4]),
+        )
+        assert self.signing_key is not None
+        signer = Ed25519PrivateKey.generate() if self.sign_with_attacker_key else self.signing_key
+        receipt = unsigned.with_signature(
+            signer.sign(canonical_json_bytes(unsigned.signing_payload())).hex()
         )
         if self.write_release_receipt:
             self.release_receipt = receipt
@@ -382,8 +389,18 @@ class FakeActiveRunIndex:
         return receipt
 
     def verify_release(self, receipt: IndexReleaseReceipt) -> None:
-        if self.release_receipt != receipt:
+        if self.release_receipt is None or not self.release_receipt.matches(receipt) or self.signing_key is None:
             raise RuntimeError("release receipt is missing")
+        public_key = self.signing_key.public_key().public_bytes_raw().hex()
+        try:
+            self.release_receipt.verify_signature(public_key, sha256(bytes.fromhex(public_key)).hexdigest())
+        except ValueError as error:
+            raise RuntimeError("release receipt signature is invalid") from error
+
+    def load_verified_release(self, receipt: IndexReleaseReceipt) -> IndexReleaseReceipt:
+        self.verify_release(receipt)
+        assert self.release_receipt is not None
+        return self.release_receipt
 
 
 @dataclass
@@ -493,7 +510,9 @@ def harness(tmp_path: Path) -> FinalizerHarness:
     )
     generation = store.compare_and_swap(statuses.revision, statuses.state_hash, state)
     git = FakeGitGuard(approved.product_manifest.baseline_sha)
-    index = FakeActiveRunIndex()
+    index = FakeActiveRunIndex(
+        signing_key=FinalizationKeyAuthority(tmp_path).load_private_key(finalization_binding.public_key_hash)
+    )
     finalizer = Finalizer(
         FinalizerDependencies(
             store=store,
@@ -646,6 +665,25 @@ def test_done_recovery_rejects_missing_index_without_a_verified_release_receipt(
     generation = harness.accept(action)
     harness.index.crash_before_release_marker = True
     harness.index.write_release_receipt = False
+
+    with pytest.raises(KeyboardInterrupt, match="crash after index release"):
+        harness.finalizer.advance(generation)
+
+    resumed = harness.finalizer.advance(harness.store.load())
+
+    assert resumed.kind is StepKind.HUMAN_REVIEW
+    assert harness.store.load().state.disposition.value == "human_review"
+
+
+def test_done_recovery_rejects_an_attacker_signed_release_receipt(
+    harness: FinalizerHarness,
+) -> None:
+    """A restart must reject a tombstone signed by a key other than the Active Run key."""
+
+    action = harness.request_done()
+    generation = harness.accept(action)
+    harness.index.crash_before_release_marker = True
+    harness.index.sign_with_attacker_key = True
 
     with pytest.raises(KeyboardInterrupt, match="crash after index release"):
         harness.finalizer.advance(generation)
