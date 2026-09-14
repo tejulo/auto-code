@@ -31,6 +31,7 @@ from .git import GitGuard
 from .hashing import canonical_json_bytes
 from .linear import LinearGateway
 from .mcp_bridge import McpToolResult, TrustedLinearBridge
+from .process import LauncherSocketSandbox
 from .run_index import ActiveRunIndex
 from .state import RunStateStore
 
@@ -193,7 +194,7 @@ def load_protected_bootstrap() -> _LauncherRuntime:
             "state_fd", "index_fd", "git_fd", "key_fd", "state_sha256", "index_sha256", "bridge_sha256",
             "git_sha256", "key_sha256", "bridge_transport_device", "bridge_transport_inode",
             "bridge_transport_peer_pid", "bridge_transport_peer_uid", "bridge_transport_peer_gid",
-            "finalization_public_key_hash", "finalization_parent", "signature",
+            "finalization_public_key_hash", "finalization_parent", "sandbox_socket_path", "sandbox_identity", "signature",
         }
         if set(config) != expected or config["domain"] != "auto-code-launcher-bootstrap/v1":
             raise ValueError
@@ -212,6 +213,7 @@ def load_protected_bootstrap() -> _LauncherRuntime:
             raise ValueError
         state_root = _require_path(config["state_root"], "state root")
         repository_root = _require_path(config["repository_root"], "repository root")
+        sandbox = LauncherSocketSandbox(Path(_require_path_value(config["sandbox_socket_path"], "sandbox socket")), _require_sandbox_identity(config["sandbox_identity"]))
         key_hash = _require_hash(config["finalization_public_key_hash"], "finalization public key hash")
         parent = FinalizationParentCapability.from_payload(config["finalization_parent"])
         parent.verify()
@@ -299,9 +301,25 @@ def load_protected_bootstrap() -> _LauncherRuntime:
             artifact_authority=FinalizationArtifactAuthority(state_root),
             signing_key=signing_key,
             finalization_parent=parent,
+            sandbox=sandbox,
         )
     except (InvalidSignature, OSError, TypeError, ValueError, FinalizationLauncherBootstrapError) as error:
         raise FinalizationLauncherBootstrapError("protected bootstrap is invalid") from error
+
+
+def _require_path_value(value: object, description: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{description} is invalid")
+    path = Path(value)
+    if not path.is_absolute() or ".." in path.parts or path.is_symlink():
+        raise ValueError(f"{description} is invalid")
+    return value
+
+
+def _require_sandbox_identity(value: object) -> str:
+    if not isinstance(value, str) or not value or len(value) > 255:
+        raise ValueError("sandbox identity is invalid")
+    return value
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -374,6 +374,70 @@ class LauncherSocketSandbox:
             raise ProcessConfigurationError("Python archive response is invalid")
         return SandboxCompleted(response["returncode"], response["stdout"], response["stderr"])
 
+    def _finalization_child_request(self, operation: str, child_id: str, timeout: float | None) -> object:
+        if operation not in {
+            "poll_finalization_child",
+            "wait_finalization_child",
+            "terminate_finalization_child",
+            "kill_finalization_child",
+        } or len(child_id) != 32 or any(character not in "0123456789abcdef" for character in child_id):
+            raise ProcessConfigurationError("Finalization child request is invalid")
+        return self._exchange(
+            {
+                "schema_version": "v1",
+                "sandbox_identity": self.identity,
+                "operation": operation,
+                "child_id": child_id,
+            },
+            5.0 if timeout is None else _positive_timeout(timeout),
+        )
+
+    def start_finalization_child(
+        self,
+        argv: tuple[str, ...],
+        *,
+        capability_fds: tuple[int, int, int],
+        isolate_procfs: bool,
+    ) -> _LauncherSocketFinalizationHandle:
+        """Start a ticket only when the launcher sandbox attests PID/procfs isolation."""
+
+        if (
+            not isolate_procfs
+            or not argv
+            or any(not isinstance(argument, str) or not argument for argument in argv)
+            or len(capability_fds) != 3
+            or any(not isinstance(descriptor, int) or descriptor < 0 for descriptor in capability_fds)
+        ):
+            raise ProcessConfigurationError("Finalization child configuration is invalid")
+        try:
+            response = self._exchange(
+                {
+                    "schema_version": "v1",
+                    "sandbox_identity": self.identity,
+                    "operation": "start_finalization_child",
+                    "argv": list(argv),
+                    "capability_fd_targets": [4, 5, 6],
+                    "isolate_procfs": True,
+                },
+                5.0,
+                descriptors=capability_fds,
+            )
+            if (
+                not isinstance(response, dict)
+                or set(response) != {"child_id", "pid", "procfs_pid_isolated"}
+                or not isinstance(response["child_id"], str)
+                or len(response["child_id"]) != 32
+                or any(character not in "0123456789abcdef" for character in response["child_id"])
+                or isinstance(response["pid"], bool)
+                or not isinstance(response["pid"], int)
+                or response["pid"] < 1
+                or response["procfs_pid_isolated"] is not True
+            ):
+                raise ValueError
+        except (OSError, ValueError, ProcessConfigurationError) as error:
+            raise ProcessConfigurationError("Finalization child isolation is unavailable") from error
+        return _LauncherSocketFinalizationHandle(self, response["child_id"], response["pid"])
+
     def _exchange(
         self,
         request: Mapping[str, object],
@@ -381,6 +445,7 @@ class LauncherSocketSandbox:
         *,
         executable_descriptor: int | None = None,
         executable_descriptors: tuple[int, ...] = (),
+        descriptors: tuple[int, ...] = (),
     ) -> object:
         metadata = os.lstat(self.socket_path)
         if not stat.S_ISSOCK(metadata.st_mode) or (metadata.st_dev, metadata.st_ino) != (self._device, self._inode):
@@ -390,9 +455,9 @@ class LauncherSocketSandbox:
             transport.settimeout(timeout)
             transport.connect(str(self.socket_path))
             descriptors_to_send = (
-                executable_descriptors
+                descriptors or executable_descriptors
                 if executable_descriptor is None
-                else (executable_descriptor, *executable_descriptors)
+                else (executable_descriptor, *executable_descriptors, *descriptors)
             )
             if not descriptors_to_send:
                 transport.sendall(raw)
@@ -419,6 +484,43 @@ class LauncherSocketSandbox:
 
     def start(self, *args: object, **kwargs: object) -> ProcessHandle:
         raise SandboxStartError()
+
+
+@dataclass(frozen=True, slots=True)
+class _LauncherSocketFinalizationHandle:
+    """Remote process control remains with the trusted launcher sandbox."""
+
+    sandbox: LauncherSocketSandbox
+    child_id: str
+    pid: int
+
+    def poll(self) -> int | None:
+        response = self.sandbox._finalization_child_request("poll_finalization_child", self.child_id, 5.0)
+        return _finalization_returncode(response, complete=False)
+
+    def wait(self, timeout: float | None = None) -> SandboxCompleted:
+        response = self.sandbox._finalization_child_request("wait_finalization_child", self.child_id, timeout)
+        returncode = _finalization_returncode(response, complete=True)
+        if not isinstance(response.get("stdout"), (str, bytes)) or not isinstance(response.get("stderr"), (str, bytes)):
+            raise ProcessConfigurationError("Finalization child result is invalid")
+        return SandboxCompleted(returncode, response["stdout"], response["stderr"])
+
+    def terminate_group(self) -> None:
+        self.sandbox._finalization_child_request("terminate_finalization_child", self.child_id, 5.0)
+
+    def kill_group(self) -> None:
+        self.sandbox._finalization_child_request("kill_finalization_child", self.child_id, 5.0)
+
+
+def _finalization_returncode(response: object, *, complete: bool) -> int | None:
+    if not isinstance(response, dict) or set(response) != ({"returncode", "stdout", "stderr"} if complete else {"returncode"}):
+        raise ProcessConfigurationError("Finalization child result is invalid")
+    returncode = response["returncode"]
+    if returncode is None and not complete:
+        return None
+    if isinstance(returncode, bool) or not isinstance(returncode, int):
+        raise ProcessConfigurationError("Finalization child result is invalid")
+    return returncode
 
 
 class FilesystemEvidenceSink:

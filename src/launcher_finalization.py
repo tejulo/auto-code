@@ -6,7 +6,6 @@ import hashlib
 import os
 from pathlib import Path
 import socket
-import subprocess
 import tempfile
 from typing import Protocol
 
@@ -45,6 +44,7 @@ from auto_code.hashing import hash_json
 from auto_code.hashing import canonical_json_bytes
 from auto_code.linear import LinearGateway
 from auto_code.mcp_bridge import TrustedLinearBridge
+from auto_code.process import LauncherSocketSandbox, ProcessConfigurationError, ProcessHandle
 from auto_code.prepare import PreparationContextAuthority
 from auto_code.project_config import ProjectConfig
 from auto_code.state import RunStateStore, StateGeneration, _read_canonical_json
@@ -167,6 +167,7 @@ class _LauncherRuntime:
     artifact_authority: FinalizationArtifactAuthority | None = None
     signing_key: Ed25519PrivateKey | None = None
     finalization_parent: FinalizationParentCapability | None = None
+    sandbox: LauncherSocketSandbox | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "state_root", Path(self.state_root))
@@ -222,12 +223,15 @@ class FinalizationLauncher:
 
         if not ticket_argv or any(not isinstance(argument, str) or not argument for argument in ticket_argv):
             raise FinalizationLauncherError("ticket command is invalid")
+        sandbox = self._runtime.sandbox
+        if not isinstance(sandbox, LauncherSocketSandbox):
+            raise FinalizationLauncherError("finalization sandbox isolation is unavailable")
         socket_directory = Path(tempfile.mkdtemp(prefix="auto-code-finalization-"))
         socket_directory.chmod(0o700)
         socket_path = socket_directory / "service.sock"
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         descriptors: list[int] = []
-        process: subprocess.Popen[str] | None = None
+        process: ProcessHandle | None = None
         try:
             listener.bind(str(socket_path))
             listener.listen(1)
@@ -262,21 +266,21 @@ class FinalizationLauncher:
                 _sealed_descriptor(trust_bytes),
                 _sealed_descriptor(binding.to_bytes()),
             ]
-            process = subprocess.Popen(
+            process = sandbox.start_finalization_child(
                 ticket_argv,
-                # Keep the target slots through close_fds; preexec replaces the
-                # inherited bootstrap descriptors with finalization-only data.
-                pass_fds=(*descriptors, 4, 5, 6),
-                preexec_fn=lambda: (_dup_to(descriptors[0], 4), _dup_to(descriptors[1], 5), _dup_to(descriptors[2], 6)),
-                text=True,
+                capability_fds=(descriptors[0], descriptors[1], descriptors[2]),
+                isolate_procfs=True,
             )
             service._peer_pid = process.pid
             service.serve_once(listener)
-            return process.wait(timeout=descriptor.timeout_seconds)
+            return process.wait(timeout=descriptor.timeout_seconds).returncode
         except Exception as error:
             if process is not None:
-                process.kill()
-                process.wait()
+                try:
+                    process.kill_group()
+                    process.wait()
+                except (OSError, ProcessConfigurationError):
+                    pass
             raise FinalizationLauncherError("finalization launcher lifecycle failed") from error
         finally:
             for descriptor_fd in descriptors:
@@ -427,10 +431,6 @@ def _sealed_descriptor(payload: bytes) -> int:
     descriptor = os.open(path, os.O_RDONLY)
     os.unlink(path)
     return descriptor
-
-
-def _dup_to(source: int, target: int) -> None:
-    os.dup2(source, target, inheritable=True)
 
 
 __all__ = [

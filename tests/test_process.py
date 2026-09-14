@@ -514,6 +514,69 @@ def test_production_ticket_invoker_uses_pinned_interpreter_sealed_archive_and_sa
     }
 
 
+def test_launcher_socket_starts_finalization_child_only_with_procfs_pid_isolation(tmp_path: Path) -> None:
+    """Dropping the isolation attestation or a capability FD would expose launcher authority."""
+
+    socket_path = tmp_path / "launcher.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(1)
+    observed: dict[str, object] = {}
+
+    def serve() -> None:
+        connection, _ = listener.accept()
+        with connection:
+            descriptors = array.array("i")
+            raw, ancillary, _, _ = connection.recvmsg(65_536, socket.CMSG_SPACE(3 * descriptors.itemsize))
+            for level, kind, data in ancillary:
+                if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                    descriptors.frombytes(data[: len(data) - (len(data) % descriptors.itemsize)])
+            while not raw.endswith(b"\n"):
+                raw += connection.recv(65_536)
+            observed.update(json.loads(raw))
+            observed["capabilities"] = tuple(os.pread(descriptor, 32, 0) for descriptor in descriptors)
+            for descriptor in descriptors:
+                os.close(descriptor)
+            connection.sendall(
+                canonical_json_bytes(
+                    {
+                        "child_id": "f" * 32,
+                        "pid": 1,
+                        "procfs_pid_isolated": True,
+                    }
+                )
+                + b"\n"
+            )
+
+    thread = threading.Thread(target=serve)
+    thread.start()
+    descriptor_fds = tuple(os.memfd_create(f"capability-{slot}", os.MFD_CLOEXEC) for slot in (4, 5, 6))
+    try:
+        for descriptor, payload in zip(descriptor_fds, (b"descriptor", b"trust", b"binding"), strict=True):
+            os.write(descriptor, payload)
+        handle = LauncherSocketSandbox(socket_path, "launcher").start_finalization_child(
+            (sys.executable, "-c", "pass"),
+            capability_fds=descriptor_fds,
+            isolate_procfs=True,
+        )
+    finally:
+        for descriptor in descriptor_fds:
+            os.close(descriptor)
+        thread.join(timeout=3)
+        listener.close()
+
+    assert handle.child_id == "f" * 32
+    assert observed == {
+        "schema_version": "v1",
+        "sandbox_identity": "launcher",
+        "operation": "start_finalization_child",
+        "argv": [sys.executable, "-c", "pass"],
+        "capability_fd_targets": [4, 5, 6],
+        "isolate_procfs": True,
+        "capabilities": (b"descriptor", b"trust", b"binding"),
+    }
+
+
 def test_runner_rejects_a_working_directory_symlink_to_authoritative_state(sandbox_policy: SandboxPolicy) -> None:
     escaped_cwd = sandbox_policy.project_root / "state-link"
     escaped_cwd.symlink_to(sandbox_policy.authoritative_state_root, target_is_directory=True)

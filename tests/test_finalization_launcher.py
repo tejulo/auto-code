@@ -213,25 +213,37 @@ def test_launcher_exposes_no_direct_finalizer_invocation(tmp_path: Path) -> None
     assert not hasattr(launcher, "serve")
 
 
-def test_launcher_serves_one_ticket_process_over_protected_fds(tmp_path: Path) -> None:
-    """The ticket receives only inherited capability material, not launcher state paths."""
+def test_ticket_child_cannot_start_without_a_procfs_isolated_launcher_sandbox(tmp_path: Path) -> None:
+    """A direct child can read FD 8 through procfs, so finalization must not spawn one."""
 
     _, generation = _persisted_run(tmp_path)
     launcher = FinalizationLauncher(_runtime(tmp_path, ActiveIndexHarness(tmp_path)))
+    marker = tmp_path / "ticket-ran"
+    key = tmp_path / "launcher-key"
+    key.write_text("launcher-private-key", encoding="ascii")
+    descriptor = os.open(key, os.O_RDONLY)
+    saved_fd_eight = os.dup(8)
     ticket = (
         sys.executable,
         "-c",
         (
+            "from pathlib import Path; import os; "
+            f"Path({str(marker)!r}).write_bytes(open('/proc/%s/fd/8' % os.getppid(), 'rb').read()); "
             "from auto_code.finalization_service import invoke_protected_capability; "
             "invoke_protected_capability('finalize', 'run-1', "
             f"{generation.revision}, '{generation.state_hash}', None)"
         ),
     )
+    try:
+        os.dup2(descriptor, 8, inheritable=True)
+        with pytest.raises(FinalizationLauncherError, match="sandbox"):
+            launcher.serve_ticket_process("run-1", generation.revision, generation.state_hash, ticket)
+    finally:
+        os.dup2(saved_fd_eight, 8, inheritable=True)
+        os.close(saved_fd_eight)
+        os.close(descriptor)
 
-    # The deliberately incomplete harness rejects finalization after the IPC exchange;
-    # a nonzero child result proves the launcher accepted and answered the one request.
-    assert launcher.serve_ticket_process("run-1", generation.revision, generation.state_hash, ticket) == 1
-    assert not list(tmp_path.glob("finalization-*.sock"))
+    assert not marker.exists()
 
 
 @pytest.mark.parametrize(
@@ -512,22 +524,22 @@ def _installed_launcher_result(
             replacement_server.close()
 
 
-def test_installed_launcher_serves_a_finalization_child_from_protected_bootstrap(tmp_path: Path) -> None:
-    """Returning the stub error instead of serving protected IPC would fail this real console boundary."""
+def test_installed_launcher_fails_closed_without_a_procfs_isolation_capability(tmp_path: Path) -> None:
+    """A bootstrap without a verified sandbox cannot safely start a ticket child."""
 
     result = _installed_launcher_result(tmp_path)
 
-    assert result.returncode == 0
-    assert result.stderr == ""
+    assert result.returncode == 2
+    assert result.stderr == "auto-code-launcher: protected runtime unavailable\n"
 
 
-def test_protected_bootstrap_accepts_a_real_socketpair_transport(tmp_path: Path) -> None:
-    """Rejecting a valid inherited socketpair prevents launcher-owned bridge composition."""
+def test_protected_bootstrap_requires_a_procfs_isolation_capability_even_with_a_valid_socketpair(tmp_path: Path) -> None:
+    """A bridge transport alone cannot make the ticket process isolated."""
 
     result = _installed_launcher_result(tmp_path)
 
-    assert result.returncode == 0
-    assert result.stderr == ""
+    assert result.returncode == 2
+    assert result.stderr == "auto-code-launcher: protected runtime unavailable\n"
 
 
 def test_installed_launcher_rejects_a_replaced_bootstrap_descriptor(tmp_path: Path) -> None:
