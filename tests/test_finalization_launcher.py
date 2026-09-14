@@ -681,45 +681,65 @@ def _installed_launcher_result(
                     assert sandbox_listener is not None
                     connection, _ = sandbox_listener.accept()
                     with connection:
-                        request = json.loads(connection.makefile("rb").readline())
-                        forged_sandbox.operations.append(request["operation"])
-                        child_id = "f" * 32
-                        evidence = {
-                            "domain": "auto-code-sandbox-child-evidence/v1",
-                            "sandbox_identity": "launcher",
-                            "challenge": request["challenge"],
-                            "child_id": child_id,
-                            "pid": 124,
-                            "pid_namespace_inode": 456,
-                            "mount_namespace_inode": 789,
-                            "fd_numbers": [],
-                        }
-                        connection.sendall(
-                            canonical_json_bytes(
-                                {
-                                    "child_id": child_id,
-                                    "evidence": {
-                                        **{
-                                            key: value
-                                            for key, value in evidence.items()
-                                            if key not in {"domain", "sandbox_identity"}
-                                        },
-                                        "signature": forged_key.sign(canonical_json_bytes(evidence)).hex(),
-                                    },
-                                }
+                        descriptors = array.array("i")
+                        try:
+                            raw, ancillary, flags, _ = connection.recvmsg(
+                                65_536,
+                                socket.CMSG_SPACE(64 * descriptors.itemsize),
                             )
-                            + b"\n"
-                        )
-                        for operation, response in (
-                            ("kill_finalization_child", {}),
-                            ("wait_finalization_child", {"returncode": -9, "stdout": "", "stderr": ""}),
-                        ):
-                            cleanup, _ = sandbox_listener.accept()
-                            with cleanup:
-                                cleanup_request = json.loads(cleanup.makefile("rb").readline())
-                                assert cleanup_request["operation"] == operation
-                                forged_sandbox.operations.append(cleanup_request["operation"])
-                                cleanup.sendall(canonical_json_bytes(response) + b"\n")
+                            if flags & socket.MSG_CTRUNC:
+                                raise RuntimeError("sandbox ancillary data was truncated")
+                            for level, kind, data in ancillary:
+                                if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                                    descriptors.frombytes(data[: len(data) - (len(data) % descriptors.itemsize)])
+                            forged_sandbox.received_descriptors.extend(descriptors)
+                            while not raw.endswith(b"\n"):
+                                raw += connection.recv(65_536)
+                            request = json.loads(raw)
+                            forged_sandbox.operations.append(request["operation"])
+                            child_id = "f" * 32
+                            evidence = {
+                                "domain": "auto-code-sandbox-child-evidence/v1",
+                                "sandbox_identity": "launcher",
+                                "challenge": request["challenge"],
+                                "child_id": child_id,
+                                "pid": 124,
+                                "pid_namespace_inode": 456,
+                                "mount_namespace_inode": 789,
+                                "fd_numbers": [],
+                            }
+                            connection.sendall(
+                                canonical_json_bytes(
+                                    {
+                                        "child_id": child_id,
+                                        "evidence": {
+                                            **{
+                                                key: value
+                                                for key, value in evidence.items()
+                                                if key not in {"domain", "sandbox_identity"}
+                                            },
+                                            "signature": forged_key.sign(canonical_json_bytes(evidence)).hex(),
+                                        },
+                                    }
+                                )
+                                + b"\n"
+                            )
+                            for operation, response in (
+                                ("kill_finalization_child", {}),
+                                ("wait_finalization_child", {"returncode": -9, "stdout": "", "stderr": ""}),
+                            ):
+                                cleanup, _ = sandbox_listener.accept()
+                                with cleanup:
+                                    cleanup_request = json.loads(cleanup.makefile("rb").readline())
+                                    assert cleanup_request["operation"] == operation
+                                    forged_sandbox.operations.append(cleanup_request["operation"])
+                                    cleanup.sendall(canonical_json_bytes(response) + b"\n")
+                        finally:
+                            for descriptor in descriptors:
+                                try:
+                                    os.close(descriptor)
+                                except OSError:
+                                    pass
                 except BaseException as error:
                     forged_sandbox.errors.append(error)
 

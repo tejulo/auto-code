@@ -862,12 +862,22 @@ def test_sandbox_rejects_unsigned_or_wrong_peer_evidence(tmp_path: Path, signing
         listener.close()
 
 
-@pytest.mark.parametrize("cleanup_fails", (False, True), ids=("cleanup-succeeds", "cleanup-fails"))
+@pytest.mark.parametrize(
+    ("evidence_kind", "cleanup_fails"),
+    (
+        ("forged", False),
+        ("forged", True),
+        ("missing", False),
+        ("malformed", False),
+    ),
+    ids=("forged-cleanup-succeeds", "forged-cleanup-fails", "missing", "malformed"),
+)
 def test_invalid_preparation_evidence_cleanup_kills_and_reaps_returned_child(
     tmp_path: Path,
+    evidence_kind: str,
     cleanup_fails: bool,
 ) -> None:
-    """Closing the preparation socket alone would leave a forged child running."""
+    """Closing a malformed preparation response alone would leave its child running."""
 
     socket_path = tmp_path / "launcher.sock"
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -892,22 +902,19 @@ def test_invalid_preparation_evidence_cleanup_kills_and_reaps_returned_child(
                 "mount_namespace_inode": 789,
                 "fd_numbers": [],
             }
-            connection.sendall(
-                canonical_json_bytes(
-                    {
-                        "child_id": child_id,
-                        "evidence": {
-                            **{
-                                key: value
-                                for key, value in evidence.items()
-                                if key not in {"domain", "sandbox_identity"}
-                            },
-                            "signature": forged_key.sign(canonical_json_bytes(evidence)).hex(),
-                        },
-                    }
-                )
-                + b"\n"
-            )
+            response: dict[str, object] = {"child_id": child_id}
+            if evidence_kind == "forged":
+                response["evidence"] = {
+                    **{
+                        key: value
+                        for key, value in evidence.items()
+                        if key not in {"domain", "sandbox_identity"}
+                    },
+                    "signature": forged_key.sign(canonical_json_bytes(evidence)).hex(),
+                }
+            elif evidence_kind == "malformed":
+                response["evidence"] = []
+            connection.sendall(canonical_json_bytes(response) + b"\n")
             for operation, response in (
                 ("kill_finalization_child", {}),
                 ("wait_finalization_child", {"returncode": -9, "stdout": "", "stderr": ""}),

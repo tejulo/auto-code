@@ -240,10 +240,12 @@ class LauncherSocketSandbox:
                     "challenge": challenge,
                 },
             )
-            if not isinstance(response, dict) or set(response) != {"child_id", "evidence"}:
+            if not isinstance(response, dict):
                 raise ValueError
-            child_id = response["child_id"]
+            child_id = response.get("child_id")
             if not isinstance(child_id, str) or len(child_id) != 32 or any(character not in "0123456789abcdef" for character in child_id):
+                raise ValueError
+            if set(response) != {"child_id", "evidence"}:
                 raise ValueError
             evidence = _sandbox_child_evidence(response["evidence"])
             if evidence.child_id != child_id or evidence.challenge != challenge or evidence.fd_numbers != ():
@@ -253,7 +255,7 @@ class LauncherSocketSandbox:
                 _sandbox_child_evidence_payload(evidence, self.identity),
             )
             return SandboxChildHandle(self, evidence, transport)
-        except (InvalidSignature, OSError, TypeError, ValueError, ProcessConfigurationError) as error:
+        except (InvalidSignature, KeyError, OSError, TypeError, ValueError, ProcessConfigurationError) as error:
             cleanup_error: PreparedChildCleanupError | None = None
             if child_id is not None:
                 try:
