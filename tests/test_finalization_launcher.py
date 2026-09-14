@@ -3,14 +3,17 @@ from __future__ import annotations
 import array
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
+import shutil
 import socket
 import struct
 import subprocess
 import sys
 import threading
+from typing import Callable
 from types import SimpleNamespace
 
 import pytest
@@ -53,6 +56,14 @@ _BOOTSTRAP_TEST_KEY = Ed25519PrivateKey.from_private_bytes(bytes.fromhex("11" * 
 class _ForgedSandboxRecord:
     operations: list[str] = field(default_factory=list)
     received_descriptors: list[int] = field(default_factory=list)
+    errors: list[BaseException] = field(default_factory=list)
+    thread: threading.Thread | None = None
+
+
+@dataclass
+class _GitProbeRecord:
+    requests: list[dict[str, object]] = field(default_factory=list)
+    executable_digests: list[str] = field(default_factory=list)
     errors: list[BaseException] = field(default_factory=list)
     thread: threading.Thread | None = None
 
@@ -626,6 +637,8 @@ def _installed_launcher_result(
     mutate_bootstrap: bool = False,
     substitute: str | None = None,
     forged_sandbox: _ForgedSandboxRecord | None = None,
+    mutate_git_descriptor: Callable[[dict[str, object]], dict[str, object]] | None = None,
+    valid_sandbox: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     state_root = tmp_path / "state"
     state_root.mkdir(mode=0o700)
@@ -696,6 +709,8 @@ def _installed_launcher_result(
             "evidence_root": str(evidence_root),
             "controlled_home": str(controlled_home),
         }
+        if mutate_git_descriptor is not None:
+            git_descriptor = mutate_git_descriptor(git_descriptor)
         transport_metadata = os.fstat(bridge_client.fileno())
         peer_pid, peer_uid, peer_gid = struct.unpack(
             "3i",
@@ -731,85 +746,87 @@ def _installed_launcher_result(
             "finalization_public_key_hash": key_hash,
             "finalization_parent": parent,
         }
-        if forged_sandbox is not None:
+        if forged_sandbox is not None or valid_sandbox:
             sandbox_key = Ed25519PrivateKey.generate()
-            forged_key = Ed25519PrivateKey.generate()
             sandbox_path = tmp_path / "sandbox.sock"
             sandbox_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             sandbox_listener.bind(str(sandbox_path))
             sandbox_listener.listen(3)
 
-            def serve_forged_sandbox() -> None:
-                try:
-                    assert sandbox_listener is not None
-                    connection, _ = sandbox_listener.accept()
-                    with connection:
-                        descriptors = array.array("i")
-                        try:
-                            raw, ancillary, flags, _ = connection.recvmsg(
-                                65_536,
-                                socket.CMSG_SPACE(64 * descriptors.itemsize),
-                            )
-                            if flags & socket.MSG_CTRUNC:
-                                raise RuntimeError("sandbox ancillary data was truncated")
-                            for level, kind, data in ancillary:
-                                if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
-                                    descriptors.frombytes(data[: len(data) - (len(data) % descriptors.itemsize)])
-                            forged_sandbox.received_descriptors.extend(descriptors)
-                            while not raw.endswith(b"\n"):
-                                raw += connection.recv(65_536)
-                            request = json.loads(raw)
-                            forged_sandbox.operations.append(request["operation"])
-                            child_id = "f" * 32
-                            evidence = {
-                                "domain": "auto-code-sandbox-child-evidence/v1",
-                                "sandbox_identity": "launcher",
-                                "challenge": request["challenge"],
-                                "child_id": child_id,
-                                "pid": 124,
-                                "pid_namespace_inode": 456,
-                                "mount_namespace_inode": 789,
-                                "fd_numbers": [],
-                                "bootstrap_fd_access": "denied",
-                            }
-                            connection.sendall(
-                                canonical_json_bytes(
-                                    {
-                                        "child_id": child_id,
-                                        "evidence": {
-                                            **{
-                                                key: value
-                                                for key, value in evidence.items()
-                                                if key not in {"domain", "sandbox_identity"}
-                                            },
-                                            "signature": forged_key.sign(canonical_json_bytes(evidence)).hex(),
-                                        },
-                                    }
-                                )
-                                + b"\n"
-                            )
-                            for operation, response in (
-                                ("kill_finalization_child", {}),
-                                ("wait_finalization_child", {"returncode": -9, "stdout": "", "stderr": ""}),
-                            ):
-                                cleanup, _ = sandbox_listener.accept()
-                                with cleanup:
-                                    cleanup_request = json.loads(cleanup.makefile("rb").readline())
-                                    assert cleanup_request["operation"] == operation
-                                    forged_sandbox.operations.append(cleanup_request["operation"])
-                                    cleanup.sendall(canonical_json_bytes(response) + b"\n")
-                        finally:
-                            for descriptor in descriptors:
-                                try:
-                                    os.close(descriptor)
-                                except OSError:
-                                    pass
-                except BaseException as error:
-                    forged_sandbox.errors.append(error)
+            if forged_sandbox is not None:
+                forged_key = Ed25519PrivateKey.generate()
 
-            sandbox_thread = threading.Thread(target=serve_forged_sandbox)
-            forged_sandbox.thread = sandbox_thread
-            sandbox_thread.start()
+                def serve_forged_sandbox() -> None:
+                    try:
+                        assert sandbox_listener is not None
+                        connection, _ = sandbox_listener.accept()
+                        with connection:
+                            descriptors = array.array("i")
+                            try:
+                                raw, ancillary, flags, _ = connection.recvmsg(
+                                    65_536,
+                                    socket.CMSG_SPACE(64 * descriptors.itemsize),
+                                )
+                                if flags & socket.MSG_CTRUNC:
+                                    raise RuntimeError("sandbox ancillary data was truncated")
+                                for level, kind, data in ancillary:
+                                    if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                                        descriptors.frombytes(data[: len(data) - (len(data) % descriptors.itemsize)])
+                                forged_sandbox.received_descriptors.extend(descriptors)
+                                while not raw.endswith(b"\n"):
+                                    raw += connection.recv(65_536)
+                                request = json.loads(raw)
+                                forged_sandbox.operations.append(request["operation"])
+                                child_id = "f" * 32
+                                evidence = {
+                                    "domain": "auto-code-sandbox-child-evidence/v1",
+                                    "sandbox_identity": "launcher",
+                                    "challenge": request["challenge"],
+                                    "child_id": child_id,
+                                    "pid": 124,
+                                    "pid_namespace_inode": 456,
+                                    "mount_namespace_inode": 789,
+                                    "fd_numbers": [],
+                                    "bootstrap_fd_access": "denied",
+                                }
+                                connection.sendall(
+                                    canonical_json_bytes(
+                                        {
+                                            "child_id": child_id,
+                                            "evidence": {
+                                                **{
+                                                    key: value
+                                                    for key, value in evidence.items()
+                                                    if key not in {"domain", "sandbox_identity"}
+                                                },
+                                                "signature": forged_key.sign(canonical_json_bytes(evidence)).hex(),
+                                            },
+                                        }
+                                    )
+                                    + b"\n"
+                                )
+                                for operation, response in (
+                                    ("kill_finalization_child", {}),
+                                    ("wait_finalization_child", {"returncode": -9, "stdout": "", "stderr": ""}),
+                                ):
+                                    cleanup, _ = sandbox_listener.accept()
+                                    with cleanup:
+                                        cleanup_request = json.loads(cleanup.makefile("rb").readline())
+                                        assert cleanup_request["operation"] == operation
+                                        forged_sandbox.operations.append(cleanup_request["operation"])
+                                        cleanup.sendall(canonical_json_bytes(response) + b"\n")
+                            finally:
+                                for descriptor in descriptors:
+                                    try:
+                                        os.close(descriptor)
+                                    except OSError:
+                                        pass
+                    except BaseException as error:
+                        forged_sandbox.errors.append(error)
+
+                sandbox_thread = threading.Thread(target=serve_forged_sandbox)
+                forged_sandbox.thread = sandbox_thread
+                sandbox_thread.start()
             config.update(
                 {
                     "sandbox_socket_path": str(sandbox_path),
@@ -950,6 +967,244 @@ def test_installed_launcher_rejects_a_replaced_bootstrap_descriptor(tmp_path: Pa
     assert result.returncode == 2
     assert result.stdout == ""
     assert result.stderr == "auto-code-launcher: protected runtime unavailable\n"
+
+
+@pytest.mark.parametrize(
+    "mutate_git_descriptor",
+    (
+        lambda descriptor: {key: value for key, value in descriptor.items() if key != "git_executable"},
+        lambda descriptor: {**descriptor, "git_executable": "git"},
+        lambda descriptor: {key: value for key, value in descriptor.items() if key != "git_executable_sha256"},
+        lambda descriptor: {**descriptor, "git_executable_sha256": "invalid"},
+        lambda descriptor: {key: value for key, value in descriptor.items() if key != "timeout_seconds"},
+        lambda descriptor: {**descriptor, "timeout_seconds": 0},
+        lambda descriptor: {key: value for key, value in descriptor.items() if key != "evidence_root"},
+        lambda descriptor: {**descriptor, "evidence_root": "relative"},
+        lambda descriptor: {key: value for key, value in descriptor.items() if key != "controlled_home"},
+        lambda descriptor: {**descriptor, "controlled_home": "relative"},
+    ),
+    ids=(
+        "missing-executable",
+        "malformed-executable",
+        "missing-digest",
+        "malformed-digest",
+        "missing-timeout",
+        "malformed-timeout",
+        "missing-evidence-root",
+        "malformed-evidence-root",
+        "missing-controlled-home",
+        "malformed-controlled-home",
+    ),
+)
+def test_installed_launcher_fails_closed_for_invalid_protected_git_capabilities(
+    tmp_path: Path,
+    mutate_git_descriptor: Callable[[dict[str, object]], dict[str, object]],
+) -> None:
+    """A malformed signed Git capability must fail before the sandbox can prepare a ticket child."""
+
+    result = _installed_launcher_result(
+        tmp_path,
+        mutate_git_descriptor=mutate_git_descriptor,
+        valid_sandbox=True,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr == "auto-code-launcher: protected runtime unavailable\n"
+
+
+def test_installed_bootstrap_executes_finalization_git_through_the_descriptor_bound_sandbox(tmp_path: Path) -> None:
+    """Replacing any bootstrap-bound Git capability must change or prevent the sandbox-observed finalization calls."""
+
+    state_root = tmp_path / "state"
+    repository = tmp_path / "repository"
+    evidence_root = state_root / "git-evidence"
+    controlled_home = tmp_path / "git-home"
+    for directory in (state_root, repository, evidence_root, controlled_home):
+        directory.mkdir(mode=0o700)
+    executable = Path(shutil.which("git") or "").resolve()
+    assert executable.is_file()
+    finalization_key = Ed25519PrivateKey.generate()
+    key_hash = sha256(finalization_key.public_key().public_bytes_raw()).hexdigest()
+    bridge_client, bridge_server = socket.socketpair()
+    sandbox_path = tmp_path / "sandbox.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(sandbox_path))
+    listener.listen(5)
+    record = _GitProbeRecord()
+    descriptors: list[int] = []
+    descriptor_paths = [tmp_path / f"git-probe-{number}.json" for number in range(3, 9)]
+    key_path = tmp_path / "finalization-key.bin"
+    key_path.write_bytes(finalization_key.private_bytes_raw())
+    key_path.chmod(0o600)
+    try:
+        state_descriptor = {"domain": "auto-code-launcher-state/v1", "state_root": str(state_root)}
+        index_descriptor = {
+            "domain": "auto-code-launcher-index/v1",
+            "state_root": str(state_root),
+            "finalization_public_key_hash": key_hash,
+        }
+        bridge_descriptor = {
+            "domain": "auto-code-launcher-bridge/v1",
+            "state_root": str(state_root),
+            "bridge_identity": "launcher-bridge",
+            "mcp_server_identity": "linear-mcp",
+            "receipt_signing_key": "22" * 16,
+            "transport_fd": 9,
+        }
+        git_descriptor = {
+            "domain": "auto-code-launcher-git/v1",
+            "repository_root": str(repository),
+            "remote": "origin",
+            "base_branch": None,
+            "protected_paths": [".auto-code"],
+            "commit_excluded_paths": ["run-local"],
+            "git_executable": str(executable),
+            "git_executable_sha256": sha256(executable.read_bytes()).hexdigest(),
+            "timeout_seconds": 3.5,
+            "evidence_root": str(evidence_root),
+            "controlled_home": str(controlled_home),
+        }
+        transport_metadata = os.fstat(bridge_client.fileno())
+        peer_pid, peer_uid, peer_gid = struct.unpack(
+            "3i",
+            bridge_client.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")),
+        )
+        parent = {
+            "domain": "auto-code-finalization-parent/v1",
+            "public_key": _BOOTSTRAP_TEST_KEY.public_key().public_bytes_raw().hex(),
+            "finalization_public_key_hash": key_hash,
+        }
+        parent["signature"] = _BOOTSTRAP_TEST_KEY.sign(canonical_json_bytes(parent)).hex()
+        config = {
+            "domain": "auto-code-launcher-bootstrap/v1",
+            "state_root": str(state_root),
+            "repository_root": str(repository),
+            "bridge_identity": "launcher-bridge",
+            "mcp_server_identity": "linear-mcp",
+            "bridge_fd": 6,
+            "state_fd": 4,
+            "index_fd": 5,
+            "git_fd": 7,
+            "key_fd": 8,
+            "state_sha256": sha256(canonical_json_bytes(state_descriptor)).hexdigest(),
+            "index_sha256": sha256(canonical_json_bytes(index_descriptor)).hexdigest(),
+            "bridge_sha256": sha256(canonical_json_bytes(bridge_descriptor)).hexdigest(),
+            "git_sha256": sha256(canonical_json_bytes(git_descriptor)).hexdigest(),
+            "key_sha256": sha256(key_path.read_bytes()).hexdigest(),
+            "bridge_transport_device": transport_metadata.st_dev,
+            "bridge_transport_inode": transport_metadata.st_ino,
+            "bridge_transport_peer_pid": peer_pid,
+            "bridge_transport_peer_uid": peer_uid,
+            "bridge_transport_peer_gid": peer_gid,
+            "finalization_public_key_hash": key_hash,
+            "finalization_parent": parent,
+            "sandbox_socket_path": str(sandbox_path),
+            "sandbox_identity": "launcher",
+            "sandbox_public_key": Ed25519PrivateKey.generate().public_key().public_bytes_raw().hex(),
+        }
+        config["signature"] = _BOOTSTRAP_TEST_KEY.sign(canonical_json_bytes(config)).hex()
+        payloads = (config, state_descriptor, index_descriptor, bridge_descriptor, git_descriptor)
+        for path, payload in zip(descriptor_paths[:5], payloads, strict=True):
+            descriptors.append(_write_bootstrap_descriptor(path, payload))
+        descriptors.append(os.open(key_path, os.O_RDONLY))
+
+        def serve_sandbox() -> None:
+            responses = {
+                ("fetch", "--no-tags", "origin"): "",
+                ("remote", "get-url", "origin"): "https://example.invalid/repository.git\n",
+                ("ls-remote", "--symref", "origin", "HEAD"): "ref: refs/heads/main\tHEAD\n",
+                ("ls-remote", "--heads", "origin", "refs/heads/main"): f"{'a' * 40}\trefs/heads/main\n",
+                ("symbolic-ref", "--quiet", "--short", "HEAD"): "ENG-1-finalize-safely\n",
+            }
+            try:
+                listener.settimeout(45)
+                while len(record.requests) < len(responses):
+                    connection, _ = listener.accept()
+                    with connection:
+                        received = array.array("i")
+                        raw, ancillary, flags, _ = connection.recvmsg(
+                            65_536,
+                            socket.CMSG_SPACE(4 * received.itemsize),
+                        )
+                        if flags & socket.MSG_CTRUNC:
+                            raise RuntimeError("sandbox executable descriptor was truncated")
+                        for level, kind, data in ancillary:
+                            if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                                received.frombytes(data[: len(data) - (len(data) % received.itemsize)])
+                        while not raw.endswith(b"\n"):
+                            raw += connection.recv(65_536)
+                        request = json.loads(raw)
+                        record.requests.append(request)
+                        if len(received) != 1:
+                            raise RuntimeError("sandbox did not receive exactly one executable descriptor")
+                        try:
+                            os.lseek(received[0], 0, os.SEEK_SET)
+                            record.executable_digests.append(sha256(os.read(received[0], 16 * 1024 * 1024)).hexdigest())
+                        finally:
+                            os.close(received[0])
+                        command = tuple(request["argv"][4:])
+                        connection.sendall(
+                            canonical_json_bytes({"returncode": 0, "stdout": responses[command], "stderr": ""}) + b"\n"
+                        )
+            except BaseException as error:
+                record.errors.append(error)
+
+        record.thread = threading.Thread(target=serve_sandbox)
+        record.thread.start()
+        wrapper = (
+            "import os, sys; sources=[os.dup(int(source)) for source in sys.argv[1:8]]; "
+            "[(os.dup2(source, target, inheritable=True)) for target, source in enumerate(sources[:6], 3)]; "
+            "os.dup2(sources[6], 9, inheritable=True); "
+            "[(os.set_inheritable(target, True)) for target in (*range(3, 9), 9)]; "
+            "os.execv(sys.argv[8], sys.argv[8:])"
+        )
+        probe = (
+            "from auto_code.launcher import load_protected_bootstrap; "
+            "runtime = load_protected_bootstrap(); "
+            "assert runtime.git_guard.refresh_finalization('ENG-1-finalize-safely', 'a' * 40)"
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                wrapper,
+                *(str(descriptor) for descriptor in descriptors),
+                str(bridge_client.fileno()),
+                sys.executable,
+                "-c",
+                probe,
+            ],
+            capture_output=True,
+            check=False,
+            text=True,
+            pass_fds=(*descriptors, bridge_client.fileno()),
+        )
+    finally:
+        for descriptor in descriptors:
+            os.close(descriptor)
+        bridge_client.close()
+        bridge_server.close()
+        if record.thread is not None:
+            record.thread.join(timeout=5)
+        listener.close()
+
+    assert result.returncode == 0, f"{result.stderr}\nsandbox errors: {record.errors!r}"
+    assert record.errors == []
+    assert [tuple(request["argv"][4:]) for request in record.requests] == [
+        ("fetch", "--no-tags", "origin"),
+        ("remote", "get-url", "origin"),
+        ("ls-remote", "--symref", "origin", "HEAD"),
+        ("ls-remote", "--heads", "origin", "refs/heads/main"),
+        ("symbolic-ref", "--quiet", "--short", "HEAD"),
+    ]
+    assert record.executable_digests == [git_descriptor["git_executable_sha256"]] * len(record.requests)
+    assert {request["timeout"] for request in record.requests} == {3.5}
+    assert {request["environment"]["HOME"] for request in record.requests} == {str(controlled_home)}
+    assert {request["policy"]["controlled_home"] for request in record.requests} == {str(controlled_home)}
+    assert {tuple(request["policy"]["readable_roots"]) for request in record.requests} == {(str(repository),)}
+    assert {tuple(request["policy"]["writable_roots"]) for request in record.requests} == {(str(repository),)}
+    assert len(list(evidence_root.iterdir())) == len(record.requests) * 2
 
 
 @pytest.mark.parametrize("substitute", ("state", "index", "bridge", "git", "key", "transport"))
