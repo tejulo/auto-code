@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import array
 from dataclasses import replace
 from datetime import UTC, datetime
 import json
@@ -9,6 +10,7 @@ import socket
 import struct
 import subprocess
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -561,6 +563,7 @@ def _installed_launcher_result(
     *,
     mutate_bootstrap: bool = False,
     substitute: str | None = None,
+    forged_sandbox_evidence: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     state_root = tmp_path / "state"
     state_root.mkdir(mode=0o700)
@@ -592,6 +595,8 @@ def _installed_launcher_result(
     bridge_client, bridge_server = socket.socketpair()
     replacement_client: socket.socket | None = None
     replacement_server: socket.socket | None = None
+    sandbox_listener: socket.socket | None = None
+    sandbox_thread: threading.Thread | None = None
     descriptor_paths = [tmp_path / f"bootstrap-{number}.json" for number in range(3, 9)]
     key_path = tmp_path / "finalization-key.bin"
     key_path.write_bytes(signing_key.private_bytes_raw())
@@ -655,6 +660,82 @@ def _installed_launcher_result(
             "finalization_public_key_hash": key_hash,
             "finalization_parent": parent,
         }
+        if forged_sandbox_evidence:
+            sandbox_key = Ed25519PrivateKey.generate()
+            forged_key = Ed25519PrivateKey.generate()
+            sandbox_path = tmp_path / "sandbox.sock"
+            sandbox_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sandbox_listener.bind(str(sandbox_path))
+            sandbox_listener.listen(3)
+
+            def serve_forged_sandbox() -> None:
+                connection, _ = sandbox_listener.accept()
+                with connection:
+                    request = json.loads(connection.makefile("rb").readline())
+                    child_id = "f" * 32
+                    evidence = {
+                        "domain": "auto-code-sandbox-child-evidence/v1",
+                        "sandbox_identity": "launcher",
+                        "challenge": request["challenge"],
+                        "child_id": child_id,
+                        "pid": 124,
+                        "pid_namespace_inode": 456,
+                        "mount_namespace_inode": 789,
+                        "fd_numbers": [],
+                    }
+                    connection.sendall(
+                        canonical_json_bytes(
+                            {
+                                "child_id": child_id,
+                                "evidence": {
+                                    **{
+                                        key: value
+                                        for key, value in evidence.items()
+                                        if key not in {"domain", "sandbox_identity"}
+                                    },
+                                    "signature": sandbox_key.sign(canonical_json_bytes(evidence)).hex(),
+                                },
+                            }
+                        )
+                        + b"\n"
+                    )
+                    connection.recvmsg(65_536, socket.CMSG_SPACE(3 * array.array("i").itemsize))
+                    forged_evidence = {**evidence, "fd_numbers": [0, 1, 2, 4, 5, 6]}
+                    connection.sendall(
+                        canonical_json_bytes(
+                            {
+                                "child_id": child_id,
+                                "evidence": {
+                                    **{
+                                        key: value
+                                        for key, value in forged_evidence.items()
+                                        if key not in {"domain", "sandbox_identity"}
+                                    },
+                                    "signature": forged_key.sign(canonical_json_bytes(forged_evidence)).hex(),
+                                },
+                            }
+                        )
+                        + b"\n"
+                    )
+                for operation, response in (
+                    ("kill_finalization_child", {}),
+                    ("wait_finalization_child", {"returncode": -9, "stdout": "", "stderr": ""}),
+                ):
+                    connection, _ = sandbox_listener.accept()
+                    with connection:
+                        request = json.loads(connection.makefile("rb").readline())
+                        assert request["operation"] == operation
+                        connection.sendall(canonical_json_bytes(response) + b"\n")
+
+            sandbox_thread = threading.Thread(target=serve_forged_sandbox)
+            sandbox_thread.start()
+            config.update(
+                {
+                    "sandbox_socket_path": str(sandbox_path),
+                    "sandbox_identity": "launcher",
+                    "sandbox_public_key": sandbox_key.public_key().public_bytes_raw().hex(),
+                }
+            )
         config["signature"] = _BOOTSTRAP_TEST_KEY.sign(canonical_json_bytes(config)).hex()
         payloads = (config, state_descriptor, index_descriptor, bridge_descriptor, git_descriptor)
         if mutate_bootstrap:
@@ -736,6 +817,10 @@ def _installed_launcher_result(
             replacement_client.close()
         if replacement_server is not None:
             replacement_server.close()
+        if sandbox_listener is not None:
+            sandbox_listener.close()
+        if sandbox_thread is not None:
+            sandbox_thread.join(timeout=3)
 
 
 def test_installed_launcher_fails_closed_without_a_procfs_isolation_capability(tmp_path: Path) -> None:
@@ -744,6 +829,16 @@ def test_installed_launcher_fails_closed_without_a_procfs_isolation_capability(t
     result = _installed_launcher_result(tmp_path)
 
     assert result.returncode == 2
+    assert result.stderr == "auto-code-launcher: protected runtime unavailable\n"
+
+
+def test_installed_launcher_refuses_forged_evidence_before_capability(tmp_path: Path) -> None:
+    """A forged post-transfer proof must fail closed before the ticket uses capability FDs."""
+
+    result = _installed_launcher_result(tmp_path, forged_sandbox_evidence=True)
+
+    assert result.returncode == 2
+    assert result.stdout == ""
     assert result.stderr == "auto-code-launcher: protected runtime unavailable\n"
 
 
