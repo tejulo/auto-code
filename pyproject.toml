@@ -19,6 +19,7 @@ dependencies = [
 auto-code = "auto_code.cli:entrypoint"
 auto-code-launcher = "auto_code.launcher:entrypoint"
 auto-code-repair = "auto_code.repair_entrypoint:entrypoint"
+auto-code-launcher-sandbox = "auto_code.launcher_sandbox_daemon:sandbox_daemon_entrypoint"
 
 [project.optional-dependencies]
 test = ["pytest>=8,<9", "respx"]
