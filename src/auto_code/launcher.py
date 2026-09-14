@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -25,6 +26,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey,
 from launcher_finalization import FinalizationArtifactAuthority, FinalizationLauncher, FinalizationLauncherError, _LauncherRuntime
 
 from .contracts import EffectOutcome
+from .finalization_service import FinalizationParentCapability
 from .git import GitGuard
 from .hashing import canonical_json_bytes
 from .linear import LinearGateway
@@ -89,14 +91,15 @@ def _read_protected(fd: int, *, maximum: int = _MAX_BOOTSTRAP_BYTES) -> bytes:
     return payload
 
 
-def _read_protected_json(fd: int) -> dict[str, object]:
+def _read_protected_json(fd: int) -> tuple[dict[str, object], bytes]:
     try:
-        payload = json.loads(_read_protected(fd).decode("ascii"), object_pairs_hook=_reject_duplicate_json_keys)
+        raw = _read_protected(fd)
+        payload = json.loads(raw.decode("ascii"), object_pairs_hook=_reject_duplicate_json_keys)
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         raise FinalizationLauncherBootstrapError("protected descriptor is invalid") from error
-    if not isinstance(payload, dict) or canonical_json_bytes(payload) != _read_protected(fd):
+    if not isinstance(payload, dict) or canonical_json_bytes(payload) != raw:
         raise FinalizationLauncherBootstrapError("protected descriptor is invalid")
-    return payload
+    return payload, raw
 
 
 def _require_path(value: object, description: str) -> Path:
@@ -117,7 +120,13 @@ def _require_hash(value: object, description: str) -> str:
     return value
 
 
-def _protected_bridge_transport() -> socket.socket:
+def _require_nonnegative_int(value: object, description: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"{description} is invalid")
+    return value
+
+
+def _protected_bridge_transport(expected_identity: tuple[int, int, int, int, int]) -> socket.socket:
     try:
         duplicate = os.dup(_BRIDGE_TRANSPORT_FD)
         metadata = os.fstat(duplicate)
@@ -126,8 +135,11 @@ def _protected_bridge_transport() -> socket.socket:
             raise ValueError
         transport = socket.socket(fileno=duplicate)
         credentials = transport.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
-        _, peer_uid, _ = struct.unpack("3i", credentials)
-        if peer_uid != os.geteuid():
+        peer_pid, peer_uid, peer_gid = struct.unpack("3i", credentials)
+        if (
+            (metadata.st_dev, metadata.st_ino, peer_pid, peer_uid, peer_gid) != expected_identity
+            or peer_uid != os.geteuid()
+        ):
             transport.close()
             raise ValueError
         return transport
@@ -175,18 +187,21 @@ def load_protected_bootstrap() -> _LauncherRuntime:
     """Validate launcher-owned descriptors before constructing operational objects."""
 
     try:
-        config = _read_protected_json(_BOOTSTRAP_FD)
+        config, _ = _read_protected_json(_BOOTSTRAP_FD)
         expected = {
             "domain", "state_root", "repository_root", "bridge_identity", "mcp_server_identity", "bridge_fd",
-            "state_fd", "index_fd", "git_fd", "key_fd", "finalization_public_key_hash", "signature",
+            "state_fd", "index_fd", "git_fd", "key_fd", "state_sha256", "index_sha256", "bridge_sha256",
+            "git_sha256", "key_sha256", "bridge_transport_device", "bridge_transport_inode",
+            "bridge_transport_peer_pid", "bridge_transport_peer_uid", "bridge_transport_peer_gid",
+            "finalization_public_key_hash", "finalization_parent", "signature",
         }
         if set(config) != expected or config["domain"] != "auto-code-launcher-bootstrap/v1":
             raise ValueError
-        signature = config.pop("signature")
+        unsigned_config = dict(config)
+        signature = unsigned_config.pop("signature")
         if not isinstance(signature, str) or len(signature) != 128:
             raise ValueError
-        Ed25519PublicKey.from_public_bytes(_BOOTSTRAP_VERIFICATION_KEY).verify(bytes.fromhex(signature), canonical_json_bytes(config))
-        config["signature"] = signature
+        Ed25519PublicKey.from_public_bytes(_BOOTSTRAP_VERIFICATION_KEY).verify(bytes.fromhex(signature), canonical_json_bytes(unsigned_config))
         if (
             config["state_fd"] != _STATE_FD
             or config["index_fd"] != _INDEX_FD
@@ -198,10 +213,32 @@ def load_protected_bootstrap() -> _LauncherRuntime:
         state_root = _require_path(config["state_root"], "state root")
         repository_root = _require_path(config["repository_root"], "repository root")
         key_hash = _require_hash(config["finalization_public_key_hash"], "finalization public key hash")
-        state = _read_protected_json(_STATE_FD)
-        index = _read_protected_json(_INDEX_FD)
-        bridge = _read_protected_json(_BRIDGE_FD)
-        git = _read_protected_json(_GIT_FD)
+        parent = FinalizationParentCapability.from_payload(config["finalization_parent"])
+        parent.verify()
+        if not hmac.compare_digest(parent.finalization_public_key_hash, key_hash):
+            raise ValueError
+        state, state_raw = _read_protected_json(_STATE_FD)
+        index, index_raw = _read_protected_json(_INDEX_FD)
+        bridge, bridge_raw = _read_protected_json(_BRIDGE_FD)
+        git, git_raw = _read_protected_json(_GIT_FD)
+        key_bytes = _read_protected(_KEY_FD, maximum=32)
+        protected_payloads = (
+            ("state", state_raw),
+            ("index", index_raw),
+            ("bridge", bridge_raw),
+            ("git", git_raw),
+            ("key", key_bytes),
+        )
+        for name, raw in protected_payloads:
+            if not hmac.compare_digest(hashlib.sha256(raw).hexdigest(), _require_hash(config[f"{name}_sha256"], f"{name} descriptor hash")):
+                raise ValueError
+        transport_identity = (
+            _require_nonnegative_int(config["bridge_transport_device"], "bridge transport device"),
+            _require_nonnegative_int(config["bridge_transport_inode"], "bridge transport inode"),
+            _require_nonnegative_int(config["bridge_transport_peer_pid"], "bridge transport peer PID"),
+            _require_nonnegative_int(config["bridge_transport_peer_uid"], "bridge transport peer UID"),
+            _require_nonnegative_int(config["bridge_transport_peer_gid"], "bridge transport peer GID"),
+        )
         if state != {"domain": "auto-code-launcher-state/v1", "state_root": str(state_root)}:
             raise ValueError
         if index != {"domain": "auto-code-launcher-index/v1", "state_root": str(state_root), "finalization_public_key_hash": key_hash}:
@@ -231,13 +268,12 @@ def load_protected_bootstrap() -> _LauncherRuntime:
             or not all(isinstance(value, str) for value in git["commit_excluded_paths"])
         ):
             raise ValueError
-        key_bytes = _read_protected(_KEY_FD, maximum=32)
         if len(key_bytes) != 32:
             raise ValueError
         signing_key = Ed25519PrivateKey.from_private_bytes(key_bytes)
         if hashlib.sha256(signing_key.public_key().public_bytes_raw()).hexdigest() != key_hash:
             raise ValueError
-        transport = _protected_bridge_transport()
+        transport = _protected_bridge_transport(transport_identity)
         trusted_bridge = TrustedLinearBridge(
             state_root=state_root,
             bridge_identity=config["bridge_identity"],
@@ -262,6 +298,7 @@ def load_protected_bootstrap() -> _LauncherRuntime:
             active_run_index=ActiveRunIndex(state_root, finalization_signing_key=signing_key),
             artifact_authority=FinalizationArtifactAuthority(state_root),
             signing_key=signing_key,
+            finalization_parent=parent,
         )
     except (InvalidSignature, OSError, TypeError, ValueError, FinalizationLauncherBootstrapError) as error:
         raise FinalizationLauncherBootstrapError("protected bootstrap is invalid") from error

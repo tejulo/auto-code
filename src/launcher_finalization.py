@@ -32,8 +32,11 @@ from auto_code.contracts import (
     VerificationResult,
 )
 from auto_code.finalization_service import (
+    FinalizationCapabilityBinding,
     FinalizationCapabilityDescriptor,
+    FinalizationParentCapability,
     FinalizationRequest,
+    FinalizationTrustMaterial,
     _FinalizationHandlersInternal,
     _LauncherFinalizationServiceInternal,
 )
@@ -163,6 +166,7 @@ class _LauncherRuntime:
     active_run_index: object | None = None
     artifact_authority: FinalizationArtifactAuthority | None = None
     signing_key: Ed25519PrivateKey | None = None
+    finalization_parent: FinalizationParentCapability | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "state_root", Path(self.state_root))
@@ -236,25 +240,27 @@ class FinalizationLauncher:
                 request_id=request_id,
             )
             service = self._services[descriptor.nonce]
+            parent = self._runtime.finalization_parent
+            if not isinstance(parent, FinalizationParentCapability) or not isinstance(self._runtime.signing_key, Ed25519PrivateKey):
+                raise FinalizationLauncherError("finalization parent capability is unavailable")
+            descriptor_bytes = descriptor.to_bytes()
+            trust = FinalizationTrustMaterial(
+                public_key=service.public_key,
+                descriptor_hash=hashlib.sha256(descriptor_bytes).hexdigest(),
+                parent=parent,
+            )
+            trust_bytes = trust.to_bytes()
+            binding = FinalizationCapabilityBinding.issue(
+                descriptor,
+                trust,
+                descriptor_bytes,
+                trust_bytes,
+                self._runtime.signing_key,
+            )
             descriptors = [
-                _sealed_descriptor(descriptor.to_bytes()),
-                _sealed_descriptor(
-                    canonical_json_bytes(
-                        {
-                            "domain": "auto-code-finalization-trust/v1",
-                            "public_key": service.public_key,
-                            "descriptor_hash": hashlib.sha256(descriptor.to_bytes()).hexdigest(),
-                        }
-                    )
-                ),
-                _sealed_descriptor(
-                    canonical_json_bytes(
-                        {
-                            "domain": "auto-code-finalization-binding/v1",
-                            "public_key_hash": generation_key_hash(self._load_exact(run_id, expected_revision, expected_generation_hash)),
-                        }
-                    )
-                ),
+                _sealed_descriptor(descriptor_bytes),
+                _sealed_descriptor(trust_bytes),
+                _sealed_descriptor(binding.to_bytes()),
             ]
             process = subprocess.Popen(
                 ticket_argv,

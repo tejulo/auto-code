@@ -48,6 +48,8 @@ from auto_code.finalizer import (
 )
 from auto_code import finalization_service
 from auto_code.finalization_service import (
+    FinalizationCapabilityBinding,
+    FinalizationParentCapability,
     FinalizationTrustMaterial,
     _FinalizationHandlersInternal as FinalizationHandlers,
     _LauncherFinalizationServiceInternal as FinalizationService,
@@ -72,6 +74,23 @@ from auto_code.project_config import (
 )
 from auto_code.state import EMPTY_STATE_HASH, RunStateStore, StateGeneration
 from auto_code.supervisor import StepKind
+
+
+_PARENT_TEST_KEY = Ed25519PrivateKey.from_private_bytes(bytes.fromhex("11" * 32))
+
+
+def parent_capability(finalization_public_key: str) -> FinalizationParentCapability:
+    key_hash = sha256(bytes.fromhex(finalization_public_key)).hexdigest()
+    unsigned = {
+        "domain": "auto-code-finalization-parent/v1",
+        "public_key": _PARENT_TEST_KEY.public_key().public_bytes_raw().hex(),
+        "finalization_public_key_hash": key_hash,
+    }
+    return FinalizationParentCapability(
+        public_key=unsigned["public_key"],
+        finalization_public_key_hash=key_hash,
+        signature=_PARENT_TEST_KEY.sign(canonical_json_bytes(unsigned)).hex(),
+    )
 
 
 def digest(value: str) -> str:
@@ -980,22 +999,24 @@ def test_finalize_and_receipt_cli_dispatch_only_through_the_launcher_socket(
         capability_path = harness.store.root / f"{descriptor.nonce}.json"
         trust_path = harness.store.root / "finalization-trust.json"
         capability_path.write_bytes(descriptor.to_bytes())
-        trust_path.write_bytes(
-            FinalizationTrustMaterial(
-                public_key=service.public_key,
-                descriptor_hash=sha256(descriptor.to_bytes()).hexdigest(),
-            ).to_bytes()
+        trusted = FinalizationTrustMaterial(
+            public_key=service.public_key,
+            descriptor_hash=sha256(descriptor.to_bytes()).hexdigest(),
+            parent=parent_capability(service.public_key),
         )
+        trust_bytes = trusted.to_bytes()
+        trust_path.write_bytes(trust_bytes)
         capability_fd = os.open(capability_path, os.O_RDONLY)
         trust_fd = os.open(trust_path, os.O_RDONLY)
         binding_path = harness.store.root / "finalization-binding.json"
         binding_path.write_bytes(
-            canonical_json_bytes(
-                {
-                    "domain": "auto-code-finalization-binding/v1",
-                    "public_key_hash": sha256(bytes.fromhex(service.public_key)).hexdigest(),
-                }
-            )
+            FinalizationCapabilityBinding.issue(
+                descriptor,
+                trusted,
+                descriptor.to_bytes(),
+                trust_bytes,
+                service._signing_key,
+            ).to_bytes()
         )
         binding_fd = os.open(binding_path, os.O_RDONLY)
         monkeypatch.setattr(finalization_service, "_LAUNCHER_FINALIZATION_FD", capability_fd)

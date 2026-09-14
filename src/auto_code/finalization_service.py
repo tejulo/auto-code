@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -35,6 +36,7 @@ _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,254}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _NONCE = re.compile(r"[0-9a-f]{64}\Z")
 _SIGNATURE = re.compile(r"[0-9a-f]{128}\Z")
+_FINALIZATION_PARENT_PUBLIC_KEY_HASH = "10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d"
 
 
 class FinalizationServiceError(RuntimeError):
@@ -61,21 +63,75 @@ class _Deadline:
 
 
 @dataclass(frozen=True, slots=True)
+class FinalizationParentCapability:
+    public_key: str
+    finalization_public_key_hash: str
+    signature: str
+
+    def __post_init__(self) -> None:
+        _require_public_key(self.public_key)
+        _require_hash(self.finalization_public_key_hash, "finalization public key hash")
+        if not isinstance(self.signature, str) or _SIGNATURE.fullmatch(self.signature) is None:
+            raise ValueError("finalization parent signature is invalid")
+
+    def unsigned_payload(self) -> dict[str, object]:
+        return {
+            "domain": "auto-code-finalization-parent/v1",
+            "public_key": self.public_key,
+            "finalization_public_key_hash": self.finalization_public_key_hash,
+        }
+
+    def payload(self) -> dict[str, object]:
+        return {**self.unsigned_payload(), "signature": self.signature}
+
+    def to_bytes(self) -> bytes:
+        return canonical_json_bytes(self.payload())
+
+    def verify(self) -> None:
+        try:
+            if not hmac.compare_digest(
+                hashlib.sha256(bytes.fromhex(self.public_key)).hexdigest(),
+                _FINALIZATION_PARENT_PUBLIC_KEY_HASH,
+            ):
+                raise ValueError
+            Ed25519PublicKey.from_public_bytes(bytes.fromhex(self.public_key)).verify(
+                bytes.fromhex(self.signature), canonical_json_bytes(self.unsigned_payload())
+            )
+        except (InvalidSignature, ValueError):
+            raise FinalizationServiceError("finalization parent capability is invalid") from None
+
+    @classmethod
+    def from_payload(cls, value: object) -> FinalizationParentCapability:
+        expected = {"domain", "public_key", "finalization_public_key_hash", "signature"}
+        if not isinstance(value, dict) or set(value) != expected or value["domain"] != "auto-code-finalization-parent/v1":
+            raise ValueError("finalization parent capability is invalid")
+        return cls(
+            public_key=value["public_key"],
+            finalization_public_key_hash=value["finalization_public_key_hash"],
+            signature=value["signature"],
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class FinalizationTrustMaterial:
     public_key: str
     descriptor_hash: str | None = None
+    parent: FinalizationParentCapability | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.public_key, str) or re.fullmatch(r"[0-9a-f]{64}", self.public_key) is None:
             raise ValueError("finalization trust public key is invalid")
         if self.descriptor_hash is not None:
             _require_hash(self.descriptor_hash, "finalization descriptor hash")
+        if self.parent is not None and not isinstance(self.parent, FinalizationParentCapability):
+            raise ValueError("finalization parent capability is invalid")
 
     def payload(self) -> dict[str, object]:
         return {
             "domain": "auto-code-finalization-trust/v1",
             "public_key": self.public_key,
             "descriptor_hash": self.descriptor_hash,
+            "parent": None if self.parent is None else self.parent.payload(),
         }
 
     def to_bytes(self) -> bytes:
@@ -83,11 +139,19 @@ class FinalizationTrustMaterial:
 
     @classmethod
     def from_payload(cls, value: object) -> FinalizationTrustMaterial:
-        if not isinstance(value, dict) or set(value) != {"domain", "public_key", "descriptor_hash"} or value["domain"] != "auto-code-finalization-trust/v1":
+        if not isinstance(value, dict) or value.get("domain") != "auto-code-finalization-trust/v1":
+            raise ValueError("finalization trust material is invalid")
+        expected = {"domain", "public_key", "descriptor_hash"}
+        if set(value) == expected:
+            parent = None
+        elif set(value) == {*expected, "parent"}:
+            parent = None if value["parent"] is None else FinalizationParentCapability.from_payload(value["parent"])
+        else:
             raise ValueError("finalization trust material is invalid")
         return cls(
             public_key=value["public_key"],
             descriptor_hash=value["descriptor_hash"],
+            parent=parent,
         )
 
 
@@ -319,6 +383,131 @@ class FinalizationCapabilityDescriptor:
             )
         except (TypeError, ValueError):
             raise ValueError("capability descriptor is invalid") from None
+
+
+@dataclass(frozen=True, slots=True)
+class FinalizationCapabilityBinding:
+    run_id: str
+    expected_revision: int
+    expected_state_hash: str
+    finalization_public_key_hash: str
+    descriptor_hash: str
+    trust_hash: str
+    parent_hash: str
+    signature: str
+
+    def __post_init__(self) -> None:
+        _require_identifier(self.run_id, "run ID")
+        if not isinstance(self.expected_revision, int) or isinstance(self.expected_revision, bool) or self.expected_revision < 1:
+            raise ValueError("expected revision is invalid")
+        for value, description in (
+            (self.expected_state_hash, "expected state hash"),
+            (self.finalization_public_key_hash, "finalization public key hash"),
+            (self.descriptor_hash, "finalization descriptor hash"),
+            (self.trust_hash, "finalization trust hash"),
+            (self.parent_hash, "finalization parent hash"),
+        ):
+            _require_hash(value, description)
+        if not isinstance(self.signature, str) or _SIGNATURE.fullmatch(self.signature) is None:
+            raise ValueError("finalization binding signature is invalid")
+
+    def unsigned_payload(self) -> dict[str, object]:
+        return {
+            "domain": "auto-code-finalization-binding/v2",
+            "run_id": self.run_id,
+            "expected_revision": self.expected_revision,
+            "expected_state_hash": self.expected_state_hash,
+            "finalization_public_key_hash": self.finalization_public_key_hash,
+            "descriptor_hash": self.descriptor_hash,
+            "trust_hash": self.trust_hash,
+            "parent_hash": self.parent_hash,
+        }
+
+    def payload(self) -> dict[str, object]:
+        return {**self.unsigned_payload(), "signature": self.signature}
+
+    def to_bytes(self) -> bytes:
+        return canonical_json_bytes(self.payload())
+
+    @classmethod
+    def issue(
+        cls,
+        descriptor: FinalizationCapabilityDescriptor,
+        trust: FinalizationTrustMaterial,
+        descriptor_raw: bytes,
+        trust_raw: bytes,
+        signing_key: Ed25519PrivateKey,
+    ) -> FinalizationCapabilityBinding:
+        if trust.parent is None or not isinstance(signing_key, Ed25519PrivateKey):
+            raise ValueError("finalization binding is invalid")
+        unsigned = cls(
+            run_id=descriptor.run_id,
+            expected_revision=descriptor.expected_revision,
+            expected_state_hash=descriptor.expected_state_hash,
+            finalization_public_key_hash=hashlib.sha256(bytes.fromhex(trust.public_key)).hexdigest(),
+            descriptor_hash=hashlib.sha256(descriptor_raw).hexdigest(),
+            trust_hash=hashlib.sha256(trust_raw).hexdigest(),
+            parent_hash=hashlib.sha256(trust.parent.to_bytes()).hexdigest(),
+            signature="0" * 128,
+        )
+        return cls(
+            run_id=unsigned.run_id,
+            expected_revision=unsigned.expected_revision,
+            expected_state_hash=unsigned.expected_state_hash,
+            finalization_public_key_hash=unsigned.finalization_public_key_hash,
+            descriptor_hash=unsigned.descriptor_hash,
+            trust_hash=unsigned.trust_hash,
+            parent_hash=unsigned.parent_hash,
+            signature=signing_key.sign(canonical_json_bytes(unsigned.unsigned_payload())).hex(),
+        )
+
+    def validate(
+        self,
+        descriptor: FinalizationCapabilityDescriptor,
+        trust: FinalizationTrustMaterial,
+        descriptor_raw: bytes,
+        trust_raw: bytes,
+    ) -> None:
+        try:
+            parent = trust.parent
+            if parent is None:
+                raise ValueError
+            parent.verify()
+            if (
+                self.run_id != descriptor.run_id
+                or self.expected_revision != descriptor.expected_revision
+                or not hmac.compare_digest(self.expected_state_hash, descriptor.expected_state_hash)
+                or not hmac.compare_digest(self.finalization_public_key_hash, parent.finalization_public_key_hash)
+                or not hmac.compare_digest(self.finalization_public_key_hash, hashlib.sha256(bytes.fromhex(trust.public_key)).hexdigest())
+                or not hmac.compare_digest(self.descriptor_hash, hashlib.sha256(descriptor_raw).hexdigest())
+                or not hmac.compare_digest(self.trust_hash, hashlib.sha256(trust_raw).hexdigest())
+                or not hmac.compare_digest(self.parent_hash, hashlib.sha256(parent.to_bytes()).hexdigest())
+            ):
+                raise ValueError
+            Ed25519PublicKey.from_public_bytes(bytes.fromhex(trust.public_key)).verify(
+                bytes.fromhex(self.signature), canonical_json_bytes(self.unsigned_payload())
+            )
+        except (InvalidSignature, ValueError, FinalizationServiceError):
+            raise FinalizationCapabilityError("launcher finalization binding is invalid") from None
+
+    @classmethod
+    def from_payload(cls, value: object) -> FinalizationCapabilityBinding:
+        expected = {
+            "domain", "run_id", "expected_revision", "expected_state_hash", "finalization_public_key_hash",
+            "descriptor_hash", "trust_hash", "parent_hash", "signature",
+        }
+        if not isinstance(value, dict) or set(value) != expected or value["domain"] != "auto-code-finalization-binding/v2":
+            raise ValueError("finalization binding is invalid")
+        return cls(
+            run_id=value["run_id"],
+            expected_revision=value["expected_revision"],
+            expected_state_hash=value["expected_state_hash"],
+            finalization_public_key_hash=value["finalization_public_key_hash"],
+            descriptor_hash=value["descriptor_hash"],
+            trust_hash=value["trust_hash"],
+            parent_hash=value["parent_hash"],
+            signature=value["signature"],
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -620,7 +809,7 @@ class _LauncherFinalizationServiceInternal:
         )
 
 
-def _load_protected_json(fd_number: int, description: str) -> object:
+def _load_protected_json(fd_number: int, description: str) -> tuple[object, bytes]:
     try:
         descriptor = os.dup(fd_number)
     except OSError as error:
@@ -641,28 +830,17 @@ def _load_protected_json(fd_number: int, description: str) -> object:
         payload = json.loads(raw.decode("ascii"), object_pairs_hook=_reject_duplicate_json_keys)
         if raw != canonical_json_bytes(payload):
             raise ValueError
-        return payload
+        return payload, raw
     except (TypeError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
         raise FinalizationServiceError(f"launcher finalization {description} is invalid") from error
 
 
 def load_finalization_trust_from_protected_fd() -> FinalizationTrustMaterial:
     try:
-        return FinalizationTrustMaterial.from_payload(_load_protected_json(_LAUNCHER_FINALIZATION_TRUST_FD, "trust"))
+        payload, _ = _load_protected_json(_LAUNCHER_FINALIZATION_TRUST_FD, "trust")
+        return FinalizationTrustMaterial.from_payload(payload)
     except (TypeError, ValueError, FinalizationServiceError) as error:
         raise FinalizationServiceError("launcher finalization trust is invalid") from error
-
-
-def _load_finalization_binding_from_protected_fd() -> str:
-    try:
-        payload = _load_protected_json(_LAUNCHER_FINALIZATION_BINDING_FD, "binding")
-        if not isinstance(payload, dict) or set(payload) != {"domain", "public_key_hash"}:
-            raise ValueError
-        if payload["domain"] != "auto-code-finalization-binding/v1":
-            raise ValueError
-        return _require_hash(payload["public_key_hash"], "finalization public key hash")
-    except (TypeError, ValueError, FinalizationServiceError) as error:
-        raise FinalizationCapabilityError("launcher finalization binding is invalid") from error
 
 
 def validate_finalization_capability(
@@ -690,7 +868,8 @@ def load_capability_from_protected_fd(
     expected_public_key_hash: str,
 ) -> FinalizationCapabilityDescriptor:
     try:
-        capability = FinalizationCapabilityDescriptor.from_payload(_load_protected_json(_LAUNCHER_FINALIZATION_FD, "capability"))
+        payload, _ = _load_protected_json(_LAUNCHER_FINALIZATION_FD, "capability")
+        capability = FinalizationCapabilityDescriptor.from_payload(payload)
         validate_finalization_capability(
             capability,
             trust,
@@ -731,8 +910,17 @@ def invoke_protected_capability(
     expected_state_hash: str,
     request_id: str | None,
 ) -> FinalizationResponse:
-    trust = load_finalization_trust_from_protected_fd()
-    descriptor = load_capability_from_protected_fd(trust, _load_finalization_binding_from_protected_fd())
+    try:
+        descriptor_payload, descriptor_raw = _load_protected_json(_LAUNCHER_FINALIZATION_FD, "capability")
+        trust_payload, trust_raw = _load_protected_json(_LAUNCHER_FINALIZATION_TRUST_FD, "trust")
+        binding_payload, _ = _load_protected_json(_LAUNCHER_FINALIZATION_BINDING_FD, "binding")
+        descriptor = FinalizationCapabilityDescriptor.from_payload(descriptor_payload)
+        trust = FinalizationTrustMaterial.from_payload(trust_payload)
+        binding = FinalizationCapabilityBinding.from_payload(binding_payload)
+        binding.validate(descriptor, trust, descriptor_raw, trust_raw)
+        validate_finalization_capability(descriptor, trust, binding.finalization_public_key_hash)
+    except (TypeError, ValueError, FinalizationServiceError) as error:
+        raise FinalizationCapabilityError("launcher finalization trust binding is invalid") from error
     request = FinalizationRequest(
         operation=operation,
         run_id=run_id,

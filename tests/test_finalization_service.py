@@ -18,7 +18,9 @@ from auto_code.cli import main
 from auto_code.contracts import RunState, StepKind, StepResult
 from auto_code.finalization_service import (
     FinalizationCapabilityDescriptor,
+    FinalizationCapabilityBinding,
     FinalizationCapabilityError,
+    FinalizationParentCapability,
     FinalizationRequest,
     FinalizationServiceError,
     FinalizationTrustMaterial,
@@ -32,6 +34,23 @@ from auto_code.finalization_service import (
 from auto_code import finalization_service
 from auto_code.hashing import canonical_json_bytes
 from auto_code.state import EMPTY_STATE_HASH, RunStateStore
+
+
+_PARENT_TEST_KEY = Ed25519PrivateKey.from_private_bytes(bytes.fromhex("11" * 32))
+
+
+def parent_capability(finalization_public_key: str) -> FinalizationParentCapability:
+    key_hash = __import__("hashlib").sha256(bytes.fromhex(finalization_public_key)).hexdigest()
+    unsigned = {
+        "domain": "auto-code-finalization-parent/v1",
+        "public_key": _PARENT_TEST_KEY.public_key().public_bytes_raw().hex(),
+        "finalization_public_key_hash": key_hash,
+    }
+    return FinalizationParentCapability(
+        public_key=unsigned["public_key"],
+        finalization_public_key_hash=key_hash,
+        signature=_PARENT_TEST_KEY.sign(canonical_json_bytes(unsigned)).hex(),
+    )
 
 
 class RecordingHandlers:
@@ -343,20 +362,22 @@ def test_installed_finalize_cli_uses_only_the_fixed_fd_capability(
     descriptor_path = tmp_path / "capability.json"
     descriptor_path.write_bytes(issued.to_bytes())
     trust_path = tmp_path / "trust.json"
-    trust_path.write_bytes(
-        FinalizationTrustMaterial(
-            public_key=service.public_key,
-            descriptor_hash=__import__("hashlib").sha256(issued.to_bytes()).hexdigest(),
-        ).to_bytes()
+    trusted = FinalizationTrustMaterial(
+        public_key=service.public_key,
+        descriptor_hash=__import__("hashlib").sha256(issued.to_bytes()).hexdigest(),
+        parent=parent_capability(service.public_key),
     )
+    trust_bytes = trusted.to_bytes()
+    trust_path.write_bytes(trust_bytes)
     binding_path = tmp_path / "binding.json"
     binding_path.write_bytes(
-        canonical_json_bytes(
-            {
-                "domain": "auto-code-finalization-binding/v1",
-                "public_key_hash": __import__("hashlib").sha256(bytes.fromhex(service.public_key)).hexdigest(),
-            }
-        )
+        FinalizationCapabilityBinding.issue(
+            issued,
+            trusted,
+            issued.to_bytes(),
+            trust_bytes,
+            service._signing_key,
+        ).to_bytes()
     )
     fd = os.open(descriptor_path, os.O_RDONLY)
     trust_fd = os.open(trust_path, os.O_RDONLY)
@@ -554,6 +575,92 @@ raise SystemExit("attacker-controlled inherited FDs reached finalization")
         listener.close()
         os.close(descriptor_fd)
         os.close(trust_fd)
+
+
+def test_child_rejects_coherently_replaced_finalization_fds_before_connecting(tmp_path: Path) -> None:
+    """Removing the immutable parent binding would let a coherent FD 4/5/6 chain reach an attacker socket."""
+
+    socket_path = tmp_path / "attacker.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(1)
+    handlers = RecordingHandlers()
+    attacker = FinalizationService(
+        signing_key=Ed25519PrivateKey.generate(),
+        state_root=tmp_path / "attacker-state",
+        handlers=FinalizationHandlers(finalize=handlers.finalize, receipt=handlers.receipt),
+    )
+    issued = attacker.issue_descriptor(
+        operation="finalize",
+        run_id="run-1",
+        expected_revision=3,
+        expected_state_hash="a" * 64,
+        request_id=None,
+        socket_path=socket_path,
+        expires_at=datetime.now(UTC) + timedelta(minutes=1),
+        timeout_seconds=2.0,
+    )
+    descriptor_path = tmp_path / "attacker-descriptor.json"
+    descriptor_path.write_bytes(issued.to_bytes())
+    trust_path = tmp_path / "attacker-trust.json"
+    trust_path.write_bytes(
+        FinalizationTrustMaterial(
+            public_key=attacker.public_key,
+            descriptor_hash=__import__("hashlib").sha256(issued.to_bytes()).hexdigest(),
+        ).to_bytes()
+    )
+    binding_path = tmp_path / "attacker-binding.json"
+    binding_path.write_bytes(
+        canonical_json_bytes(
+            {
+                "domain": "auto-code-finalization-binding/v1",
+                "public_key_hash": __import__("hashlib").sha256(bytes.fromhex(attacker.public_key)).hexdigest(),
+            }
+        )
+    )
+    descriptor_fd = os.open(descriptor_path, os.O_RDONLY)
+    trust_fd = os.open(trust_path, os.O_RDONLY)
+    binding_fd = os.open(binding_path, os.O_RDONLY)
+    worker = threading.Thread(target=attacker.serve_once, args=(listener,), daemon=True)
+    worker.start()
+    try:
+        child = subprocess.run(
+            (
+                sys.executable,
+                "-c",
+                """
+import os
+import sys
+
+from auto_code.finalization_service import FinalizationCapabilityError, FinalizationServiceError, invoke_protected_capability
+
+for source, target in zip(sys.argv[1:4], (4, 5, 6), strict=True):
+    os.dup2(int(source), target)
+try:
+    invoke_protected_capability("finalize", "run-1", 3, "a" * 64, None)
+except (FinalizationCapabilityError, FinalizationServiceError):
+    raise SystemExit(0)
+raise SystemExit(7)
+""",
+                str(descriptor_fd),
+                str(trust_fd),
+                str(binding_fd),
+            ),
+            pass_fds=(descriptor_fd, trust_fd, binding_fd),
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PYTHONPATH": str(Path.cwd() / "src")},
+        )
+
+        assert child.returncode == 0, child.stderr
+    finally:
+        listener.close()
+        worker.join(timeout=2)
+        os.close(descriptor_fd)
+        os.close(trust_fd)
+        os.close(binding_fd)
+
+    assert handlers.calls == []
 
 
 def test_capability_rejects_replaced_descriptor_and_trust_fds(tmp_path: Path) -> None:
