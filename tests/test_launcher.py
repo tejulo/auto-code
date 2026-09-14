@@ -36,8 +36,8 @@ def test_protected_bridge_client_timeout_applies_one_deadline_to_the_response() 
         worker.join(timeout=1)
 
 
-def test_protected_bridge_client_uses_the_finalization_deadline_by_default() -> None:
-    """Requiring every legacy bridge caller to supply a deadline would reject valid finalization work."""
+def test_protected_bridge_client_requires_the_propagated_finalization_deadline() -> None:
+    """Creating a new bridge timeout would let it outlive the original finalization budget."""
 
     client_transport, bridge_transport = socket.socketpair()
 
@@ -65,8 +65,15 @@ def test_protected_bridge_client_uses_the_finalization_deadline_by_default() -> 
     worker.start()
     try:
         client = _ProtectedBridgeClient(client_transport, "linear-mcp")
+        with pytest.raises(TypeError):
+            client.call("linear-mcp", "query_ticket_state", {"id": "ENG-1"})
 
-        response = client.call("linear-mcp", "query_ticket_state", {"id": "ENG-1"})
+        response = client.call(
+            "linear-mcp",
+            "query_ticket_state",
+            {"id": "ENG-1"},
+            deadline=time.monotonic() + 1,
+        )
 
         assert response.tool_call_id == "tool-call-1"
     finally:

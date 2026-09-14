@@ -172,11 +172,9 @@ class _ProtectedBridgeClient:
         self._transport = transport
         self._server_identity = server_identity
 
-    def call(self, server_identity: str, tool_name: str, arguments: object, *, deadline: float | None = None) -> McpToolResult:
+    def call(self, server_identity: str, tool_name: str, arguments: object, *, deadline: float) -> McpToolResult:
         if server_identity != self._server_identity or not isinstance(tool_name, str):
             raise RuntimeError("bridge request is invalid")
-        if deadline is None:
-            deadline = time.monotonic() + 5.0
         if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) or not math.isfinite(deadline):
             raise RuntimeError("bridge deadline is invalid")
 

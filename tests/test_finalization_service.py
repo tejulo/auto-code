@@ -33,6 +33,8 @@ from auto_code.finalization_service import (
 )
 from auto_code import finalization_service
 from auto_code.hashing import canonical_json_bytes
+from auto_code.launcher import _ProtectedBridgeClient
+from auto_code.mcp_bridge import TrustedLinearBridge
 from auto_code.state import EMPTY_STATE_HASH, RunStateStore
 
 
@@ -57,10 +59,10 @@ class RecordingHandlers:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, int, str, str | None]] = []
 
-    def finalize(self, request: object) -> StepResult:
+    def finalize(self, request: object, deadline: float) -> StepResult:
         return self._result(request)
 
-    def receipt(self, request: object) -> StepResult:
+    def receipt(self, request: object, deadline: float) -> StepResult:
         return self._result(request)
 
     def _result(self, request: object) -> StepResult:
@@ -103,6 +105,7 @@ def descriptor(
     *,
     operation: str = "finalize",
     expires_at: datetime | None = None,
+    timeout_seconds: float = 1.0,
 ) -> FinalizationCapabilityDescriptor:
     ensure_socket_node(socket_path)
     return service.issue_descriptor(
@@ -113,7 +116,7 @@ def descriptor(
         request_id="11111111-1111-4111-8111-111111111111" if operation == "receipt" else None,
         socket_path=socket_path,
         expires_at=expires_at or datetime.now(UTC) + timedelta(minutes=1),
-        timeout_seconds=1.0,
+        timeout_seconds=timeout_seconds,
     )
 
 
@@ -128,7 +131,7 @@ def test_finalization_service_never_persists_its_in_memory_private_key(tmp_path:
     FinalizationService(
         signing_key=Ed25519PrivateKey.generate(),
         state_root=state_root,
-        handlers=FinalizationHandlers(finalize=lambda _: StepResult(kind=StepKind.READY_TO_FINALIZE, run_id="run-1", state_revision=1, state_hash="a" * 64), receipt=lambda _: StepResult(kind=StepKind.READY_TO_FINALIZE, run_id="run-1", state_revision=1, state_hash="a" * 64)),
+        handlers=FinalizationHandlers(finalize=lambda _, __: StepResult(kind=StepKind.READY_TO_FINALIZE, run_id="run-1", state_revision=1, state_hash="a" * 64), receipt=lambda _, __: StepResult(kind=StepKind.READY_TO_FINALIZE, run_id="run-1", state_revision=1, state_hash="a" * 64)),
     )
 
     assert not (state_root / "finalization-keys").exists()
@@ -254,7 +257,7 @@ def test_handler_failure_completes_nonce_with_replayable_signed_error(tmp_path: 
 
     calls: list[FinalizationRequest] = []
 
-    def fail(request: FinalizationRequest) -> StepResult:
+    def fail(request: FinalizationRequest, deadline: float) -> StepResult:
         calls.append(request)
         raise RuntimeError("bridge transport rejected the response")
 
@@ -272,6 +275,75 @@ def test_handler_failure_completes_nonce_with_replayable_signed_error(tmp_path: 
     assert first.error == "rejected"
     assert service.dispatch(issued.request()) == first
     assert calls == [issued.request()]
+
+
+@pytest.mark.parametrize("failure", ("timeout", "transport", "malformed_response"))
+def test_bridge_failure_completes_nonce_with_replayable_signed_error(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    """A bridge failure must not strand a finalization nonce after the handler begins execution."""
+
+    client_transport, bridge_transport = socket.socketpair()
+    bridge_received = threading.Event()
+    worker: threading.Thread | None = None
+    if failure == "transport":
+        bridge_transport.close()
+    elif failure == "timeout":
+        def stall_response() -> None:
+            with bridge_transport:
+                if not bridge_transport.recv(65_536):
+                    return
+                bridge_received.set()
+                threading.Event().wait(0.2)
+
+        worker = threading.Thread(target=stall_response, daemon=True)
+        worker.start()
+    else:
+        def send_malformed_response() -> None:
+            with bridge_transport:
+                if not bridge_transport.recv(65_536):
+                    return
+                bridge_received.set()
+                bridge_transport.sendall(b"{}\n")
+
+        worker = threading.Thread(target=send_malformed_response, daemon=True)
+        worker.start()
+    calls: list[FinalizationRequest] = []
+    client = _ProtectedBridgeClient(client_transport, "linear-mcp")
+    bridge = TrustedLinearBridge(
+        state_root=tmp_path / "bridge-state",
+        bridge_identity="launcher-bridge",
+        mcp_server_identity="linear-mcp",
+        receipt_signing_key=b"test-signing-key-123",
+        client=client,
+    )
+
+    def route_bridge_failure(request: FinalizationRequest, deadline: float) -> StepResult:
+        calls.append(request)
+        bridge._call("query_ticket_state", {"id": "ENG-1"}, deadline=deadline)
+        raise AssertionError("bridge failure should not return a result")
+
+    service = FinalizationService(
+        signing_key=Ed25519PrivateKey.generate(),
+        state_root=tmp_path / "state",
+        handlers=FinalizationHandlers(finalize=route_bridge_failure, receipt=route_bridge_failure),
+    )
+    issued = descriptor(service, tmp_path / "launcher.sock", timeout_seconds=0.05)
+    try:
+        first = service.dispatch(issued.request())
+    finally:
+        client_transport.close()
+        if worker is not None:
+            worker.join(timeout=1)
+
+    first.verify(issued, trust(service))
+    assert first.result is None
+    assert first.error == "rejected"
+    assert service.dispatch(issued.request()) == first
+    assert calls == [issued.request()]
+    if failure != "transport":
+        assert bridge_received.is_set()
 
 
 def test_receipt_capability_binds_its_request_id(service: FinalizationService, handlers: RecordingHandlers, tmp_path: Path) -> None:
@@ -329,7 +401,7 @@ def test_forged_socket_response_is_rejected(
     attacker = FinalizationService(
         signing_key=Ed25519PrivateKey.generate(),
         state_root=tmp_path / "attacker-state",
-        handlers=FinalizationHandlers(finalize=lambda _: result, receipt=lambda _: result),
+        handlers=FinalizationHandlers(finalize=lambda _, __: result, receipt=lambda _, __: result),
     )
 
     def reply_with_forged_signature() -> None:
@@ -444,7 +516,7 @@ def test_trusted_fd_rejects_attacker_descriptor_before_connect(
     attacker = FinalizationService(
         signing_key=Ed25519PrivateKey.generate(),
         state_root=tmp_path / "attacker-state",
-        handlers=FinalizationHandlers(finalize=lambda _: StepResult(kind=StepKind.READY_TO_FINALIZE, run_id="run-1", state_revision=3, state_hash="a" * 64), receipt=lambda _: StepResult(kind=StepKind.READY_TO_FINALIZE, run_id="run-1", state_revision=3, state_hash="a" * 64)),
+        handlers=FinalizationHandlers(finalize=lambda _, __: StepResult(kind=StepKind.READY_TO_FINALIZE, run_id="run-1", state_revision=3, state_hash="a" * 64), receipt=lambda _, __: StepResult(kind=StepKind.READY_TO_FINALIZE, run_id="run-1", state_revision=3, state_hash="a" * 64)),
     )
     attacker_descriptor = descriptor(attacker, attacker_socket)
     descriptor_path = tmp_path / "attacker-capability.json"
@@ -520,13 +592,13 @@ def test_attacker_cannot_finalize_with_replaced_fd4_and_fd5(
         signing_key=Ed25519PrivateKey.generate(),
         state_root=state_root,
         handlers=FinalizationHandlers(
-            finalize=lambda _: StepResult(
+            finalize=lambda _, __: StepResult(
                 kind=StepKind.READY_TO_FINALIZE,
                 run_id="run-1",
                 state_revision=generation.revision,
                 state_hash=generation.state_hash,
             ),
-            receipt=lambda _: StepResult(
+            receipt=lambda _, __: StepResult(
                 kind=StepKind.READY_TO_FINALIZE,
                 run_id="run-1",
                 state_revision=generation.revision,
@@ -716,13 +788,13 @@ def test_capability_rejects_replaced_descriptor_and_trust_fds(tmp_path: Path) ->
         signing_key=Ed25519PrivateKey.generate(),
         state_root=state_root,
         handlers=FinalizationHandlers(
-            finalize=lambda _: StepResult(
+            finalize=lambda _, __: StepResult(
                 kind=StepKind.READY_TO_FINALIZE,
                 run_id="run-1",
                 state_revision=generation.revision,
                 state_hash=generation.state_hash,
             ),
-            receipt=lambda _: StepResult(
+            receipt=lambda _, __: StepResult(
                 kind=StepKind.READY_TO_FINALIZE,
                 run_id="run-1",
                 state_revision=generation.revision,

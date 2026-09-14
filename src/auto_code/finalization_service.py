@@ -600,8 +600,8 @@ class FinalizationResponse:
 
 @dataclass(frozen=True, slots=True)
 class _FinalizationHandlersInternal:
-    finalize: Callable[[FinalizationRequest], StepResult]
-    receipt: Callable[[FinalizationRequest], StepResult]
+    finalize: Callable[[FinalizationRequest, float], StepResult]
+    receipt: Callable[[FinalizationRequest, float], StepResult]
 
     def __post_init__(self) -> None:
         if not callable(self.finalize) or not callable(self.receipt):
@@ -692,7 +692,12 @@ class _LauncherFinalizationServiceInternal:
         self._io_timeout_seconds = timeout_seconds if self._io_timeout_seconds is None else min(self._io_timeout_seconds, timeout_seconds)
         return descriptor
 
-    def dispatch(self, value: FinalizationRequest | Mapping[str, object]) -> FinalizationResponse:
+    def dispatch(
+        self,
+        value: FinalizationRequest | Mapping[str, object],
+        *,
+        deadline: _Deadline | None = None,
+    ) -> FinalizationResponse:
         try:
             request = value if isinstance(value, FinalizationRequest) else FinalizationRequest.from_payload(dict(value))
         except (TypeError, ValueError):
@@ -718,22 +723,26 @@ class _LauncherFinalizationServiceInternal:
             if record["status"] != "issued":
                 raise FinalizationServiceError("capability is replayed")
             _atomic_replace_json(self._record_path(request.nonce), {"descriptor": descriptor.payload(), "status": "consumed", "response": None})
+        deadline = _Deadline.start(descriptor.timeout_seconds) if deadline is None else deadline
         try:
-            response = self._response(request, result=self._dispatch_handler(request), error=None)
+            deadline.remaining()
+            result = self._dispatch_handler(request, deadline.expires_at)
+            deadline.remaining()
+            response = self._response(request, result=result, error=None)
         except Exception:
             response = self._response(request, result=None, error="rejected")
         with _interprocess_lock(self._record_root / "lock"):
             _atomic_replace_json(self._record_path(request.nonce), {"descriptor": descriptor.payload(), "status": "completed", "response": response.payload()})
         return response
 
-    def _dispatch_handler(self, request: FinalizationRequest) -> StepResult:
+    def _dispatch_handler(self, request: FinalizationRequest, deadline: float) -> StepResult:
         """Run a launcher-originated request through the same handler validation as IPC."""
 
         if not isinstance(request, FinalizationRequest):
             raise FinalizationServiceError("finalization request is invalid")
         handler = self._handlers.finalize if request.operation == "finalize" else self._handlers.receipt
         try:
-            result = handler(request)
+            result = handler(request, deadline)
         except Exception as error:
             raise FinalizationServiceError("finalization operation is unavailable") from error
         if not isinstance(result, StepResult):
@@ -766,7 +775,7 @@ class _LauncherFinalizationServiceInternal:
                 return
             try:
                 request = FinalizationRequest.from_payload(_read_frame(connection, deadline))
-                response = self.dispatch(request)
+                response = self.dispatch(request, deadline=deadline)
             except (FinalizationServiceError, ValueError, OSError):
                 return
             connection.settimeout(deadline.remaining())

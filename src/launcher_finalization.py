@@ -320,8 +320,8 @@ class FinalizationLauncher:
             signing_key=key,
             state_root=self._state_root,
             handlers=_FinalizationHandlersInternal(
-                finalize=lambda request: self._handle_finalize(generation, request),
-                receipt=lambda request: self._handle_receipt(generation, request),
+                finalize=lambda request, deadline: self._handle_finalize(generation, request, deadline),
+                receipt=lambda request, deadline: self._handle_receipt(generation, request, deadline),
             ),
         )
 
@@ -345,7 +345,7 @@ class FinalizationLauncher:
         ):
             raise FinalizationLauncherError("Active Run Index does not match finalization state")
 
-    def _handle_finalize(self, generation: StateGeneration, request: FinalizationRequest) -> StepResult:
+    def _handle_finalize(self, generation: StateGeneration, request: FinalizationRequest, deadline: float) -> StepResult:
         self._require_request(generation, request)
         if generation.state.disposition is RunDisposition.HUMAN_REVIEW:
             failure = generation.state.failure_history[-1] if generation.state.failure_history else FailureRecord(
@@ -362,7 +362,7 @@ class FinalizationLauncher:
             )
         return self._finalizer_for(generation).advance(generation)
 
-    def _handle_receipt(self, generation: StateGeneration, request: FinalizationRequest) -> StepResult:
+    def _handle_receipt(self, generation: StateGeneration, request: FinalizationRequest, deadline: float) -> StepResult:
         self._require_request(generation, request)
         if request.request_id is None or not isinstance(self._runtime.bridge, TrustedLinearBridge):
             raise FinalizationLauncherError("finalization receipt composition is unavailable")
@@ -370,7 +370,7 @@ class FinalizationLauncher:
         pending = linear.replay_pending(generation)
         if pending is None or pending.request_id != request.request_id:
             raise FinalizationLauncherError("finalization receipt does not match the Active Run")
-        receipt = self._runtime.bridge.execute(pending)
+        receipt = self._runtime.bridge.execute(pending, deadline=deadline)
         accepted = self._finalizer_for(generation).accept_trusted_receipt(generation, receipt)
         return self._finalizer_for(accepted).advance(accepted)
 

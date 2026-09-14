@@ -989,8 +989,8 @@ def test_finalize_and_receipt_cli_dispatch_only_through_the_launcher_socket(
         signing_key=Ed25519PrivateKey.generate(),
         state_root=harness.store.root,
         handlers=FinalizationHandlers(
-            finalize=lambda _: harness.finalizer.advance(harness.store.load()),
-            receipt=lambda request: StepResult(kind=StepKind.READY_TO_FINALIZE, run_id=request.run_id, state_revision=request.expected_revision, state_hash=request.expected_state_hash),
+            finalize=lambda _, __: harness.finalizer.advance(harness.store.load()),
+            receipt=lambda request, _: StepResult(kind=StepKind.READY_TO_FINALIZE, run_id=request.run_id, state_revision=request.expected_revision, state_hash=request.expected_state_hash),
         ),
     )
 

@@ -109,7 +109,7 @@ class TrustedLinearBridge:
     def receipt_authority(self) -> BridgeReceiptAuthority:
         return self._receipt_authority
 
-    def execute(self, request: McpActionRequest) -> TrustedMcpReceipt:
+    def execute(self, request: McpActionRequest, *, deadline: float | None = None) -> TrustedMcpReceipt:
         try:
             snapshot = McpActionRequest.snapshot(request)
         except (TypeError, ValueError) as error:
@@ -128,7 +128,7 @@ class TrustedLinearBridge:
             raise McpBridgeError("MCP request is invalid") from None
         if not self._request_is_persisted(snapshot):
             raise UnpersistedMcpRequestError("MCP request was not persisted before bridge execution")
-        result = self._call(snapshot.operation, snapshot.arguments)
+        result = self._call(snapshot.operation, snapshot.arguments, deadline=deadline)
         return self._write_signed_receipt(snapshot, result, target=ticket_target or snapshot.target)
 
     def _write_signed_receipt(
@@ -335,11 +335,14 @@ class TrustedLinearBridge:
             raise ValueError("Preparation input path is invalid")
         return self.state_root.joinpath(*relative.parts)
 
-    def _call(self, operation: str, arguments: object) -> McpToolResult:
+    def _call(self, operation: str, arguments: object, *, deadline: float | None = None) -> McpToolResult:
         if operation not in _ALLOWED_LINEAR_OPERATIONS:
             raise McpOperationNotAllowedError("MCP operation is not allowlisted")
         try:
-            result = self.client.call(self.mcp_server_identity, operation, arguments)
+            if deadline is None:
+                result = self.client.call(self.mcp_server_identity, operation, arguments)
+            else:
+                result = self.client.call(self.mcp_server_identity, operation, arguments, deadline=deadline)
         except Exception as error:
             raise McpBridgeError("Trusted Linear MCP invocation failed") from error
         if not isinstance(result, McpToolResult):
