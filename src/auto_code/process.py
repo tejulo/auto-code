@@ -607,18 +607,21 @@ class SandboxChildHandle:
             self._transport.close()
 
     def _kill_and_reap(self) -> None:
-        cleanup_error: Exception | None = None
+        cleanup_errors: list[Exception] = []
         try:
             self.kill_group()
         except Exception as error:
-            cleanup_error = error
+            cleanup_errors.append(error)
         try:
             self.wait()
         except Exception as error:
-            if cleanup_error is None:
-                cleanup_error = error
-        if cleanup_error is not None:
-            raise ProcessConfigurationError("Finalization child cleanup failed") from cleanup_error
+            cleanup_errors.append(error)
+        if len(cleanup_errors) == 1:
+            raise ProcessConfigurationError("Finalization child cleanup failed") from cleanup_errors[0]
+        if cleanup_errors:
+            raise ProcessConfigurationError("Finalization child cleanup failed") from ExceptionGroup(
+                "Finalization child cleanup failures", cleanup_errors
+            )
 
     def poll(self) -> int | None:
         response = self.sandbox._finalization_child_request("poll_finalization_child", self.child_id, 5.0)

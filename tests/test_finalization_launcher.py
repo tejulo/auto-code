@@ -410,6 +410,56 @@ def test_launcher_reaps_child_and_reports_kill_failure_after_invalid_post_transf
     assert isinstance(raised.value.__cause__, OSError)
 
 
+def test_launcher_reports_both_cleanup_failures_after_invalid_post_transfer_evidence(tmp_path: Path) -> None:
+    _, generation = _persisted_run(tmp_path)
+    actions: list[str] = []
+
+    class PreparedChild:
+        pid = 124
+
+        def transfer_finalization_fds(self, capability_fds: tuple[int, int, int]) -> SandboxChildEvidence:
+            actions.append("transfer")
+            return SandboxChildEvidence("f" * 32, "e" * 64, 124, 456, 789, (0, 1, 2, 4, 5), "0" * 128)
+
+        def wait(self, timeout: float | None = None) -> SandboxCompleted:
+            actions.append("wait")
+            raise OSError("sandbox reap failed")
+
+        def terminate_group(self) -> None:
+            actions.append("terminate")
+
+        def kill_group(self) -> None:
+            actions.append("kill")
+            raise OSError("sandbox kill failed")
+
+    class SequencedSandbox(LauncherSocketSandbox):
+        def __init__(self) -> None:
+            pass
+
+        def prepare_finalization_child(self, argv: tuple[str, ...]) -> PreparedChild:
+            return PreparedChild()
+
+    runtime = replace(
+        _runtime(tmp_path, ActiveIndexHarness(tmp_path)),
+        sandbox=SequencedSandbox(),
+    )
+
+    with pytest.raises(FinalizationLauncherError, match="cleanup failed") as raised:
+        FinalizationLauncher(runtime).serve_ticket_process(
+            "run-1",
+            generation.revision,
+            generation.state_hash,
+            (sys.executable, "-c", "pass"),
+        )
+
+    assert actions == ["transfer", "kill", "wait"]
+    assert isinstance(raised.value.__cause__, ExceptionGroup)
+    assert {str(error) for error in raised.value.__cause__.exceptions} == {
+        "sandbox kill failed",
+        "sandbox reap failed",
+    }
+
+
 @pytest.mark.parametrize(
     "index",
     (

@@ -712,7 +712,8 @@ def test_sandbox_returns_signed_post_transfer_evidence_for_only_456(
     assert evidence.fd_numbers == (0, 1, 2, 4, 5, 6)
 
 
-def test_sandbox_rejects_forged_post_transfer_evidence(tmp_path: Path) -> None:
+@pytest.mark.parametrize("cleanup_fails", (False, True), ids=("cleanup-succeeds", "kill-and-reap-fail"))
+def test_sandbox_rejects_forged_post_transfer_evidence(tmp_path: Path, cleanup_fails: bool) -> None:
     socket_path = tmp_path / "launcher.sock"
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(socket_path))
@@ -781,7 +782,8 @@ def test_sandbox_rejects_forged_post_transfer_evidence(tmp_path: Path) -> None:
                 request = json.loads(connection.makefile("rb").readline())
                 cleanup_operations.append(request["operation"])
                 assert request["operation"] == operation
-                connection.sendall(canonical_json_bytes(response) + b"\n")
+                if not cleanup_fails:
+                    connection.sendall(canonical_json_bytes(response) + b"\n")
 
     thread = threading.Thread(target=serve, daemon=True)
     thread.start()
@@ -792,7 +794,7 @@ def test_sandbox_rejects_forged_post_transfer_evidence(tmp_path: Path) -> None:
             "launcher",
             signing_key.public_key().public_bytes_raw(),
         ).prepare_finalization_child((sys.executable, "-c", "pass"))
-        with pytest.raises(ProcessConfigurationError, match="capability transfer failed"):
+        with pytest.raises(ProcessConfigurationError, match="capability transfer") as raised:
             child.transfer_finalization_fds(descriptor_fds)
     finally:
         for descriptor in descriptor_fds:
@@ -801,6 +803,11 @@ def test_sandbox_rejects_forged_post_transfer_evidence(tmp_path: Path) -> None:
         listener.close()
 
     assert cleanup_operations == ["kill_finalization_child", "wait_finalization_child"]
+    if cleanup_fails:
+        cleanup_error = raised.value.__cause__
+        assert isinstance(cleanup_error, ProcessConfigurationError)
+        assert isinstance(cleanup_error.__cause__, ExceptionGroup)
+        assert len(cleanup_error.__cause__.exceptions) == 2
 
 
 @pytest.mark.parametrize("signing_key", (None, Ed25519PrivateKey.generate()), ids=("unsigned", "wrong-key"))
