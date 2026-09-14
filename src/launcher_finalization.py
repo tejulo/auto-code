@@ -44,7 +44,7 @@ from auto_code.hashing import hash_json
 from auto_code.hashing import canonical_json_bytes
 from auto_code.linear import LinearGateway
 from auto_code.mcp_bridge import TrustedLinearBridge
-from auto_code.process import LauncherSocketSandbox, ProcessConfigurationError, SandboxChildHandle
+from auto_code.process import LauncherSocketSandbox, ProcessConfigurationError, SandboxChildEvidence, SandboxChildHandle
 from auto_code.prepare import PreparationContextAuthority
 from auto_code.project_config import ProjectConfig
 from auto_code.state import RunStateStore, StateGeneration, _read_canonical_json
@@ -267,7 +267,9 @@ class FinalizationLauncher:
                 _sealed_descriptor(trust_bytes),
                 _sealed_descriptor(binding.to_bytes()),
             ]
-            process.transfer_finalization_fds((descriptors[0], descriptors[1], descriptors[2]))
+            post_transfer_evidence = process.transfer_finalization_fds((descriptors[0], descriptors[1], descriptors[2]))
+            if not isinstance(post_transfer_evidence, SandboxChildEvidence) or post_transfer_evidence.fd_numbers != (0, 1, 2, 4, 5, 6):
+                raise FinalizationLauncherError("finalization child post-transfer evidence is invalid")
             service._peer_pid = process.pid
             service.serve_once(listener)
             return process.wait(timeout=descriptor.timeout_seconds).returncode

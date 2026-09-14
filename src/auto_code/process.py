@@ -556,7 +556,7 @@ class SandboxChildHandle:
     def pid(self) -> int:
         return self.evidence.pid
 
-    def transfer_finalization_fds(self, capability_fds: tuple[int, int, int]) -> None:
+    def transfer_finalization_fds(self, capability_fds: tuple[int, int, int]) -> SandboxChildEvidence:
         if (
             self._transferred
             or len(capability_fds) != 3
@@ -576,14 +576,32 @@ class SandboxChildHandle:
                 },
                 descriptors=capability_fds,
             )
-            if response != {
-                "child_id": self.child_id,
-                "challenge": self.evidence.challenge,
-                "capability_fds_transferred": True,
-            }:
+            if not isinstance(response, dict) or set(response) != {"child_id", "evidence"}:
                 raise ValueError
+            evidence = _sandbox_child_evidence(response["evidence"])
+            if (
+                response["child_id"] != self.child_id
+                or evidence.child_id != self.child_id
+                or evidence.challenge != self.evidence.challenge
+                or evidence.pid != self.evidence.pid
+                or evidence.pid_namespace_inode != self.evidence.pid_namespace_inode
+                or evidence.mount_namespace_inode != self.evidence.mount_namespace_inode
+                or evidence.fd_numbers != (0, 1, 2, 4, 5, 6)
+            ):
+                raise ValueError
+            if self.sandbox._evidence_public_key is None:
+                raise ValueError
+            self.sandbox._evidence_public_key.verify(
+                bytes.fromhex(evidence.signature),
+                _sandbox_child_evidence_payload(evidence, self.sandbox.identity),
+            )
             self._transferred = True
-        except (OSError, ValueError, ProcessConfigurationError) as error:
+            return evidence
+        except (InvalidSignature, OSError, ValueError, ProcessConfigurationError) as error:
+            try:
+                self.kill_group()
+            except (OSError, ProcessConfigurationError):
+                pass
             raise ProcessConfigurationError("Finalization capability transfer failed") from error
         finally:
             self._transport.close()

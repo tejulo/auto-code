@@ -598,7 +598,7 @@ def test_sandbox_prepares_a_child_only_after_verifying_signed_evidence(tmp_path:
     }
 
 
-def test_sandbox_transfers_finalization_fds_only_on_the_authenticated_preparation_connection(
+def test_sandbox_returns_signed_post_transfer_evidence_for_only_456(
     tmp_path: Path,
 ) -> None:
     socket_path = tmp_path / "launcher.sock"
@@ -654,12 +654,28 @@ def test_sandbox_transfers_finalization_fds_only_on_the_authenticated_preparatio
             capabilities = tuple(os.pread(descriptor, 32, 0) for descriptor in descriptors)
             for descriptor in descriptors:
                 os.close(descriptor)
+            post_transfer_evidence = {
+                "domain": "auto-code-sandbox-child-evidence/v1",
+                "sandbox_identity": "launcher",
+                "challenge": request["challenge"],
+                "child_id": child_id,
+                "pid": 124,
+                "pid_namespace_inode": 456,
+                "mount_namespace_inode": 789,
+                "fd_numbers": [0, 1, 2, 4, 5, 6],
+            }
             connection.sendall(
                 canonical_json_bytes(
                     {
                         "child_id": child_id,
-                        "challenge": request["challenge"],
-                        "capability_fds_transferred": True,
+                        "evidence": {
+                            **{
+                                key: value
+                                for key, value in post_transfer_evidence.items()
+                                if key not in {"domain", "sandbox_identity"}
+                            },
+                            "signature": signing_key.sign(canonical_json_bytes(post_transfer_evidence)).hex(),
+                        },
                     }
                 )
                 + b"\n"
@@ -677,7 +693,7 @@ def test_sandbox_transfers_finalization_fds_only_on_the_authenticated_preparatio
             "launcher",
             signing_key.public_key().public_bytes_raw(),
         ).prepare_finalization_child((sys.executable, "-c", "pass"))
-        child.transfer_finalization_fds(descriptor_fds)
+        evidence = child.transfer_finalization_fds(descriptor_fds)
     finally:
         for descriptor in descriptor_fds:
             os.close(descriptor)
@@ -693,6 +709,85 @@ def test_sandbox_transfers_finalization_fds_only_on_the_authenticated_preparatio
     ]
     assert requests[1]["child_id"] == "f" * 32
     assert requests[1]["challenge"] == requests[0]["challenge"]
+    assert evidence.fd_numbers == (0, 1, 2, 4, 5, 6)
+
+
+def test_sandbox_rejects_forged_post_transfer_evidence(tmp_path: Path) -> None:
+    socket_path = tmp_path / "launcher.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(1)
+    signing_key = Ed25519PrivateKey.generate()
+    forged_key = Ed25519PrivateKey.generate()
+
+    def serve() -> None:
+        connection, _ = listener.accept()
+        with connection:
+            request = json.loads(connection.makefile("rb").readline())
+            child_id = "f" * 32
+            pre_transfer_evidence = {
+                "domain": "auto-code-sandbox-child-evidence/v1",
+                "sandbox_identity": "launcher",
+                "challenge": request["challenge"],
+                "child_id": child_id,
+                "pid": 124,
+                "pid_namespace_inode": 456,
+                "mount_namespace_inode": 789,
+                "fd_numbers": [],
+            }
+            connection.sendall(
+                canonical_json_bytes(
+                    {
+                        "child_id": child_id,
+                        "evidence": {
+                            **{
+                                key: value
+                                for key, value in pre_transfer_evidence.items()
+                                if key not in {"domain", "sandbox_identity"}
+                            },
+                            "signature": signing_key.sign(canonical_json_bytes(pre_transfer_evidence)).hex(),
+                        },
+                    }
+                )
+                + b"\n"
+            )
+            raw = connection.recv(65_536)
+            while not raw.endswith(b"\n"):
+                raw += connection.recv(65_536)
+            post_transfer_evidence = {**pre_transfer_evidence, "fd_numbers": [0, 1, 2, 4, 5, 6]}
+            connection.sendall(
+                canonical_json_bytes(
+                    {
+                        "child_id": child_id,
+                        "evidence": {
+                            **{
+                                key: value
+                                for key, value in post_transfer_evidence.items()
+                                if key not in {"domain", "sandbox_identity"}
+                            },
+                            "signature": forged_key.sign(canonical_json_bytes(post_transfer_evidence)).hex(),
+                        },
+                    }
+                )
+                + b"\n"
+            )
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    descriptor_fds = tuple(os.memfd_create(f"capability-{slot}", os.MFD_CLOEXEC) for slot in (4, 5, 6))
+    try:
+        child = LauncherSocketSandbox(
+            socket_path,
+            "launcher",
+            signing_key.public_key().public_bytes_raw(),
+        ).prepare_finalization_child((sys.executable, "-c", "pass"))
+        with pytest.raises(ProcessConfigurationError, match="capability transfer failed"):
+            child.transfer_finalization_fds(descriptor_fds)
+    finally:
+        for descriptor in descriptor_fds:
+            os.close(descriptor)
+        thread.join(timeout=3)
+        listener.close()
 
 
 @pytest.mark.parametrize("signing_key", (None, Ed25519PrivateKey.generate()), ids=("unsigned", "wrong-key"))
