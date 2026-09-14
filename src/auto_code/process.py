@@ -49,6 +49,10 @@ class ProcessConfigurationError(ProcessBoundaryError):
     pass
 
 
+class PreparedChildCleanupError(ExceptionGroup):
+    """Failures while killing and reaping a child rejected before FD transfer."""
+
+
 class ExecutableVerificationError(ProcessConfigurationError):
     pass
 
@@ -221,6 +225,7 @@ class LauncherSocketSandbox:
         ):
             raise ProcessConfigurationError("Finalization child evidence is invalid")
         transport: socket.socket | None = None
+        child_id: str | None = None
         try:
             challenge = secrets.token_hex(32)
             transport = self._connect(5.0, require_peer_credentials=True)
@@ -249,8 +254,16 @@ class LauncherSocketSandbox:
             )
             return SandboxChildHandle(self, evidence, transport)
         except (InvalidSignature, OSError, TypeError, ValueError, ProcessConfigurationError) as error:
+            cleanup_error: PreparedChildCleanupError | None = None
+            if child_id is not None:
+                try:
+                    self._cleanup_prepared_finalization_child(child_id)
+                except PreparedChildCleanupError as cleanup:
+                    cleanup_error = cleanup
             if transport is not None:
                 transport.close()
+            if cleanup_error is not None:
+                raise ProcessConfigurationError("Finalization child evidence is invalid") from cleanup_error
             raise ProcessConfigurationError("Finalization child evidence is invalid") from error
 
     def run(
@@ -460,6 +473,16 @@ class LauncherSocketSandbox:
             },
             5.0 if timeout is None else _positive_timeout(timeout),
         )
+
+    def _cleanup_prepared_finalization_child(self, child_id: str) -> None:
+        cleanup_errors: list[Exception] = []
+        for operation in ("kill_finalization_child", "wait_finalization_child"):
+            try:
+                self._finalization_child_request(operation, child_id, 5.0)
+            except Exception as error:
+                cleanup_errors.append(error)
+        if cleanup_errors:
+            raise PreparedChildCleanupError("Finalization child cleanup failures", cleanup_errors)
 
     def _exchange(
         self,

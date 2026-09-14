@@ -710,26 +710,16 @@ def _installed_launcher_result(
                             )
                             + b"\n"
                         )
-                        descriptors = array.array("i")
-                        try:
-                            raw, ancillary, flags, _ = connection.recvmsg(
-                                65_536,
-                                socket.CMSG_SPACE(64 * descriptors.itemsize),
-                            )
-                            if flags & socket.MSG_CTRUNC:
-                                raise RuntimeError("sandbox ancillary data was truncated")
-                            for level, kind, data in ancillary:
-                                if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
-                                    descriptors.frombytes(data[: len(data) - (len(data) % descriptors.itemsize)])
-                            forged_sandbox.received_descriptors.extend(descriptors)
-                            if raw:
-                                forged_sandbox.operations.append(json.loads(raw)["operation"])
-                        finally:
-                            for descriptor in descriptors:
-                                try:
-                                    os.close(descriptor)
-                                except OSError:
-                                    pass
+                        for operation, response in (
+                            ("kill_finalization_child", {}),
+                            ("wait_finalization_child", {"returncode": -9, "stdout": "", "stderr": ""}),
+                        ):
+                            cleanup, _ = sandbox_listener.accept()
+                            with cleanup:
+                                cleanup_request = json.loads(cleanup.makefile("rb").readline())
+                                assert cleanup_request["operation"] == operation
+                                forged_sandbox.operations.append(cleanup_request["operation"])
+                                cleanup.sendall(canonical_json_bytes(response) + b"\n")
                 except BaseException as error:
                     forged_sandbox.errors.append(error)
 
@@ -848,7 +838,11 @@ def test_installed_launcher_refuses_forged_evidence_before_capability(tmp_path: 
     assert result.returncode == 2
     assert result.stdout == ""
     assert result.stderr == "auto-code-launcher: protected runtime unavailable\n"
-    assert sandbox.operations == ["prepare_finalization_child"]
+    assert sandbox.operations == [
+        "prepare_finalization_child",
+        "kill_finalization_child",
+        "wait_finalization_child",
+    ]
     assert sandbox.received_descriptors == []
     assert sandbox.errors == []
     assert sandbox.thread is not None

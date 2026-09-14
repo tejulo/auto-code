@@ -862,6 +862,83 @@ def test_sandbox_rejects_unsigned_or_wrong_peer_evidence(tmp_path: Path, signing
         listener.close()
 
 
+@pytest.mark.parametrize("cleanup_fails", (False, True), ids=("cleanup-succeeds", "cleanup-fails"))
+def test_invalid_preparation_evidence_cleanup_kills_and_reaps_returned_child(
+    tmp_path: Path,
+    cleanup_fails: bool,
+) -> None:
+    """Closing the preparation socket alone would leave a forged child running."""
+
+    socket_path = tmp_path / "launcher.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(3)
+    pinned_key = Ed25519PrivateKey.generate()
+    forged_key = Ed25519PrivateKey.generate()
+    calls: list[str] = []
+
+    def serve() -> None:
+        connection, _ = listener.accept()
+        with connection:
+            request = json.loads(connection.makefile("rb").readline())
+            child_id = "f" * 32
+            evidence = {
+                "domain": "auto-code-sandbox-child-evidence/v1",
+                "sandbox_identity": "launcher",
+                "challenge": request["challenge"],
+                "child_id": child_id,
+                "pid": 124,
+                "pid_namespace_inode": 456,
+                "mount_namespace_inode": 789,
+                "fd_numbers": [],
+            }
+            connection.sendall(
+                canonical_json_bytes(
+                    {
+                        "child_id": child_id,
+                        "evidence": {
+                            **{
+                                key: value
+                                for key, value in evidence.items()
+                                if key not in {"domain", "sandbox_identity"}
+                            },
+                            "signature": forged_key.sign(canonical_json_bytes(evidence)).hex(),
+                        },
+                    }
+                )
+                + b"\n"
+            )
+            for operation, response in (
+                ("kill_finalization_child", {}),
+                ("wait_finalization_child", {"returncode": -9, "stdout": "", "stderr": ""}),
+            ):
+                cleanup, _ = listener.accept()
+                with cleanup:
+                    cleanup_request = json.loads(cleanup.makefile("rb").readline())
+                    calls.append(cleanup_request["operation"])
+                    assert cleanup_request["operation"] == operation
+                    assert cleanup_request["child_id"] == child_id
+                    if not cleanup_fails:
+                        cleanup.sendall(canonical_json_bytes(response) + b"\n")
+
+    thread = threading.Thread(target=serve)
+    thread.start()
+    try:
+        sandbox = LauncherSocketSandbox(socket_path, "launcher", pinned_key.public_key().public_bytes_raw())
+        with pytest.raises(ProcessConfigurationError, match="Finalization child evidence is invalid") as raised:
+            sandbox.prepare_finalization_child((sys.executable, "-c", "pass"))
+    finally:
+        thread.join(timeout=3)
+        listener.close()
+
+    assert calls == ["kill_finalization_child", "wait_finalization_child"]
+    if cleanup_fails:
+        cleanup_error = raised.value.__cause__
+        assert type(cleanup_error).__name__ == "PreparedChildCleanupError"
+        assert isinstance(cleanup_error, ExceptionGroup)
+        assert len(cleanup_error.exceptions) == 2
+
+
 @pytest.mark.parametrize(
     ("returned_child_id", "signed_child_id", "challenge_source", "fd_numbers"),
     (
