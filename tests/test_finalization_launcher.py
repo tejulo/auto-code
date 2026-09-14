@@ -631,6 +631,10 @@ def _installed_launcher_result(
     state_root.mkdir(mode=0o700)
     repository = tmp_path / "repository"
     repository.mkdir(mode=0o700)
+    evidence_root = state_root / "git-evidence"
+    evidence_root.mkdir(mode=0o700)
+    controlled_home = tmp_path / "git-home"
+    controlled_home.mkdir(mode=0o700)
     signing_key = Ed25519PrivateKey.generate()
     state = RunState(
         run_id="run-1",
@@ -686,6 +690,11 @@ def _installed_launcher_result(
             "base_branch": None,
             "protected_paths": [],
             "commit_excluded_paths": [],
+            "git_executable": str(Path(sys.executable).resolve()),
+            "git_executable_sha256": __import__("hashlib").sha256(Path(sys.executable).resolve().read_bytes()).hexdigest(),
+            "timeout_seconds": 5,
+            "evidence_root": str(evidence_root),
+            "controlled_home": str(controlled_home),
         }
         transport_metadata = os.fstat(bridge_client.fileno())
         peer_pid, peer_uid, peer_gid = struct.unpack(

@@ -29,11 +29,11 @@ from launcher_finalization import FinalizationArtifactAuthority, FinalizationLau
 
 from .contracts import EffectOutcome
 from .finalization_service import FinalizationParentCapability
-from .git import GitGuard
+from .git import GitGuard, ProcessGitExecutor
 from .hashing import canonical_json_bytes
 from .linear import LinearGateway
 from .mcp_bridge import McpToolResult, TrustedLinearBridge
-from .process import LauncherSocketSandbox
+from .process import FilesystemEvidenceSink, HashVerifiedExecutables, LauncherSocketSandbox, ProcessRunner, SandboxPolicy
 from .run_index import ActiveRunIndex
 from .state import RunStateStore
 
@@ -115,6 +115,24 @@ def _require_path(value: object, description: str) -> Path:
     if metadata.st_uid != os.geteuid():
         raise ValueError(f"{description} is invalid")
     return path
+
+
+def _require_executable(value: object, description: str) -> Path:
+    if not isinstance(value, str):
+        raise ValueError(f"{description} is invalid")
+    path = Path(value)
+    if not path.is_absolute() or ".." in path.parts or path.is_symlink():
+        raise ValueError(f"{description} is invalid")
+    metadata = path.stat()
+    if not stat.S_ISREG(metadata.st_mode) or not metadata.st_mode & stat.S_IXUSR:
+        raise ValueError(f"{description} is invalid")
+    return path
+
+
+def _require_positive_float(value: object, description: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{description} is invalid")
+    return float(value)
 
 
 def _require_hash(value: object, description: str) -> str:
@@ -294,7 +312,10 @@ def load_protected_bootstrap() -> _LauncherRuntime:
             raise ValueError
         if (
             not isinstance(git, dict)
-            or set(git) != {"domain", "repository_root", "remote", "base_branch", "protected_paths", "commit_excluded_paths"}
+            or set(git) != {
+                "domain", "repository_root", "remote", "base_branch", "protected_paths", "commit_excluded_paths",
+                "git_executable", "git_executable_sha256", "timeout_seconds", "evidence_root", "controlled_home",
+            }
             or git["domain"] != "auto-code-launcher-git/v1"
             or git["repository_root"] != str(repository_root)
             or not isinstance(git["remote"], str)
@@ -303,6 +324,15 @@ def load_protected_bootstrap() -> _LauncherRuntime:
             or not all(isinstance(value, str) for value in git["commit_excluded_paths"])
         ):
             raise ValueError
+        git_executable = _require_executable(git["git_executable"], "Git executable")
+        if not hmac.compare_digest(
+            hashlib.sha256(git_executable.read_bytes()).hexdigest(),
+            _require_hash(git["git_executable_sha256"], "Git executable hash"),
+        ):
+            raise ValueError
+        git_timeout = _require_positive_float(git["timeout_seconds"], "Git timeout")
+        git_evidence_root = _require_path(git["evidence_root"], "Git evidence root")
+        git_controlled_home = _require_path(git["controlled_home"], "Git controlled home")
         if len(key_bytes) != 32:
             raise ValueError
         signing_key = Ed25519PrivateKey.from_private_bytes(key_bytes)
@@ -316,6 +346,24 @@ def load_protected_bootstrap() -> _LauncherRuntime:
             receipt_signing_key=receipt_key,
             client=_ProtectedBridgeClient(transport, config["mcp_server_identity"]),
         )
+        git_executor = ProcessGitExecutor.from_protected_launcher(
+            process_runner=ProcessRunner(
+                HashVerifiedExecutables({git_executable: git["git_executable_sha256"]}),
+                sandbox,
+            ),
+            git_executable=str(git_executable),
+            timeout=git_timeout,
+            evidence_sink=FilesystemEvidenceSink(git_evidence_root),
+            sandbox_policy=SandboxPolicy(
+                project_root=repository_root,
+                readable_roots=(repository_root,),
+                writable_roots=(repository_root,),
+                authoritative_state_root=state_root,
+                secret_paths=(),
+                controlled_home=git_controlled_home,
+                environment_allowlist=frozenset(),
+            ),
+        )
         return _LauncherRuntime(
             state_root=state_root,
             linear=LinearGateway(
@@ -325,6 +373,7 @@ def load_protected_bootstrap() -> _LauncherRuntime:
             bridge=trusted_bridge,
             git_guard=GitGuard(
                 repository_root,
+                executor=git_executor,
                 remote=git["remote"],
                 base_branch=git["base_branch"],
                 protected_paths=git["protected_paths"],

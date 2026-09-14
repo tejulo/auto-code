@@ -102,6 +102,31 @@ class ProcessGitExecutor:
     sandbox_policy: SandboxPolicy
     _trusted_outputs: dict[int, TrustedCommandOutput] = field(default_factory=dict, init=False, repr=False, compare=False)
 
+    @classmethod
+    def from_protected_launcher(
+        cls,
+        *,
+        process_runner: ProcessRunner,
+        git_executable: str,
+        timeout: float,
+        evidence_sink: EvidenceSink,
+        sandbox_policy: SandboxPolicy,
+    ) -> ProcessGitExecutor:
+        """Create the finalization executor only from launcher-owned process capabilities."""
+
+        if not isinstance(process_runner, ProcessRunner) or process_runner.executables is None or process_runner.sandbox is None:
+            raise GitExecutorUnavailableError("Protected Git process capability is unavailable")
+        if not isinstance(sandbox_policy, SandboxPolicy):
+            raise GitExecutorUnavailableError("Protected Git sandbox policy is unavailable")
+        return cls(
+            process_runner=process_runner,
+            git_executable=git_executable,
+            timeout=timeout,
+            evidence_sink=evidence_sink,
+            environment={},
+            sandbox_policy=sandbox_policy,
+        )
+
     def run(self, argv: Sequence[str], *, cwd: Path, redact_output: bool = False) -> CommandResult:
         if not isinstance(self.environment, Mapping) or any(name in _SAFE_GIT_ENVIRONMENT for name in self.environment):
             raise GitExecutorUnavailableError("Git execution environment is invalid")
