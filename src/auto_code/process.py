@@ -3,18 +3,29 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
+import array
+import fcntl
 import hashlib
 import hmac
+import json
 import math
 import os
 from pathlib import Path
 import re
+import secrets
+import socket
 import stat
+import struct
 import subprocess
 import time
-from typing import Protocol
+from typing import Literal, Protocol, cast
+import uuid
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from .contracts import EvidenceRef, sanitize_untrusted_text
+from .hashing import canonical_json_bytes
 
 
 MAX_CAPTURE_TEXT = 8_192
@@ -36,6 +47,10 @@ class ProcessBoundaryError(RuntimeError):
 
 class ProcessConfigurationError(ProcessBoundaryError):
     pass
+
+
+class PreparedChildCleanupError(ExceptionGroup):
+    """Failures while killing and reaping a child rejected before FD transfer."""
 
 
 class ExecutableVerificationError(ProcessConfigurationError):
@@ -111,6 +126,26 @@ class SandboxCompleted:
     stderr: str | bytes = ""
 
 
+@dataclass(frozen=True, slots=True)
+class SandboxChildEvidence:
+    """Sandbox-signed observation of a child before finalization FD transfer."""
+
+    child_id: str
+    challenge: str
+    pid: int
+    pid_namespace_inode: int
+    mount_namespace_inode: int
+    fd_numbers: tuple[int, ...]
+    bootstrap_fd_access: Literal["denied"]
+    signature: str
+
+
+@dataclass(frozen=True, slots=True)
+class ObservedLauncherEffect:
+    receipt_hash: str
+    returncode: int
+
+
 class EvidenceSink(Protocol):
     def write(self, result: CommandResult) -> CommandResult:
         """Persist already-redacted output outside the target repository."""
@@ -155,6 +190,616 @@ class Sandbox(Protocol):
         new_process_group: bool,
     ) -> ProcessHandle:
         """Start an owned process or raise SandboxStartError with any created handle."""
+
+
+class LauncherSocketSandbox:
+    """Delegate execution to the launcher-owned sandbox service over a pinned Unix socket."""
+
+    def __init__(self, socket_path: Path, identity: str, evidence_public_key: bytes | None = None) -> None:
+        path = Path(socket_path)
+        if not path.is_absolute() or ".." in path.parts or not identity or len(identity) > 255:
+            raise ProcessConfigurationError("Launcher sandbox configuration is invalid")
+        metadata = os.lstat(path)
+        if not stat.S_ISSOCK(metadata.st_mode):
+            raise ProcessConfigurationError("Launcher sandbox socket is invalid")
+        self.socket_path = path
+        self.identity = identity
+        self._device = metadata.st_dev
+        self._inode = metadata.st_ino
+        if evidence_public_key is not None:
+            if not isinstance(evidence_public_key, bytes) or len(evidence_public_key) != 32:
+                raise ProcessConfigurationError("Launcher sandbox evidence key is invalid")
+            try:
+                self._evidence_public_key = Ed25519PublicKey.from_public_bytes(evidence_public_key)
+            except ValueError as error:
+                raise ProcessConfigurationError("Launcher sandbox evidence key is invalid") from error
+        else:
+            self._evidence_public_key = None
+
+    def prepare_finalization_child(self, argv: tuple[str, ...]) -> SandboxChildHandle:
+        """Require signed, empty-FD evidence before the launcher can transfer authority."""
+
+        if (
+            self._evidence_public_key is None
+            or not argv
+            or any(not isinstance(argument, str) or not argument for argument in argv)
+        ):
+            raise ProcessConfigurationError("Finalization child evidence is invalid")
+        transport: socket.socket | None = None
+        child_id: str | None = None
+        try:
+            challenge = secrets.token_hex(32)
+            transport = self._connect(5.0, require_peer_credentials=True)
+            response = self._exchange_on_transport(
+                transport,
+                {
+                    "schema_version": "v1",
+                    "sandbox_identity": self.identity,
+                    "operation": "prepare_finalization_child",
+                    "argv": list(argv),
+                    "isolate_procfs": True,
+                    "challenge": challenge,
+                },
+            )
+            if not isinstance(response, dict):
+                raise ValueError
+            child_id = response.get("child_id")
+            if not isinstance(child_id, str) or len(child_id) != 32 or any(character not in "0123456789abcdef" for character in child_id):
+                raise ValueError
+            if set(response) != {"child_id", "evidence"}:
+                raise ValueError
+            evidence = _sandbox_child_evidence(response["evidence"])
+            if (
+                evidence.child_id != child_id
+                or evidence.challenge != challenge
+                or evidence.fd_numbers != ()
+                or evidence.bootstrap_fd_access != "denied"
+            ):
+                raise ValueError
+            self._evidence_public_key.verify(
+                bytes.fromhex(evidence.signature),
+                _sandbox_child_evidence_payload(evidence, self.identity),
+            )
+            return SandboxChildHandle(self, evidence, transport)
+        except (InvalidSignature, KeyError, OSError, TypeError, ValueError, ProcessConfigurationError) as error:
+            cleanup_error: PreparedChildCleanupError | None = None
+            if child_id is not None:
+                try:
+                    self._cleanup_prepared_finalization_child(child_id)
+                except PreparedChildCleanupError as cleanup:
+                    cleanup_error = cleanup
+            if transport is not None:
+                transport.close()
+            if cleanup_error is not None:
+                raise ProcessConfigurationError("Finalization child evidence is invalid") from cleanup_error
+            raise ProcessConfigurationError("Finalization child evidence is invalid") from error
+
+    def run(
+        self,
+        argv: tuple[str, ...],
+        *,
+        executable: VerifiedExecutable,
+        timeout: float,
+        env: Mapping[str, str],
+        policy: SandboxPolicyHandoff,
+    ) -> SandboxCompleted:
+        metadata = os.lstat(self.socket_path)
+        if not stat.S_ISSOCK(metadata.st_mode) or (metadata.st_dev, metadata.st_ino) != (self._device, self._inode):
+            raise ProcessConfigurationError("Launcher sandbox socket identity changed")
+        request = {
+            "schema_version": "v1",
+            "sandbox_identity": self.identity,
+            "argv": list(argv[1:]),
+            "executable_via_fd": True,
+            "timeout": timeout,
+            "environment": dict(env),
+            "policy": {
+                "cwd": str(policy.cwd.path),
+                "project_root": str(policy.project_root.path),
+                "readable_roots": [str(directory.path) for directory in policy.readable_roots],
+                "writable_roots": [str(directory.path) for directory in policy.writable_roots],
+                "controlled_home": str(policy.controlled_home.path),
+                "dynamic_downloads_disabled": policy.dynamic_downloads_disabled,
+            },
+        }
+        payload = self._exchange(request, timeout, executable_descriptor=executable.descriptor)
+        try:
+            if not isinstance(payload, dict) or set(payload) != {"returncode", "stdout", "stderr"}:
+                raise ValueError
+            if (
+                isinstance(payload["returncode"], bool)
+                or not isinstance(payload["returncode"], int)
+                or not isinstance(payload["stdout"], (str, bytes))
+                or not isinstance(payload["stderr"], (str, bytes))
+            ):
+                raise ValueError
+            return SandboxCompleted(payload["returncode"], payload["stdout"], payload["stderr"])
+        except ValueError as error:
+            raise ProcessConfigurationError("Launcher sandbox response is invalid") from error
+
+    def observe_effect(
+        self, effect_id: str, binding_hash: str, *, timeout: float
+    ) -> ObservedLauncherEffect | None:
+        _require_effect_hash(effect_id)
+        _require_effect_hash(binding_hash)
+        payload = self._exchange(
+            {
+                "schema_version": "v1",
+                "sandbox_identity": self.identity,
+                "operation": "observe_effect",
+                "effect_id": effect_id,
+                "binding_hash": binding_hash,
+            },
+            timeout,
+        )
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"effect_id", "binding_hash", "receipt_hash", "returncode"}
+            or payload["effect_id"] != effect_id
+            or payload["binding_hash"] != binding_hash
+            or (payload["receipt_hash"] is None) != (payload["returncode"] is None)
+        ):
+            raise ProcessConfigurationError("Launcher effect observation is invalid")
+        if payload["receipt_hash"] is None:
+            return None
+        if isinstance(payload["returncode"], bool) or not isinstance(payload["returncode"], int):
+            raise ProcessConfigurationError("Launcher effect observation is invalid")
+        return ObservedLauncherEffect(_require_effect_hash(payload["receipt_hash"]), payload["returncode"])
+
+    def run_effect(
+        self,
+        argv: tuple[str, ...],
+        *,
+        executable: VerifiedExecutable,
+        timeout: float,
+        env: Mapping[str, str],
+        policy: SandboxPolicyHandoff,
+        effect_id: str,
+        binding_hash: str,
+    ) -> tuple[SandboxCompleted, str]:
+        _require_effect_hash(effect_id)
+        _require_effect_hash(binding_hash)
+        payload = self._exchange(
+            {
+                "schema_version": "v1",
+                "sandbox_identity": self.identity,
+                "operation": "invoke_effect",
+                "effect_id": effect_id,
+                "binding_hash": binding_hash,
+                "argv": list(argv[1:]),
+                "executable_via_fd": True,
+                "timeout": timeout,
+                "environment": dict(env),
+                "policy": {
+                    "cwd": str(policy.cwd.path),
+                    "project_root": str(policy.project_root.path),
+                    "readable_roots": [str(directory.path) for directory in policy.readable_roots],
+                    "writable_roots": [str(directory.path) for directory in policy.writable_roots],
+                    "controlled_home": str(policy.controlled_home.path),
+                    "dynamic_downloads_disabled": policy.dynamic_downloads_disabled,
+                },
+            },
+            timeout,
+            executable_descriptor=executable.descriptor,
+        )
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"returncode", "stdout", "stderr", "effect_id", "binding_hash", "receipt_hash"}
+            or isinstance(payload["returncode"], bool)
+            or not isinstance(payload["returncode"], int)
+            or not isinstance(payload["stdout"], str)
+            or not isinstance(payload["stderr"], str)
+            or payload["effect_id"] != effect_id
+            or payload["binding_hash"] != binding_hash
+        ):
+            raise ProcessConfigurationError("Launcher effect response is invalid")
+        receipt = _require_effect_hash(payload["receipt_hash"])
+        return SandboxCompleted(payload["returncode"], payload["stdout"], payload["stderr"]), receipt
+
+    def sign_activation(self, payload: bytes, public_key_hash: str, *, timeout: float) -> str:
+        if not isinstance(payload, bytes) or not payload or len(payload) > 65_536:
+            raise ProcessConfigurationError("Activation signing payload is invalid")
+        _require_effect_hash(public_key_hash)
+        response = self._exchange(
+            {
+                "schema_version": "v1",
+                "sandbox_identity": self.identity,
+                "operation": "sign_activation",
+                "payload_hex": payload.hex(),
+                "public_key_hash": public_key_hash,
+            },
+            timeout,
+        )
+        if (
+            not isinstance(response, dict)
+            or set(response) != {"public_key_hash", "signature"}
+            or response.get("public_key_hash") != public_key_hash
+            or not isinstance(response.get("signature"), str)
+            or len(response["signature"]) != 128
+            or any(character not in "0123456789abcdef" for character in response["signature"])
+        ):
+            raise ProcessConfigurationError("Activation signing response is invalid")
+        return response["signature"]
+
+    def run_python_archive(
+        self,
+        interpreter: VerifiedExecutable,
+        archive: VerifiedExecutable,
+        argv: tuple[str, ...],
+        *,
+        timeout: float,
+        env: Mapping[str, str],
+        policy: SandboxPolicyHandoff,
+    ) -> SandboxCompleted:
+        response = self._exchange(
+            {
+                "schema_version": "v1",
+                "sandbox_identity": self.identity,
+                "operation": "run_python_archive",
+                "argv": list(argv),
+                "interpreter_via_fd": True,
+                "archive_via_fd": True,
+                "timeout": timeout,
+                "environment": dict(env),
+                "policy": {
+                    "cwd": str(policy.cwd.path),
+                    "project_root": str(policy.project_root.path),
+                    "readable_roots": [str(directory.path) for directory in policy.readable_roots],
+                    "writable_roots": [str(directory.path) for directory in policy.writable_roots],
+                    "controlled_home": str(policy.controlled_home.path),
+                    "dynamic_downloads_disabled": policy.dynamic_downloads_disabled,
+                },
+            },
+            timeout,
+            executable_descriptors=(interpreter.descriptor, archive.descriptor),
+        )
+        if (
+            not isinstance(response, dict)
+            or set(response) != {"returncode", "stdout", "stderr"}
+            or isinstance(response["returncode"], bool)
+            or not isinstance(response["returncode"], int)
+            or not isinstance(response["stdout"], (str, bytes))
+            or not isinstance(response["stderr"], (str, bytes))
+        ):
+            raise ProcessConfigurationError("Python archive response is invalid")
+        return SandboxCompleted(response["returncode"], response["stdout"], response["stderr"])
+
+    def _finalization_child_request(self, operation: str, child_id: str, timeout: float | None) -> object:
+        if operation not in {
+            "poll_finalization_child",
+            "wait_finalization_child",
+            "terminate_finalization_child",
+            "kill_finalization_child",
+        } or len(child_id) != 32 or any(character not in "0123456789abcdef" for character in child_id):
+            raise ProcessConfigurationError("Finalization child request is invalid")
+        return self._exchange(
+            {
+                "schema_version": "v1",
+                "sandbox_identity": self.identity,
+                "operation": operation,
+                "child_id": child_id,
+            },
+            5.0 if timeout is None else _positive_timeout(timeout),
+        )
+
+    def _cleanup_prepared_finalization_child(self, child_id: str) -> None:
+        cleanup_errors: list[Exception] = []
+        for operation in ("kill_finalization_child", "wait_finalization_child"):
+            try:
+                self._finalization_child_request(operation, child_id, 5.0)
+            except Exception as error:
+                cleanup_errors.append(error)
+        if cleanup_errors:
+            raise PreparedChildCleanupError("Finalization child cleanup failures", cleanup_errors)
+
+    def _exchange(
+        self,
+        request: Mapping[str, object],
+        timeout: float,
+        *,
+        executable_descriptor: int | None = None,
+        executable_descriptors: tuple[int, ...] = (),
+        descriptors: tuple[int, ...] = (),
+        require_peer_credentials: bool = False,
+    ) -> object:
+        descriptors_to_send = (
+            descriptors or executable_descriptors
+            if executable_descriptor is None
+            else (executable_descriptor, *executable_descriptors, *descriptors)
+        )
+        with self._connect(timeout, require_peer_credentials=require_peer_credentials) as transport:
+            return self._exchange_on_transport(transport, request, descriptors=descriptors_to_send)
+
+    def _connect(self, timeout: float, *, require_peer_credentials: bool) -> socket.socket:
+        metadata = os.lstat(self.socket_path)
+        if not stat.S_ISSOCK(metadata.st_mode) or (metadata.st_dev, metadata.st_ino) != (self._device, self._inode):
+            raise ProcessConfigurationError("Launcher sandbox socket identity changed")
+        transport = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            transport.settimeout(timeout)
+            transport.connect(str(self.socket_path))
+            if require_peer_credentials:
+                self._require_peer_credentials(transport)
+            return transport
+        except BaseException:
+            transport.close()
+            raise
+
+    @staticmethod
+    def _exchange_on_transport(
+        transport: socket.socket,
+        request: Mapping[str, object],
+        *,
+        descriptors: tuple[int, ...] = (),
+    ) -> object:
+        raw = canonical_json_bytes(request) + b"\n"
+        if not descriptors:
+            transport.sendall(raw)
+        else:
+            descriptor_array = array.array("i", descriptors)
+            sent = transport.sendmsg(
+                (raw,),
+                ((socket.SOL_SOCKET, socket.SCM_RIGHTS, descriptor_array),),
+            )
+            if sent < len(raw):
+                transport.sendall(raw[sent:])
+        response = b""
+        while not response.endswith(b"\n"):
+            chunk = transport.recv(65_536)
+            if not chunk:
+                break
+            response += chunk
+            if len(response) > 1_048_576:
+                raise ProcessConfigurationError("Launcher sandbox response is too large")
+        try:
+            return json.loads(response.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ProcessConfigurationError("Launcher sandbox response is invalid") from error
+
+    @staticmethod
+    def _require_peer_credentials(transport: socket.socket) -> None:
+        try:
+            credentials = transport.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+            peer_pid, peer_uid, _ = struct.unpack("3i", credentials)
+        except (OSError, struct.error) as error:
+            raise ProcessConfigurationError("Launcher sandbox peer is invalid") from error
+        if peer_pid < 1 or peer_uid != os.geteuid():
+            raise ProcessConfigurationError("Launcher sandbox peer is invalid")
+
+    def start(self, *args: object, **kwargs: object) -> ProcessHandle:
+        raise SandboxStartError()
+
+
+@dataclass(slots=True)
+class SandboxChildHandle:
+    """Remote process control remains with the trusted launcher sandbox."""
+
+    sandbox: LauncherSocketSandbox
+    evidence: SandboxChildEvidence
+    _transport: socket.socket = field(repr=False)
+    _transferred: bool = field(default=False, init=False, repr=False)
+
+    @property
+    def child_id(self) -> str:
+        return self.evidence.child_id
+
+    @property
+    def pid(self) -> int:
+        return self.evidence.pid
+
+    def transfer_finalization_fds(self, capability_fds: tuple[int, int, int]) -> SandboxChildEvidence:
+        if (
+            self._transferred
+            or len(capability_fds) != 3
+            or any(not isinstance(descriptor, int) or descriptor < 0 for descriptor in capability_fds)
+        ):
+            raise ProcessConfigurationError("Finalization capability transfer is invalid")
+        try:
+            response = self.sandbox._exchange_on_transport(
+                self._transport,
+                {
+                    "schema_version": "v1",
+                    "sandbox_identity": self.sandbox.identity,
+                    "operation": "transfer_finalization_fds",
+                    "child_id": self.child_id,
+                    "challenge": self.evidence.challenge,
+                    "capability_fd_targets": [4, 5, 6],
+                },
+                descriptors=capability_fds,
+            )
+            if not isinstance(response, dict) or set(response) != {"child_id", "evidence"}:
+                raise ValueError
+            evidence = _sandbox_child_evidence(response["evidence"])
+            if (
+                response["child_id"] != self.child_id
+                or evidence.child_id != self.child_id
+                or evidence.challenge != self.evidence.challenge
+                or evidence.pid != self.evidence.pid
+                or evidence.pid_namespace_inode != self.evidence.pid_namespace_inode
+                or evidence.mount_namespace_inode != self.evidence.mount_namespace_inode
+                or evidence.fd_numbers != (0, 1, 2, 4, 5, 6)
+                or evidence.bootstrap_fd_access != "denied"
+            ):
+                raise ValueError
+            if self.sandbox._evidence_public_key is None:
+                raise ValueError
+            self.sandbox._evidence_public_key.verify(
+                bytes.fromhex(evidence.signature),
+                _sandbox_child_evidence_payload(evidence, self.sandbox.identity),
+            )
+            self._transferred = True
+            return evidence
+        except (InvalidSignature, OSError, ValueError, ProcessConfigurationError) as error:
+            try:
+                self._kill_and_reap()
+            except ProcessConfigurationError as cleanup_error:
+                raise ProcessConfigurationError("Finalization capability transfer cleanup failed") from cleanup_error
+            raise ProcessConfigurationError("Finalization capability transfer failed") from error
+        finally:
+            self._transport.close()
+
+    def _kill_and_reap(self) -> None:
+        cleanup_errors: list[Exception] = []
+        try:
+            self.kill_group()
+        except Exception as error:
+            cleanup_errors.append(error)
+        try:
+            self.wait()
+        except Exception as error:
+            cleanup_errors.append(error)
+        if len(cleanup_errors) == 1:
+            raise ProcessConfigurationError("Finalization child cleanup failed") from cleanup_errors[0]
+        if cleanup_errors:
+            raise ProcessConfigurationError("Finalization child cleanup failed") from ExceptionGroup(
+                "Finalization child cleanup failures", cleanup_errors
+            )
+
+    def poll(self) -> int | None:
+        response = self.sandbox._finalization_child_request("poll_finalization_child", self.child_id, 5.0)
+        return _finalization_returncode(response, complete=False)
+
+    def wait(self, timeout: float | None = None) -> SandboxCompleted:
+        response = self.sandbox._finalization_child_request("wait_finalization_child", self.child_id, timeout)
+        returncode = _finalization_returncode(response, complete=True)
+        if not isinstance(response.get("stdout"), (str, bytes)) or not isinstance(response.get("stderr"), (str, bytes)):
+            raise ProcessConfigurationError("Finalization child result is invalid")
+        return SandboxCompleted(returncode, response["stdout"], response["stderr"])
+
+    def terminate_group(self) -> None:
+        self.sandbox._finalization_child_request("terminate_finalization_child", self.child_id, 5.0)
+
+    def kill_group(self) -> None:
+        self.sandbox._finalization_child_request("kill_finalization_child", self.child_id, 5.0)
+
+
+def _finalization_returncode(response: object, *, complete: bool) -> int | None:
+    if not isinstance(response, dict) or set(response) != ({"returncode", "stdout", "stderr"} if complete else {"returncode"}):
+        raise ProcessConfigurationError("Finalization child result is invalid")
+    returncode = response["returncode"]
+    if returncode is None and not complete:
+        return None
+    if isinstance(returncode, bool) or not isinstance(returncode, int):
+        raise ProcessConfigurationError("Finalization child result is invalid")
+    return returncode
+
+
+def _sandbox_child_evidence(value: object) -> SandboxChildEvidence:
+    if not isinstance(value, dict) or set(value) != {
+        "child_id",
+        "challenge",
+        "pid",
+        "pid_namespace_inode",
+        "mount_namespace_inode",
+        "fd_numbers",
+        "bootstrap_fd_access",
+        "signature",
+    }:
+        raise ValueError
+    numbers = value["fd_numbers"]
+    if not isinstance(numbers, list) or any(
+        not isinstance(number, int) or isinstance(number, bool) or number < 0 for number in numbers
+    ):
+        raise ValueError
+    evidence = SandboxChildEvidence(
+        child_id=value["child_id"],
+        challenge=value["challenge"],
+        pid=value["pid"],
+        pid_namespace_inode=value["pid_namespace_inode"],
+        mount_namespace_inode=value["mount_namespace_inode"],
+        fd_numbers=tuple(numbers),
+        bootstrap_fd_access=cast(Literal["denied"], value["bootstrap_fd_access"]),
+        signature=value["signature"],
+    )
+    if (
+        not isinstance(evidence.child_id, str)
+        or len(evidence.child_id) != 32
+        or any(character not in "0123456789abcdef" for character in evidence.child_id)
+        or not isinstance(evidence.challenge, str)
+        or len(evidence.challenge) != 64
+        or any(character not in "0123456789abcdef" for character in evidence.challenge)
+        or any(
+            not isinstance(number, int) or isinstance(number, bool) or number < 1
+            for number in (evidence.pid, evidence.pid_namespace_inode, evidence.mount_namespace_inode)
+        )
+        or not isinstance(evidence.bootstrap_fd_access, str)
+        or len(evidence.signature) != 128
+        or any(character not in "0123456789abcdef" for character in evidence.signature)
+    ):
+        raise ValueError
+    return evidence
+
+
+def _sandbox_child_evidence_payload(evidence: SandboxChildEvidence, sandbox_identity: str) -> bytes:
+    return canonical_json_bytes(
+        {
+            "domain": "auto-code-sandbox-child-evidence/v1",
+            "sandbox_identity": sandbox_identity,
+            "challenge": evidence.challenge,
+            "child_id": evidence.child_id,
+            "pid": evidence.pid,
+            "pid_namespace_inode": evidence.pid_namespace_inode,
+            "mount_namespace_inode": evidence.mount_namespace_inode,
+            "fd_numbers": list(evidence.fd_numbers),
+            "bootstrap_fd_access": evidence.bootstrap_fd_access,
+        }
+    )
+
+
+class FilesystemEvidenceSink:
+    """Persist bounded process output as immutable launcher-owned evidence files."""
+
+    def __init__(self, root: Path, *, creator: str = "trusted-process-runner") -> None:
+        path = Path(root)
+        if not path.is_absolute() or ".." in path.parts or not creator or len(creator) > 255:
+            raise EvidenceSinkError("Evidence sink configuration is invalid")
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if path.is_symlink() or not path.is_dir():
+            raise EvidenceSinkError("Evidence sink root is invalid")
+        self.root = path
+        self.creator = creator
+        self._root_identity = _directory_identity(path)
+
+    def write(self, result: CommandResult) -> CommandResult:
+        identifier = uuid.uuid4().hex
+        stdout = self._write_new(f"{identifier}.stdout.txt", result.stdout_text.encode("utf-8"))
+        stderr = self._write_new(f"{identifier}.stderr.txt", result.stderr_text.encode("utf-8"))
+        return replace(
+            result,
+            stdout_path=EvidenceRef(
+                relative_path=f"repair/{stdout.name}",
+                sha256=hashlib.sha256(result.stdout_text.encode("utf-8")).hexdigest(),
+                media_type="text/plain",
+                creator=self.creator,
+            ),
+            stderr_path=EvidenceRef(
+                relative_path=f"repair/{stderr.name}",
+                sha256=hashlib.sha256(result.stderr_text.encode("utf-8")).hexdigest(),
+                media_type="text/plain",
+                creator=self.creator,
+            ),
+        )
+
+    def _write_new(self, name: str, content: bytes) -> Path:
+        directory = _open_pinned_directory(self._root_identity)
+        try:
+            descriptor = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | _required_no_follow_flag(),
+                0o600,
+                dir_fd=directory.descriptor,
+            )
+            try:
+                remaining = memoryview(content)
+                while remaining:
+                    remaining = remaining[os.write(descriptor, remaining):]
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.fsync(directory.descriptor)
+        finally:
+            directory.close()
+        return self.root / name
 
 
 class ProcessHandle(Protocol):
@@ -403,6 +1048,57 @@ class HashVerifiedExecutables:
             raise
 
 
+class PythonArchiveTicketInvoker:
+    """Execute a sealed runner archive through a pinned interpreter and launcher sandbox."""
+
+    def __init__(
+        self,
+        *,
+        interpreter: Path,
+        interpreter_hash: str,
+        sandbox: LauncherSocketSandbox,
+        timeout: float,
+        cwd: Path,
+        policy: SandboxPolicy,
+    ) -> None:
+        if not isinstance(sandbox, LauncherSocketSandbox):
+            raise ProcessConfigurationError("Ticket archive sandbox is invalid")
+        self.interpreter = str(_absolute_policy_path(interpreter))
+        self.executables = HashVerifiedExecutables({interpreter: interpreter_hash})
+        self.sandbox = sandbox
+        self.timeout = _positive_timeout(timeout)
+        self.cwd = policy.command_cwd(cwd)
+        self.policy = policy
+
+    def invoke(self, archive: VerifiedExecutable, argv: tuple[str, ...]) -> SandboxCompleted:
+        required_seals = fcntl.F_SEAL_SEAL | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE
+        try:
+            if fcntl.fcntl(archive.descriptor, fcntl.F_GET_SEALS) & required_seals != required_seals:
+                raise ProcessConfigurationError("Ticket runner archive is not sealed")
+        except OSError as error:
+            raise ProcessConfigurationError("Ticket runner archive is not sealed") from error
+        command = _command_argv(argv)
+        if len(command) > 64 or any(len(argument) > 4_096 for argument in command):
+            raise ProcessConfigurationError("Ticket runner arguments are invalid")
+        interpreter = self.executables.require_absolute_verified(self.interpreter)
+        handoff = self.policy.prepare_handoff(self.cwd)
+        try:
+            completed = self.sandbox.run_python_archive(
+                interpreter,
+                archive,
+                command,
+                timeout=self.timeout,
+                env=self.policy.command_environment({}),
+                policy=handoff,
+            )
+            if completed.returncode != 0:
+                raise ProcessBoundaryError(f"Ticket runner failed with status {completed.returncode}")
+            return completed
+        finally:
+            handoff.close()
+            interpreter.close()
+
+
 class ProcessRunner:
     """Finite-command boundary that only operates through injected trusted capabilities."""
 
@@ -427,6 +1123,62 @@ class ProcessRunner:
             environment,
             sandbox_policy,
         ).result
+
+    def observe_reconciled_effect(
+        self, effect_id: str, binding_hash: str, timeout: float
+    ) -> ObservedLauncherEffect | None:
+        if self.sandbox is None or not callable(getattr(self.sandbox, "observe_effect", None)):
+            raise ProcessConfigurationError("Observable launcher effects are unavailable")
+        return self.sandbox.observe_effect(  # type: ignore[attr-defined,no-any-return]
+            _require_effect_hash(effect_id),
+            _require_effect_hash(binding_hash),
+            timeout=_positive_timeout(timeout),
+        )
+
+    def run_reconciled_effect(
+        self,
+        effect_id: str,
+        binding_hash: str,
+        argv: Sequence[str],
+        cwd: Path,
+        timeout: float,
+        evidence_sink: EvidenceSink,
+        environment: Mapping[str, str],
+        sandbox_policy: SandboxPolicy,
+    ) -> tuple[CommandResult, str]:
+        if self.sandbox is None or not callable(getattr(self.sandbox, "run_effect", None)):
+            raise ProcessConfigurationError("Observable launcher effects are unavailable")
+        executable: VerifiedExecutable | None = None
+        handoff: SandboxPolicyHandoff | None = None
+        try:
+            executable, command, handoff, command_timeout, command_environment = self._prepare(
+                argv, cwd, timeout, environment, sandbox_policy
+            )
+            completed, receipt = self.sandbox.run_effect(  # type: ignore[attr-defined]
+                command,
+                executable=executable,
+                timeout=command_timeout,
+                env=command_environment,
+                policy=handoff,
+                effect_id=_require_effect_hash(effect_id),
+                binding_hash=_require_effect_hash(binding_hash),
+            )
+            if not isinstance(completed, SandboxCompleted):
+                raise ProcessConfigurationError("Launcher effect returned an invalid command result")
+            result = self._record(
+                command,
+                completed.returncode,
+                completed.stdout,
+                completed.stderr,
+                None if completed.returncode == 0 else CommandFailureKind.EXIT,
+                evidence_sink,
+            )
+            return result, _require_effect_hash(receipt)
+        finally:
+            if handoff is not None:
+                handoff.close()
+            if executable is not None:
+                _close_verified_executable(executable)
 
     def run_with_trusted_output(
         self,
@@ -890,6 +1642,12 @@ def _is_relative_to(path: Path, root: Path) -> bool:
 
 def _paths_overlap(first: Path, second: Path) -> bool:
     return _is_relative_to(first, second) or _is_relative_to(second, first)
+
+
+def _require_effect_hash(value: object) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ProcessConfigurationError("Launcher effect hash is invalid")
+    return value
 
 
 def _open_regular_file_no_follow(path: Path) -> int:

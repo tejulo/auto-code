@@ -11,12 +11,15 @@ import socket
 from typing import Literal, Protocol
 import uuid
 
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
 from .contracts import (
     ActivationRequest,
     AuthorizationVerifier,
     CompatibilityClaimBinding,
     HumanAuthorization,
     HumanAuthorizationAction,
+    IndexReleaseReceipt,
     PreparationContextPayload,
     PreparationInput,
     PreparationPhase,
@@ -26,7 +29,7 @@ from .contracts import (
     TicketSnapshot,
     TrustedPreparationInputRef,
 )
-from .hashing import hash_json
+from .hashing import canonical_json_bytes, hash_json
 from .state import (
     EMPTY_STATE_HASH,
     AuthoritativeStateCorrupt,
@@ -178,14 +181,21 @@ class ActiveRunIndex:
         *,
         authorization_verifier: AuthorizationVerifier | None = None,
         preparation_input_verifier: PreparationInputVerifier | None = None,
+        finalization_signing_key: Ed25519PrivateKey | None = None,
     ) -> None:
         self.root = _normalize_state_root(root)
         self.authorization_verifier = authorization_verifier
         self.preparation_input_verifier = preparation_input_verifier
+        self._finalization_signing_key = finalization_signing_key or Ed25519PrivateKey.generate()
         self.index_dir = _ensure_directory(self.root, self.root / "active-run-index")
+        self.release_dir = _ensure_directory(self.root, self.root / "active-run-index-releases")
         self.journal_dir = _ensure_directory(self.root, self.root / "preparation-journal")
         _ensure_directory(self.root, self.root / "active-run-bindings")
         self.locks_dir = _ensure_directory(self.root, self.root / "locks")
+
+    @property
+    def finalization_public_key(self) -> str:
+        return self._finalization_signing_key.public_key().public_bytes_raw().hex()
 
     def lookup(self, repository_id: str) -> ActivationResult | None:
         repository_id = _require_identifier(repository_id, "repository ID")
@@ -484,7 +494,7 @@ class ActiveRunIndex:
         expected_index_revision: int,
         expected_index_hash: str,
         terminal_generation_hash: str,
-    ) -> None:
+    ) -> IndexReleaseReceipt:
         repository_id = _require_identifier(repository_id, "repository ID")
         run_id = _require_identifier(run_id, "run ID")
         if not isinstance(expected_index_revision, int) or isinstance(expected_index_revision, bool) or expected_index_revision < 1:
@@ -516,7 +526,72 @@ class ActiveRunIndex:
                     pass
                 else:
                     raise NonTerminalRunRelease("only terminal authorized generations may release an Active Run")
+                receipt = self._sign_release_receipt(
+                    IndexReleaseReceipt.create(
+                        repository_id=repository_id,
+                        run_id=run_id,
+                        prior_revision=entry.revision,
+                        prior_hash=entry.index_hash,
+                        terminal_generation_hash=terminal_generation_hash,
+                    ),
+                    state,
+                )
+                path = self._release_path(receipt)
+                payload = receipt.model_dump(mode="json", round_trip=True)
+                if not _write_new_json(path, payload) and _read_canonical_json(path, "Active Run release receipt") != payload:
+                    raise AuthoritativeIndexCorrupt("Active Run release receipt conflicts with the exact release")
                 self._remove_entry_locked(repository_id)
+                return receipt
+
+    def verify_release(self, receipt: IndexReleaseReceipt) -> None:
+        """Verify an fsynced tombstone still proves one exact terminal index removal."""
+
+        self.load_verified_release(receipt)
+
+    def load_verified_release(self, receipt: IndexReleaseReceipt) -> IndexReleaseReceipt:
+        """Load the signed tombstone matching one expected release binding."""
+
+        if not isinstance(receipt, IndexReleaseReceipt):
+            raise ValueError("index release receipt is invalid")
+        with self._repository_lock(receipt.repository_id):
+            if self._load_entry_locked(receipt.repository_id) is not None:
+                raise IndexCompareAndSwapConflict("Active Run index has changed since its release")
+            try:
+                stored = IndexReleaseReceipt.model_validate(
+                    _read_canonical_json(self._release_path(receipt), "Active Run release receipt")
+                )
+            except Exception as error:
+                raise AuthoritativeIndexCorrupt("Active Run release receipt is missing or corrupt") from error
+            if not stored.matches(receipt):
+                raise AuthoritativeIndexCorrupt("Active Run release receipt does not match the release binding")
+            store = RunStateStore(self.root, receipt.run_id, authorization_verifier=self.authorization_verifier)
+            with store.interprocess_lock():
+                generation = store.load_locked()
+                if (
+                    generation.state_hash != receipt.terminal_generation_hash
+                    or generation.state.repository_id != receipt.repository_id
+                    or generation.state.disposition not in {RunDisposition.DONE, RunDisposition.ABANDONED}
+                ):
+                    raise TerminalGenerationMismatch("release receipt does not match the terminal Active Run state")
+                try:
+                    state = generation.state
+                    if state.finalization_public_key is None or state.finalization_public_key_hash is None:
+                        raise ValueError
+                    stored.verify_signature(state.finalization_public_key, state.finalization_public_key_hash)
+                except ValueError as error:
+                    raise AuthoritativeIndexCorrupt("Active Run release receipt signature is invalid") from error
+            return stored
+
+    def _sign_release_receipt(self, receipt: IndexReleaseReceipt, state: RunState) -> IndexReleaseReceipt:
+        try:
+            if state.finalization_public_key is None or state.finalization_public_key_hash is None:
+                raise ValueError
+            key = self._finalization_signing_key
+            if key.public_key().public_bytes_raw().hex() != state.finalization_public_key:
+                raise ValueError
+            return receipt.with_signature(key.sign(canonical_json_bytes(receipt.signing_payload())).hex())
+        except Exception as error:
+            raise AuthoritativeIndexCorrupt("Active Run release signing key is unavailable") from error
 
     @contextmanager
     def _repository_lock(self, repository_id: str) -> Iterator[None]:
@@ -711,6 +786,10 @@ class ActiveRunIndex:
                 max_crew_iterations=state.max_crew_iterations,
                 preparation_phase=PreparationPhase.SELECTED,
                 disposition=RunDisposition.HUMAN_REVIEW,
+                repair_activation_public_key=state.repair_activation_public_key,
+                repair_activation_public_key_hash=state.repair_activation_public_key_hash,
+                finalization_public_key=state.finalization_public_key,
+                finalization_public_key_hash=state.finalization_public_key_hash,
             )
             if state != expected:
                 raise ActivationStateMismatch("Human Review activation state is invalid")
@@ -849,6 +928,10 @@ class ActiveRunIndex:
                 compatibility_receipt_ref=binding.compatibility_receipt_ref,
                 disposition=RunDisposition.ACTIVE,
                 runner_identity=binding.runner_identity,
+                repair_activation_public_key=claim.repair_activation_public_key,
+                repair_activation_public_key_hash=claim.repair_activation_public_key_hash,
+                finalization_public_key=claim.finalization_public_key,
+                finalization_public_key_hash=claim.finalization_public_key_hash,
             )
             context_hash = hash_json(context.model_dump(mode="json", round_trip=True))
             return ActivationRequest(
@@ -879,6 +962,10 @@ class ActiveRunIndex:
                 max_crew_iterations=claim.preparation_input_ref.max_crew_iterations,
                 preparation_phase=PreparationPhase.SELECTED,
                 disposition=RunDisposition.HUMAN_REVIEW,
+                repair_activation_public_key=claim.repair_activation_public_key,
+                repair_activation_public_key_hash=claim.repair_activation_public_key_hash,
+                finalization_public_key=claim.finalization_public_key,
+                finalization_public_key_hash=claim.finalization_public_key_hash,
             )
             return ActivationRequest(
                 reservation_id=claim.reservation_id,
@@ -944,6 +1031,9 @@ class ActiveRunIndex:
 
     def _journal_path(self, reservation_id: str) -> Path:
         return self.journal_dir / f"{reservation_id}.json"
+
+    def _release_path(self, receipt: IndexReleaseReceipt) -> Path:
+        return self.release_dir / f"{receipt.receipt_hash}.json"
 
     def _load_entry_locked(self, repository_id: str) -> _IndexEntry | None:
         path = self._index_path(repository_id)

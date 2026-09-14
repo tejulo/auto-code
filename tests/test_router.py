@@ -142,6 +142,7 @@ def fully_approved_state(
         task_definition_manifest=definition,
         task_status_manifest=statuses,
         product_change_manifest="product-change-v1",
+        product_change_manifest_hash="a" * 64,
         build_identity="build-v1",
         verification_result="verification-v1",
         browser_result="browser-v1",

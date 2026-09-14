@@ -10,6 +10,7 @@ from typing import Sequence
 
 import pytest
 
+import auto_code.git as git_module
 from auto_code.git import (
     BranchBinding,
     BranchReuseError,
@@ -535,6 +536,99 @@ def test_collect_manifest_inputs_preserves_modes_renames_binaries_and_authorized
     assert files["generated.txt"].object_id == git_repo_with_remote.git(
         "hash-object", "--no-filters", "--", "generated.txt"
     ).stdout_text.strip()
+
+
+def test_repair_source_manifest_hashes_worktree_bytes_modes_binaries_symlinks_and_untracked(
+    git_repo_with_remote: GitRepository,
+) -> None:
+    """A diff-only repair hash omits executable modes, untracked files, and symlink target bytes."""
+    guard = git_repo_with_remote.guard()
+    baseline = git_repo_with_remote.git("rev-parse", "HEAD").stdout_text.strip()
+    (git_repo_with_remote.root / "script.sh").chmod(0o755)
+    (git_repo_with_remote.root / "image.bin").write_bytes(b"\x00\x03")
+    (git_repo_with_remote.root / "link.py").symlink_to("script.sh")
+    (git_repo_with_remote.root / "new.py").write_bytes(b"print('new')\n")
+
+    manifest = guard.collect_repair_source_manifest(
+        baseline,
+        planned_paths=("script.sh", "image.bin", "link.py", "new.py"),
+    )
+    files = {entry.path: entry for entry in manifest.files}
+
+    assert files["script.sh"].mode == "100755"
+    assert files["image.bin"].binary is True
+    assert files["link.py"].mode == "120000"
+    assert files["link.py"].content_sha256 == sha256(b"script.sh").hexdigest()
+    assert files["new.py"].untracked is True
+    assert manifest.baseline_sha == baseline
+
+
+def test_repair_source_manifest_excludes_only_explicit_control_files_and_rejects_other_untracked(
+    git_repo_with_remote: GitRepository,
+) -> None:
+    guard = git_repo_with_remote.guard()
+    baseline = git_repo_with_remote.git("rev-parse", "HEAD").stdout_text.strip()
+    (git_repo_with_remote.root / "old.txt").write_text("repaired\n", encoding="ascii")
+    control = git_repo_with_remote.root / ".repair-control"
+    control.mkdir()
+    (control / "plan.json").write_text("{}", encoding="ascii")
+
+    manifest = guard.collect_repair_source_manifest(
+        baseline,
+        planned_paths=("old.txt",),
+        control_paths=(".repair-control/plan.json",),
+    )
+
+    assert tuple(entry.path for entry in manifest.files) == ("old.txt",)
+    (git_repo_with_remote.root / "rogue.py").write_text("rogue\n", encoding="ascii")
+    with pytest.raises(UnauthorizedUntrackedPathError):
+        guard.collect_repair_source_manifest(
+            baseline,
+            planned_paths=("old.txt",),
+            control_paths=(".repair-control/plan.json",),
+        )
+
+
+def test_repair_source_manifest_binds_unchanged_and_ignored_workspace_files(
+    git_repo_with_remote: GitRepository,
+) -> None:
+    guard = git_repo_with_remote.guard()
+    baseline = git_repo_with_remote.git("rev-parse", "HEAD").stdout_text.strip()
+    (git_repo_with_remote.root / "old.txt").write_text("repaired\n", encoding="ascii")
+    (git_repo_with_remote.root / ".git" / "info" / "exclude").write_text("ignored.cache\n", encoding="ascii")
+    (git_repo_with_remote.root / "ignored.cache").write_bytes(b"\x00ignored\n")
+
+    manifest = guard.collect_repair_source_manifest(baseline, planned_paths=("old.txt",))
+    workspace = {entry.path: entry for entry in manifest.workspace_files}
+
+    assert "old.txt" in workspace
+    assert "script.sh" in workspace
+    assert workspace["ignored.cache"].binary is True
+    assert workspace["ignored.cache"].content_sha256 == sha256(b"\x00ignored\n").hexdigest()
+    assert not any(entry.path.startswith(".git/") for entry in manifest.workspace_files)
+
+
+@pytest.mark.parametrize(
+    ("limit_name", "limit"),
+    (
+        ("MAX_REPAIR_SOURCE_FILES", 1),
+        ("MAX_REPAIR_SOURCE_FILE_BYTES", 1),
+        ("MAX_REPAIR_SOURCE_TOTAL_BYTES", 1),
+    ),
+)
+def test_repair_source_manifest_rejects_file_count_per_file_and_aggregate_oversize(
+    git_repo_with_remote: GitRepository,
+    monkeypatch: pytest.MonkeyPatch,
+    limit_name: str,
+    limit: int,
+) -> None:
+    guard = git_repo_with_remote.guard()
+    baseline = git_repo_with_remote.git("rev-parse", "HEAD").stdout_text.strip()
+    (git_repo_with_remote.root / "old.txt").write_text("repaired\n", encoding="ascii")
+    monkeypatch.setattr(git_module, limit_name, limit)
+
+    with pytest.raises(GitGuardError, match="limit"):
+        guard.collect_repair_source_manifest(baseline, planned_paths=("old.txt",))
 
 
 def test_collect_manifest_inputs_uses_trusted_full_output_when_public_evidence_is_capped(

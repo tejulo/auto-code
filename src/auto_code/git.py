@@ -6,10 +6,12 @@ import hashlib
 import os
 from pathlib import Path, PurePosixPath
 import re
+import stat
 import unicodedata
 from typing import TYPE_CHECKING, Protocol
 
 from .process import CommandResult, EvidenceSink, ProcessRunner, SandboxPolicy, TrustedCommandOutput
+from .hashing import hash_json
 
 if TYPE_CHECKING:
     from .project_config import ProjectConfig
@@ -29,6 +31,9 @@ _SAFE_GIT_ENVIRONMENT = {
     "GIT_CONFIG_NOSYSTEM": "1",
     "GIT_TERMINAL_PROMPT": "0",
 }
+MAX_REPAIR_SOURCE_FILES = 10_000
+MAX_REPAIR_SOURCE_FILE_BYTES = 16 * 1024 * 1024
+MAX_REPAIR_SOURCE_TOTAL_BYTES = 256 * 1024 * 1024
 
 
 class GitGuardError(RuntimeError):
@@ -96,6 +101,31 @@ class ProcessGitExecutor:
     environment: Mapping[str, str]
     sandbox_policy: SandboxPolicy
     _trusted_outputs: dict[int, TrustedCommandOutput] = field(default_factory=dict, init=False, repr=False, compare=False)
+
+    @classmethod
+    def from_protected_launcher(
+        cls,
+        *,
+        process_runner: ProcessRunner,
+        git_executable: str,
+        timeout: float,
+        evidence_sink: EvidenceSink,
+        sandbox_policy: SandboxPolicy,
+    ) -> ProcessGitExecutor:
+        """Create the finalization executor only from launcher-owned process capabilities."""
+
+        if not isinstance(process_runner, ProcessRunner) or process_runner.executables is None or process_runner.sandbox is None:
+            raise GitExecutorUnavailableError("Protected Git process capability is unavailable")
+        if not isinstance(sandbox_policy, SandboxPolicy):
+            raise GitExecutorUnavailableError("Protected Git sandbox policy is unavailable")
+        return cls(
+            process_runner=process_runner,
+            git_executable=git_executable,
+            timeout=timeout,
+            evidence_sink=evidence_sink,
+            environment={},
+            sandbox_policy=sandbox_policy,
+        )
 
     def run(self, argv: Sequence[str], *, cwd: Path, redact_output: bool = False) -> CommandResult:
         if not isinstance(self.environment, Mapping) or any(name in _SAFE_GIT_ENVIRONMENT for name in self.environment):
@@ -216,6 +246,67 @@ class GitManifestInputs:
     @property
     def authorized_untracked_paths(self) -> tuple[str, ...]:
         return tuple(entry.path for entry in self.files if entry.untracked)
+
+
+@dataclass(frozen=True, slots=True)
+class RepairSourceFile:
+    path: str
+    status: str
+    old_path: str | None
+    old_object_id: str | None
+    object_id: str | None
+    mode: str
+    binary: bool
+    untracked: bool
+    content_sha256: str | None
+
+    def payload(self) -> dict[str, object]:
+        return {
+            "path": self.path,
+            "status": self.status,
+            "old_path": self.old_path,
+            "old_object_id": self.old_object_id,
+            "object_id": self.object_id,
+            "mode": self.mode,
+            "binary": self.binary,
+            "untracked": self.untracked,
+            "content_sha256": self.content_sha256,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RepairWorkspaceFile:
+    path: str
+    kind: str
+    mode: str
+    binary: bool
+    content_sha256: str
+
+    def payload(self) -> dict[str, object]:
+        return {
+            "path": self.path,
+            "kind": self.kind,
+            "mode": self.mode,
+            "binary": self.binary,
+            "content_sha256": self.content_sha256,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RepairSourceManifest:
+    baseline_sha: str
+    files: tuple[RepairSourceFile, ...]
+    workspace_files: tuple[RepairWorkspaceFile, ...] = ()
+
+    @property
+    def content_hash(self) -> str:
+        return hash_json(
+            {
+                "baseline_sha": self.baseline_sha,
+                "files": [entry.payload() for entry in self.files],
+                "workspace_files": [entry.payload() for entry in self.workspace_files],
+            }
+        )
 
 
 class GitGuard:
@@ -491,6 +582,118 @@ class GitGuard:
             )
         return GitManifestInputs(baseline_sha=baseline, files=tuple(sorted(files, key=lambda entry: entry.path)))
 
+    def collect_repair_source_manifest(
+        self,
+        baseline_sha: str,
+        *,
+        planned_paths: Iterable[str],
+        control_paths: Iterable[str] = (),
+    ) -> RepairSourceManifest:
+        """Capture the exact baseline-to-worktree repair source, including non-diff bytes."""
+        planned = tuple(sorted(_validate_relative_path(path) for path in planned_paths))
+        controls = tuple(sorted(_validate_relative_path(path) for path in control_paths))
+        if not planned or len(planned) != len(set(planned)):
+            raise ManifestMismatchError("Repair source paths must be sorted and unique")
+        if len(controls) != len(set(controls)) or set(planned).intersection(controls):
+            raise ManifestMismatchError("Repair control paths are invalid")
+        manifest = self.collect_manifest_inputs(baseline_sha, authorized_untracked=(*planned, *controls))
+        source_entries = tuple(entry for entry in manifest.files if entry.path not in controls)
+        actual = {entry.path for entry in source_entries}
+        if actual != set(planned):
+            raise ManifestMismatchError("Repair source does not match its planned paths")
+        files = tuple(
+            RepairSourceFile(
+                path=entry.path,
+                status=entry.status,
+                old_path=entry.old_path,
+                old_object_id=entry.old_object_id,
+                object_id=entry.object_id,
+                mode=entry.new_mode,
+                binary=entry.binary,
+                untracked=entry.untracked,
+                content_sha256=(
+                    None
+                    if entry.status.startswith("D")
+                    else _bounded_worktree_hash(self.repository / entry.path)[0]
+                ),
+            )
+            for entry in source_entries
+        )
+        workspace_files = self._repair_workspace_files(controls)
+        return RepairSourceManifest(
+            baseline_sha=manifest.baseline_sha,
+            files=files,
+            workspace_files=workspace_files,
+        )
+
+    def _repair_workspace_files(self, control_paths: tuple[str, ...]) -> tuple[RepairWorkspaceFile, ...]:
+        controls = frozenset(control_paths)
+        entries: list[RepairWorkspaceFile] = []
+        total_bytes = 0
+        for current, directories, files in os.walk(self.repository, followlinks=False):
+            current_path = Path(current)
+            if current_path == self.repository:
+                directories[:] = [name for name in directories if name != ".git"]
+                files = [name for name in files if name != ".git"]
+            for name in tuple(directories):
+                path = current_path / name
+                if path.is_symlink():
+                    directories.remove(name)
+                    files.append(name)
+            for name in files:
+                if len(entries) >= MAX_REPAIR_SOURCE_FILES:
+                    raise GitGuardError("Repair source file-count limit exceeded")
+                path = current_path / name
+                relative = path.relative_to(self.repository).as_posix()
+                if relative in controls:
+                    continue
+                metadata = os.lstat(path)
+                if stat.S_ISLNK(metadata.st_mode):
+                    kind = "symlink"
+                elif stat.S_ISREG(metadata.st_mode):
+                    kind = "file"
+                else:
+                    raise GitGuardError("Repair workspace contains an unsupported file")
+                content_hash, size = _bounded_worktree_hash(
+                    path,
+                    remaining_bytes=MAX_REPAIR_SOURCE_TOTAL_BYTES - total_bytes,
+                )
+                total_bytes += size
+                entries.append(
+                    RepairWorkspaceFile(
+                        path=_validate_relative_path(relative),
+                        kind=kind,
+                        mode=_worktree_mode(path),
+                        binary=_worktree_is_binary(path),
+                        content_sha256=content_hash,
+                    )
+                )
+        result = tuple(sorted(entries, key=lambda entry: entry.path))
+        if len({entry.path for entry in result}) != len(result):
+            raise GitGuardError("Repair workspace manifest paths are not unique")
+        return result
+
+    def dependency_lock_hash(self) -> str:
+        entries: list[dict[str, object]] = []
+        for name in ("pyproject.toml", "poetry.lock", "uv.lock", "requirements.txt"):
+            path = self.repository / name
+            try:
+                metadata = os.lstat(path)
+            except FileNotFoundError:
+                entries.append({"path": name, "present": False})
+                continue
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                raise GitGuardError("Dependency lock path is not a regular file")
+            entries.append(
+                {
+                    "path": name,
+                    "present": True,
+                    "mode": "100755" if metadata.st_mode & 0o111 else "100644",
+                    "content_sha256": hashlib.sha256(_read_worktree_bytes(path)).hexdigest(),
+                }
+            )
+        return hash_json(entries)
+
     def commit_manifest(self, manifest: GitManifestInputs, message: str) -> str:
         if not isinstance(manifest, GitManifestInputs) or not manifest.files:
             raise ManifestMismatchError("Approved Git manifest is required")
@@ -543,6 +746,50 @@ class GitGuard:
         if remote_sha != self._approved_commit:
             raise PushNotAuthorizedError("Remote ticket branch does not match the approved commit")
         return self._approved_commit
+
+    def refresh_finalization(self, branch: str, baseline_sha: str) -> bool:
+        """Fetch and bind the exact ticket branch and approved remote base for finalization."""
+
+        _validate_branch_name(branch)
+        _validate_sha(baseline_sha)
+        self._run("fetch", "--no-tags", self.remote, redact_output=True)
+        snapshot = self._remote_snapshot()
+        if snapshot.base_sha != baseline_sha or self._current_branch() != branch:
+            return False
+        self._ticket_branch = branch
+        self._prepared_remote = snapshot
+        return True
+
+    def commit_product_manifest(self, manifest: object, message: str) -> str:
+        return self.commit_manifest(_product_manifest_inputs(manifest), message)
+
+    def push_product_commit(self, commit_sha: str) -> str:
+        _validate_sha(commit_sha)
+        if self._approved_commit != commit_sha:
+            raise PushNotAuthorizedError("Push commit does not match the approved product commit")
+        return self.push()
+
+    def reconcile_product_commit(self, manifest: object, commit_sha: str | None) -> str | None:
+        inputs = _product_manifest_inputs(manifest)
+        candidate = self._rev_parse("HEAD") if commit_sha is None else _validate_sha(commit_sha)
+        if self._rev_parse("HEAD") != candidate:
+            return None
+        try:
+            self._verify_commit(inputs, candidate)
+        except ManifestMismatchError:
+            return None
+        self._approved_commit = candidate
+        return candidate
+
+    def reconcile_product_push(self, branch: str, commit_sha: str) -> str | None:
+        _validate_branch_name(branch)
+        _validate_sha(commit_sha)
+        reference = f"refs/heads/{branch}"
+        remote = self._stdout(self._run("ls-remote", "--heads", self.remote, reference, redact_output=True)).splitlines()
+        if len(remote) != 1:
+            return None
+        remote_sha = remote[0].split(maxsplit=1)[0].lower()
+        return commit_sha if remote_sha == commit_sha else None
 
     def _run(self, *argv: str, allow_failure: bool = False, redact_output: bool = False) -> CommandResult:
         if self.executor is None:
@@ -882,6 +1129,89 @@ def _worktree_is_binary(path: Path) -> bool:
             return b"\x00" in stream.read(8_192)
     except OSError as error:
         raise GitGuardError("Worktree path cannot be read") from error
+
+
+def _read_worktree_bytes(path: Path) -> bytes:
+    try:
+        metadata = os.lstat(path)
+        if stat.S_ISLNK(metadata.st_mode):
+            return os.fsencode(os.readlink(path))
+        if not stat.S_ISREG(metadata.st_mode):
+            raise GitGuardError("Worktree path is not a regular file or symlink")
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+        try:
+            chunks: list[bytes] = []
+            while chunk := os.read(descriptor, 65_536):
+                chunks.append(chunk)
+            return b"".join(chunks)
+        finally:
+            os.close(descriptor)
+    except OSError as error:
+        raise GitGuardError("Worktree path cannot be read safely") from error
+
+
+def _bounded_worktree_hash(
+    path: Path,
+    *,
+    remaining_bytes: int = MAX_REPAIR_SOURCE_TOTAL_BYTES,
+) -> tuple[str, int]:
+    try:
+        metadata = os.lstat(path)
+        if stat.S_ISLNK(metadata.st_mode):
+            content = os.fsencode(os.readlink(path))
+            size = len(content)
+            if size > MAX_REPAIR_SOURCE_FILE_BYTES or size > remaining_bytes:
+                raise GitGuardError("Repair source byte limit exceeded")
+            return hashlib.sha256(content).hexdigest(), size
+        if not stat.S_ISREG(metadata.st_mode):
+            raise GitGuardError("Worktree path is not a regular file or symlink")
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+        try:
+            size = os.fstat(descriptor).st_size
+            if size > MAX_REPAIR_SOURCE_FILE_BYTES or size > remaining_bytes:
+                raise GitGuardError("Repair source byte limit exceeded")
+            digest = hashlib.sha256()
+            observed = 0
+            while chunk := os.read(descriptor, min(65_536, MAX_REPAIR_SOURCE_FILE_BYTES + 1 - observed)):
+                observed += len(chunk)
+                if observed > size or observed > MAX_REPAIR_SOURCE_FILE_BYTES or observed > remaining_bytes:
+                    raise GitGuardError("Repair source byte limit exceeded")
+                digest.update(chunk)
+            if observed != size:
+                raise GitGuardError("Repair source changed during capture")
+            return digest.hexdigest(), observed
+        finally:
+            os.close(descriptor)
+    except GitGuardError:
+        raise
+    except OSError as error:
+        raise GitGuardError("Worktree path cannot be read safely") from error
+
+
+def _product_manifest_inputs(manifest: object) -> GitManifestInputs:
+    """Translate the reviewed product manifest at the Git boundary, not in callers."""
+
+    from .contracts import ProductChangeManifest
+
+    if not isinstance(manifest, ProductChangeManifest):
+        raise ManifestMismatchError("Approved product manifest is invalid")
+    return GitManifestInputs(
+        baseline_sha=manifest.baseline_sha,
+        files=tuple(
+            GitManifestFile(
+                path=file.path,
+                status=file.status,
+                old_path=file.old_path,
+                old_mode=file.old_mode,
+                new_mode=file.mode,
+                old_object_id=file.old_object_id,
+                object_id=file.object_id,
+                binary=file.binary,
+                untracked=file.untracked,
+            )
+            for file in manifest.files
+        ),
+    )
 
 
 def _manifest_stage_paths(manifest: GitManifestInputs) -> set[str]:

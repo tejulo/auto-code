@@ -123,6 +123,7 @@ def invalidate_from(state: RunState, owner: Stage) -> RunState:
         updates["task_status_manifest"] = None
     if Stage.PROGRAMMER in invalid:
         updates["product_change_manifest"] = None
+        updates["product_change_manifest_hash"] = None
         updates["build_identity"] = None
     if Stage.VERIFICATION in invalid:
         updates["verification_result"] = None

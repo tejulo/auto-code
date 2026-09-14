@@ -22,6 +22,7 @@ def runner_identity() -> RunnerIdentity:
         source_sha="b" * 64,
         dependency_lock_hash="c" * 64,
         contract_bundle_hash="d" * 64,
+        runner_archive_hash="e" * 64,
         built_at=datetime(2026, 9, 7, tzinfo=UTC),
     )
 

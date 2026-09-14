@@ -11,9 +11,13 @@ import re
 import stat
 import sys
 from typing import Protocol
+import uuid
 
-from .contracts import EvidenceRef, RunnerIdentity
+from .contracts import EvidenceRef, ProductChangeManifest, RepairRunnerIdentity, RunnerIdentity, StepResult
+from .finalization_service import FinalizationServiceError, invoke_protected_capability
+from .hashing import canonical_json_bytes
 from .state import RunStateStore, StateGeneration, StateStoreError
+from .supervisor import SupervisorStateMismatch
 
 
 _LAUNCHER_RUNTIME_FD = 3
@@ -50,6 +54,21 @@ class _PrepareCoordinator(Protocol):
     ) -> object: ...
 
 
+class _Supervisor(Protocol):
+    def step(self, run_id: str, expected_revision: int, expected_hash: str) -> StepResult: ...
+
+
+class _RepairRequestCoordinator(Protocol):
+    def create_request(
+        self,
+        run_id: str,
+        expected_revision: int,
+        expected_hash: str,
+        workspace: Path,
+        plan: Path,
+    ) -> object: ...
+
+
 def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
     config: dict[str, object] = {}
     for key, value in pairs:
@@ -71,16 +90,21 @@ class TrustedRuntimeConfig:
     project_policy_path: Path
     project_policy_hash: str
     runner_identity: RunnerIdentity
+    repair_registry_root: Path | None = None
+    repair_runner_identity: RepairRunnerIdentity | None = None
+    repair_repository_id: str | None = None
 
     @classmethod
     def from_descriptor(cls, value: object) -> TrustedRuntimeConfig:
-        if not isinstance(value, dict) or set(value) != {
+        base = {
             "state_root",
             "project_root",
             "project_policy_path",
             "project_policy_hash",
             "runner_identity",
-        }:
+        }
+        repair = {"repair_registry_root", "repair_runner_identity", "repair_repository_id"}
+        if not isinstance(value, dict) or frozenset(value) not in {frozenset(base), frozenset(base | repair)}:
             raise ValueError("runtime descriptor shape is invalid")
         return cls(
             state_root=Path(value["state_root"]),
@@ -88,6 +112,13 @@ class TrustedRuntimeConfig:
             project_policy_path=Path(value["project_policy_path"]),
             project_policy_hash=value["project_policy_hash"],
             runner_identity=RunnerIdentity.model_validate(value["runner_identity"]),
+            repair_registry_root=(Path(value["repair_registry_root"]) if "repair_registry_root" in value else None),
+            repair_runner_identity=(
+                RepairRunnerIdentity.model_validate(value["repair_runner_identity"])
+                if "repair_runner_identity" in value
+                else None
+            ),
+            repair_repository_id=value.get("repair_repository_id"),
         )
 
     def __post_init__(self) -> None:
@@ -111,6 +142,24 @@ class TrustedRuntimeConfig:
             raise ValueError("project policy hash is invalid")
         if not isinstance(self.runner_identity, RunnerIdentity):
             raise ValueError("runner identity is invalid")
+        repair_values = (self.repair_registry_root, self.repair_runner_identity, self.repair_repository_id)
+        if any(value is not None for value in repair_values):
+            if not all(value is not None for value in repair_values):
+                raise ValueError("repair runtime bindings are incomplete")
+            assert self.repair_registry_root is not None
+            repair_root = Path(self.repair_registry_root)
+            if not repair_root.is_absolute() or ".." in repair_root.parts:
+                raise ValueError("repair registry root is invalid")
+            object.__setattr__(self, "repair_registry_root", repair_root)
+            if not isinstance(self.repair_runner_identity, RepairRunnerIdentity):
+                raise ValueError("repair runner identity is invalid")
+            if (
+                not isinstance(self.repair_repository_id, str)
+                or not self.repair_repository_id
+                or len(self.repair_repository_id) > 255
+                or any(character in self.repair_repository_id for character in ("/", "\x00"))
+            ):
+                raise ValueError("repair repository ID is invalid")
 
 
 def load_launcher_runtime_from_protected_fd() -> TrustedRuntimeConfig:
@@ -156,6 +205,27 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--expected-revision")
     prepare.add_argument("--expected-hash")
     prepare.add_argument("--receipt-ref", action="append")
+    step = commands.add_parser("step")
+    step.add_argument("--run")
+    step.add_argument("--expected-revision")
+    step.add_argument("--expected-hash")
+    step.add_argument("--json", action="store_true")
+    finalize = commands.add_parser("finalize")
+    finalize.add_argument("--run")
+    finalize.add_argument("--expected-revision")
+    finalize.add_argument("--expected-hash")
+    receipt = commands.add_parser("receipt")
+    receipt.add_argument("--run")
+    receipt.add_argument("--expected-revision")
+    receipt.add_argument("--expected-hash")
+    receipt.add_argument("--request-id")
+    repair_request = commands.add_parser("repair-request")
+    repair_request.add_argument("--run")
+    repair_request.add_argument("--expected-revision")
+    repair_request.add_argument("--expected-hash")
+    repair_request.add_argument("--workspace")
+    repair_request.add_argument("--plan")
+    repair_request.add_argument("--json", action="store_true")
     return parser
 
 
@@ -256,11 +326,190 @@ def _run_prepare(
     return 0
 
 
+def _run_step(
+    args: argparse.Namespace,
+    runtime: TrustedRuntimeConfig | None,
+    supervisor_factory: Callable[[TrustedRuntimeConfig], _Supervisor] | None,
+) -> int:
+    if not args.run or args.expected_revision is None or args.expected_hash is None or not args.json:
+        print("step: invalid arguments", file=sys.stderr)
+        return 2
+    try:
+        expected_revision = int(args.expected_revision)
+        if expected_revision < 1 or _SHA256.fullmatch(args.expected_hash) is None:
+            raise ValueError
+    except ValueError:
+        print("step: invalid arguments", file=sys.stderr)
+        return 2
+    try:
+        trusted_runtime = runtime if runtime is not None else load_launcher_runtime_from_protected_fd()
+    except RuntimeConfigurationError:
+        print("step: launcher runtime unavailable", file=sys.stderr)
+        return 2
+    if supervisor_factory is None:
+        print("step: launcher composition unavailable", file=sys.stderr)
+        return 2
+    try:
+        result = supervisor_factory(trusted_runtime).step(args.run, expected_revision, args.expected_hash)
+    except (SupervisorStateMismatch, ValueError, StateStoreError):
+        print("step: expected state does not match", file=sys.stderr)
+        return 2
+    except Exception:
+        print("step: operation unavailable", file=sys.stderr)
+        return 2
+    print(result.model_dump_json())
+    return 0
+
+
+def _run_finalize(
+    args: argparse.Namespace,
+) -> int:
+    if not args.run or args.expected_revision is None or args.expected_hash is None:
+        print("finalize: invalid arguments", file=sys.stderr)
+        return 2
+    try:
+        revision = int(args.expected_revision)
+        if revision < 1 or _CANONICAL_SHA256.fullmatch(args.expected_hash) is None:
+            raise ValueError
+        response = invoke_protected_capability(
+            "finalize",
+            args.run,
+            revision,
+            args.expected_hash,
+            None,
+        )
+        assert response.result is not None
+        result = response.result
+    except (FinalizationServiceError, ValueError):
+        print("finalize: expected state does not match", file=sys.stderr)
+        return 2
+    except Exception:
+        print("finalize: operation unavailable", file=sys.stderr)
+        return 2
+    print(result.model_dump_json())
+    return 0
+
+
+def _run_receipt(
+    args: argparse.Namespace,
+) -> int:
+    if not args.run or args.expected_revision is None or args.expected_hash is None or not args.request_id:
+        print("receipt: invalid arguments", file=sys.stderr)
+        return 2
+    try:
+        revision = int(args.expected_revision)
+        if revision < 1 or _CANONICAL_SHA256.fullmatch(args.expected_hash) is None:
+            raise ValueError
+        if str(uuid.UUID(args.request_id)) != args.request_id:
+            raise ValueError
+        invoke_protected_capability(
+            "receipt",
+            args.run,
+            revision,
+            args.expected_hash,
+            args.request_id,
+        )
+    except (FinalizationServiceError, ValueError):
+        print("receipt: operation unavailable", file=sys.stderr)
+        return 2
+    except Exception:
+        print("receipt: operation unavailable", file=sys.stderr)
+        return 2
+    return 0
+
+
+def _run_repair_request(
+    args: argparse.Namespace,
+    runtime: TrustedRuntimeConfig | None,
+    coordinator_factory: Callable[[TrustedRuntimeConfig], _RepairRequestCoordinator] | None,
+) -> int:
+    if (
+        not args.run
+        or args.expected_revision is None
+        or not args.expected_hash
+        or _CANONICAL_SHA256.fullmatch(args.expected_hash) is None
+        or not args.workspace
+        or not args.plan
+        or not args.json
+    ):
+        print("repair-request: invalid arguments", file=sys.stderr)
+        return 2
+    try:
+        revision = int(args.expected_revision)
+        if revision < 1:
+            raise ValueError
+        trusted_runtime = runtime if runtime is not None else load_launcher_runtime_from_protected_fd()
+        coordinator = (
+            coordinator_factory(trusted_runtime)
+            if coordinator_factory is not None
+            else _compose_repair_request_coordinator(trusted_runtime, args.run)
+        )
+        request = coordinator.create_request(
+            args.run,
+            revision,
+            args.expected_hash,
+            Path(args.workspace),
+            Path(args.plan),
+        )
+        content_hash = getattr(request, "content_hash", None)
+        if not isinstance(content_hash, str):
+            raise ValueError
+    except (RuntimeConfigurationError, ValueError, StateStoreError):
+        print("repair-request: operation unavailable", file=sys.stderr)
+        return 2
+    print(json.dumps({"request_hash": content_hash}, sort_keys=True))
+    return 0
+
+
+def _compose_repair_request_coordinator(
+    runtime: TrustedRuntimeConfig,
+    run_id: str,
+) -> _RepairRequestCoordinator:
+    if (
+        runtime.repair_registry_root is None
+        or runtime.repair_runner_identity is None
+        or runtime.repair_repository_id is None
+    ):
+        raise RuntimeConfigurationError("repair coordinator is unavailable")
+    from .repair import RepairRequestCoordinator, _open_regular_no_follow
+    from .runner import RunnerRegistry
+
+    registry = RunnerRegistry(runtime.repair_registry_root, repair_runner_identity=runtime.repair_runner_identity)
+    store = RunStateStore(runtime.state_root, run_id)
+
+    def load_product_manifest(relative_path: str) -> ProductChangeManifest:
+        if not isinstance(relative_path, str):
+            raise ValueError("product manifest path is invalid")
+        path = runtime.project_root / relative_path
+        try:
+            path.relative_to(runtime.project_root)
+            descriptor = _open_regular_no_follow(path)
+            with os.fdopen(descriptor, "rb") as stream:
+                raw = stream.read(1_048_577)
+            if len(raw) > 1_048_576:
+                raise ValueError
+            payload = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_json_keys)
+            if raw != canonical_json_bytes(payload):
+                raise ValueError
+            return ProductChangeManifest.model_validate(payload)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            raise RuntimeConfigurationError("product manifest is unavailable") from None
+
+    return RepairRequestCoordinator(
+        store,
+        load_workspace_handle=registry.load_workspace_handle,
+        load_product_manifest=load_product_manifest,
+        repair_repository_id=runtime.repair_repository_id,
+    )
+
+
 def main(
     argv: Sequence[str] | None = None,
     runtime: TrustedRuntimeConfig | None = None,
     *,
     prepare_coordinator_factory: Callable[[TrustedRuntimeConfig], _PrepareCoordinator] | None = None,
+    supervisor_factory: Callable[[TrustedRuntimeConfig], _Supervisor] | None = None,
+    repair_request_coordinator_factory: Callable[[TrustedRuntimeConfig], _RepairRequestCoordinator] | None = None,
 ) -> int:
     arguments = sys.argv[1:] if argv is None else argv
     try:
@@ -276,6 +525,14 @@ def main(
 
     if args.command == "prepare":
         return _run_prepare(args, runtime, prepare_coordinator_factory)
+    if args.command == "step":
+        return _run_step(args, runtime, supervisor_factory)
+    if args.command == "finalize":
+        return _run_finalize(args)
+    if args.command == "receipt":
+        return _run_receipt(args)
+    if args.command == "repair-request":
+        return _run_repair_request(args, runtime, repair_request_coordinator_factory)
     if args.command != "status":
         print("auto-code: a command is required", file=sys.stderr)
         return 2

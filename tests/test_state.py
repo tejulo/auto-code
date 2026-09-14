@@ -32,6 +32,7 @@ from auto_code.contracts import (
     FindingKind,
     HumanAuthorization,
     HumanAuthorizationAction,
+    IndexReleaseBinding,
     PreparationPhase,
     RunnerIdentity,
     RunDisposition,
@@ -149,6 +150,7 @@ def runner_identity(content_hash: str) -> RunnerIdentity:
         source_sha="b" * 64,
         dependency_lock_hash="c" * 64,
         contract_bundle_hash="d" * 64,
+        runner_archive_hash="e" * 64,
         built_at=NOW,
     )
 
@@ -414,6 +416,12 @@ def finalization_ready_state() -> RunState:
         pushed_sha="a" * 40,
         linear_done_receipt="linear-receipt-1",
         finalization_evidence=complete_finalization_evidence(),
+        finalization_index_release_binding=IndexReleaseBinding(
+            repository_id="repo-1",
+            run_id="run-1",
+            prior_revision=1,
+            prior_hash="a" * 64,
+        ),
     )
 
 
@@ -744,6 +752,38 @@ def test_cas_rejects_immutable_budget_changes(tmp_path: Path) -> None:
         )
 
 
+def test_cas_rejects_finalization_trust_key_changes(tmp_path: Path) -> None:
+    """Removing finalization key immutability would let a later generation replace launcher trust."""
+
+    key = "0" * 64
+    replacement = "1" * 64
+    store = RunStateStore(tmp_path, "run-1")
+    first = store.compare_and_swap(
+        0,
+        EMPTY_STATE_HASH,
+        RunState(
+            run_id="run-1",
+            ticket_id="ENG-1",
+            repository_id="repo-1",
+            max_crew_iterations=3,
+            finalization_public_key=key,
+            finalization_public_key_hash=__import__("hashlib").sha256(bytes.fromhex(key)).hexdigest(),
+        ),
+    )
+
+    with pytest.raises(InvalidStateTransition, match="finalization_public_key"):
+        store.compare_and_swap(
+            first.revision,
+            first.state_hash,
+            first.state.model_copy(
+                update={
+                    "finalization_public_key": replacement,
+                    "finalization_public_key_hash": __import__("hashlib").sha256(bytes.fromhex(replacement)).hexdigest(),
+                }
+            ),
+        )
+
+
 def test_cas_rejects_rewritten_failure_history_prefix(tmp_path: Path) -> None:
     store = RunStateStore(tmp_path, "run-1")
     original = RunState(
@@ -893,7 +933,7 @@ def test_cas_rejects_repair_restart_without_a_new_runner_and_receipt(tmp_path: P
         store.compare_and_swap(first.revision, first.state_hash, restarted)
 
 
-def test_cas_accepts_repair_restart_with_changed_runner_and_receipt(tmp_path: Path) -> None:
+def test_cas_rejects_unverified_repair_restart_even_with_a_receipt_hash(tmp_path: Path) -> None:
     store = RunStateStore(tmp_path, "run-1")
     first = persist_after_initial(
         store,
@@ -911,10 +951,12 @@ def test_cas_accepts_repair_restart_with_changed_runner_and_receipt(tmp_path: Pa
             "disposition": RunDisposition.ACTIVE,
             "runner_identity": runner_identity("b" * 64),
             "restart_receipt_hash": "e" * 64,
+            "restart_receipt_request_hash": "f" * 64,
         }
     )
 
-    assert store.compare_and_swap(first.revision, first.state_hash, restarted).state == restarted
+    with pytest.raises(InvalidStateTransition, match="repair activation"):
+        store.compare_and_swap(first.revision, first.state_hash, restarted)
 
 
 def test_cas_rejects_waiting_mcp_resume_before_pending_effect_reconciles(tmp_path: Path) -> None:
@@ -979,6 +1021,7 @@ def test_cas_rejects_resume_authorization_during_repair_reactivation(tmp_path: P
             "disposition": RunDisposition.ACTIVE,
             "runner_identity": runner_identity("b" * 64),
             "restart_receipt_hash": "e" * 64,
+            "restart_receipt_request_hash": "f" * 64,
             "human_authorizations": (
                 consumed_authorization("run-1", HumanAuthorizationAction.RESUME, "resume-1"),
             ),
@@ -1086,6 +1129,7 @@ def test_cas_requires_definition_change_to_clear_dependent_state(tmp_path: Path)
             update={
                 "task_status_manifest": task_status_manifest(first_definition, UnitStatus.UNCHECKED),
                 "product_change_manifest": "product-change-1",
+                "product_change_manifest_hash": "a" * 64,
                 "build_identity": "build-1",
                 "verification_result": "verification-1",
                 "browser_result": "browser-1",
@@ -1111,6 +1155,7 @@ def test_cas_requires_definition_change_to_clear_dependent_state(tmp_path: Path)
             "task_definition_manifest": second_definition,
             "task_status_manifest": None,
             "product_change_manifest": None,
+            "product_change_manifest_hash": None,
             "build_identity": None,
             "verification_result": None,
             "browser_result": None,
@@ -1125,6 +1170,35 @@ def test_cas_requires_definition_change_to_clear_dependent_state(tmp_path: Path)
     )
 
     assert store.compare_and_swap(first.revision, first.state_hash, reset).state == reset
+
+
+def test_product_change_manifest_reference_and_hash_cannot_be_substituted(tmp_path: Path) -> None:
+    store = RunStateStore(tmp_path, "run-1")
+    initial = store.compare_and_swap(
+        0,
+        EMPTY_STATE_HASH,
+        RunState(run_id="run-1", ticket_id="ENG-1", repository_id="repo-1", max_crew_iterations=3),
+    )
+    bound = store.compare_and_swap(
+        initial.revision,
+        initial.state_hash,
+        initial.state.model_copy(
+            update={
+                "product_change_manifest": "manifests/product.json",
+                "product_change_manifest_hash": "a" * 64,
+            }
+        ),
+    )
+
+    assert bound.state.product_change_manifest_hash == "a" * 64
+    substituted = bound.state.model_copy(
+        update={
+            "product_change_manifest": "manifests/substitute.json",
+            "product_change_manifest_hash": "b" * 64,
+        }
+    )
+    with pytest.raises(InvalidStateTransition, match="Product Change Manifest"):
+        store.compare_and_swap(bound.revision, bound.state_hash, substituted)
 
 
 def test_cas_rejects_unbound_checkpoint_even_for_a_constructed_snapshot(tmp_path: Path) -> None:
@@ -1423,9 +1497,7 @@ def test_corrupt_referenced_generation_never_rewinds(tmp_path: Path) -> None:
 
 
 def test_active_run_blocks_new_claim_until_done(tmp_path: Path) -> None:
-    index = preparation_index(tmp_path)
-    reservation = index.reserve("repo-1")
-    active = index.activate_reservation(activation_request(reservation, run_id="run-1"))
+    index, active = activated_index(tmp_path)
 
     with pytest.raises(ActiveRunExists):
         index.reserve("repo-1")

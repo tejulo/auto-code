@@ -663,7 +663,16 @@ class RunStateStore:
             self._validate_initial_state(state)
             return state
         self._validate_pending_lifecycle(previous_generation, state)
-        for field in ("run_id", "ticket_id", "repository_id", "max_crew_iterations"):
+        for field in (
+            "run_id",
+            "ticket_id",
+            "repository_id",
+            "max_crew_iterations",
+            "repair_activation_public_key",
+            "repair_activation_public_key_hash",
+            "finalization_public_key",
+            "finalization_public_key_hash",
+        ):
             if getattr(previous, field) != getattr(state, field):
                 raise InvalidStateTransition(f"immutable field {field} cannot change")
         if previous.has_preparation_binding != state.has_preparation_binding:
@@ -683,21 +692,131 @@ class RunStateStore:
             raise InvalidStateTransition("immutable field branch cannot change after it is set")
         if previous.branch_binding is not None and state.branch_binding != previous.branch_binding:
             raise InvalidStateTransition("branch binding cannot change after it is set")
+        if previous.product_change_manifest is not None and state.product_change_manifest is not None and (
+            previous.product_change_manifest != state.product_change_manifest
+            or previous.product_change_manifest_hash != state.product_change_manifest_hash
+        ):
+            raise InvalidStateTransition("Product Change Manifest binding cannot be substituted")
         for field in ("effect_ledger", "failure_history", "human_authorizations"):
             old = getattr(previous, field)
             new = getattr(state, field)
             if len(new) < len(old) or tuple(new[: len(old)]) != tuple(old):
                 raise InvalidStateTransition(f"append-only collection {field} must preserve its prefix")
         if previous.disposition in {RunDisposition.DONE, RunDisposition.ABANDONED}:
+            if previous.disposition is RunDisposition.DONE:
+                if not previous.finalization_index_released and self._is_exact_release_marker(
+                    previous_generation,
+                    state,
+                ):
+                    return state
+                escalated = previous.model_copy(
+                    update={
+                        "disposition": RunDisposition.HUMAN_REVIEW,
+                        "failure_history": state.failure_history,
+                    }
+                )
+                if (
+                    not previous.finalization_index_released
+                    and state == escalated
+                    and len(state.failure_history) == len(previous.failure_history) + 1
+                ):
+                    return state
             if state != previous:
                 raise InvalidStateTransition("terminal state is immutable")
             return state
         appended_authorizations = self._validate_appended_authorizations(previous, state)
+        if previous.disposition is RunDisposition.REPAIR_REQUIRED and state.disposition is RunDisposition.ACTIVE:
+            self._verify_repair_activation(previous_generation, state)
         self._validate_iteration_transition(previous, state)
         self._validate_task_transition(previous, state)
         self._validate_disposition_transition(previous, state, appended_authorizations)
         self._validate_preparation_transition(previous, state, appended_authorizations)
         return state
+
+    @staticmethod
+    def _is_exact_release_marker(previous_generation: StateGeneration, state: RunState) -> bool:
+        previous = previous_generation.state
+        binding = previous.finalization_index_release_binding
+        receipt = state.finalization_index_release_receipt
+        if (
+            binding is None
+            or receipt is None
+            or previous.finalization_public_key is None
+            or previous.finalization_public_key_hash is None
+        ):
+            return False
+        marker = previous.model_copy(
+            update={
+                "finalization_index_released": True,
+                "finalization_index_release_receipt": receipt,
+            }
+        )
+        try:
+            receipt.verify_signature(previous.finalization_public_key, previous.finalization_public_key_hash)
+        except ValueError:
+            return False
+        return state == marker and receipt.matches(binding.receipt_for(previous_generation.state_hash))
+
+    def _verify_repair_activation(self, previous: StateGeneration, state: RunState) -> None:
+        error = "repair activation transition is not verified"
+        try:
+            from .runner import RunnerActivationReceipt, RunnerActivationSelectionProof
+
+            old = previous.state
+            request_hash = state.restart_receipt_request_hash
+            if (
+                old.repair_activation_public_key is None
+                or old.repair_activation_public_key_hash is None
+                or request_hash is None
+                or state.restart_receipt_hash is None
+                or state.repair_activation_receipt is None
+                or state.repair_activation_selection_proof is None
+                or old.runner_identity is None
+                or state.runner_identity is None
+                or not old.failure_history
+            ):
+                raise ValueError
+            public_key = bytes.fromhex(old.repair_activation_public_key)
+            if hashlib.sha256(public_key).hexdigest() != old.repair_activation_public_key_hash:
+                raise ValueError
+            receipt_payload = json.loads(state.repair_activation_receipt)
+            proof_payload = json.loads(state.repair_activation_selection_proof)
+            if (
+                canonical_json_bytes(receipt_payload).decode("ascii") != state.repair_activation_receipt
+                or canonical_json_bytes(proof_payload).decode("ascii") != state.repair_activation_selection_proof
+            ):
+                raise ValueError
+            receipt = RunnerActivationReceipt.from_payload(receipt_payload)
+            proof = RunnerActivationSelectionProof.from_payload(proof_payload)
+            receipt.verify_signature(public_key)
+            proof.verify_signature(public_key)
+            failure_hash = hash_json(
+                old.failure_history[-1].model_dump(mode="json", round_trip=True)
+            )
+            if (
+                receipt.content_hash != state.restart_receipt_hash
+                or receipt.request_hash != request_hash
+                or receipt.run_id != old.run_id
+                or receipt.expected_revision != previous.revision
+                or receipt.expected_state_hash != previous.state_hash
+                or receipt.failure_hash != failure_hash
+                or receipt.old_runner_identity != old.runner_identity
+                or receipt.new_runner_identity != state.runner_identity
+                or receipt.project_policy_hash != old.project_policy_hash
+                or receipt.activation_public_key_hash != old.repair_activation_public_key_hash
+                or proof.activation_public_key_hash != old.repair_activation_public_key_hash
+                or proof.activation_receipt_hash != receipt.content_hash
+                or proof.request_hash != receipt.request_hash
+                or proof.run_id != receipt.run_id
+                or proof.expected_revision != receipt.expected_revision
+                or proof.expected_state_hash != receipt.expected_state_hash
+                or proof.failure_hash != receipt.failure_hash
+                or proof.old_runner_identity != receipt.old_runner_identity
+                or proof.new_runner_identity != receipt.new_runner_identity
+            ):
+                raise ValueError
+        except Exception:
+            raise InvalidStateTransition(error) from None
 
     @staticmethod
     def _validate_initial_state(state: RunState, *, require_preparation_binding: bool = False) -> None:
@@ -721,7 +840,21 @@ class RunStateStore:
                     "runner_identity": state.runner_identity,
                 }
             )
-        elif state.preparation_phase is PreparationPhase.SELECTED and state.disposition is RunDisposition.HUMAN_REVIEW:
+        if state.repair_activation_public_key is not None:
+            values.update(
+                {
+                    "repair_activation_public_key": state.repair_activation_public_key,
+                    "repair_activation_public_key_hash": state.repair_activation_public_key_hash,
+                }
+            )
+        if state.finalization_public_key is not None:
+            values.update(
+                {
+                    "finalization_public_key": state.finalization_public_key,
+                    "finalization_public_key_hash": state.finalization_public_key_hash,
+                }
+            )
+        if state.preparation_phase is PreparationPhase.SELECTED and state.disposition is RunDisposition.HUMAN_REVIEW:
             values["disposition"] = RunDisposition.HUMAN_REVIEW
         initial = RunState(**values)
         if state != initial:
@@ -791,7 +924,7 @@ class RunStateStore:
             not isinstance(invocation, EffectInvocation)
             or not isinstance(observation, EffectObservation)
             or not isinstance(reconciliation, EffectReconciliation)
-            or invocation.payload != EffectInvocationPayload()
+            or invocation.payload.wait_seconds < 0
             or invocation.effect_id != pending.effect_id
             or observation.effect_id != pending.effect_id
             or reconciliation.effect_id != pending.effect_id
@@ -1122,6 +1255,7 @@ class RunStateStore:
             raise InvalidStateTransition("Task definition change must clear Task status")
         dependent_fields = (
             "product_change_manifest",
+            "product_change_manifest_hash",
             "build_identity",
             "verification_result",
             "browser_result",
@@ -1285,6 +1419,15 @@ class RunStateStore:
         ):
             if getattr(state, field) != getattr(evidence, field):
                 raise InvalidStateTransition("finalization evidence does not bind the completed state")
+        binding = state.finalization_index_release_binding
+        if (
+            binding is None
+            or state.finalization_index_release_receipt is not None
+            or state.finalization_index_released
+            or binding.repository_id != state.repository_id
+            or binding.run_id != state.run_id
+        ):
+            raise InvalidStateTransition("DONE requires an exact Active Run Index release binding")
 
     def _validate_identifiers(self, state: RunState) -> None:
         _require_identifier(state.run_id, "state run ID")

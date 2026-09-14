@@ -14,6 +14,7 @@ from auto_code.contracts import (
     EffectIntention,
     EffectIntentionPayload,
     FinalizationEvidence,
+    IndexReleaseBinding,
     HumanAuthorization,
     HumanAuthorizationAction,
     IdentityResolution,
@@ -255,6 +256,7 @@ def activation_request(
                 source_sha="5" * 64,
                 dependency_lock_hash="6" * 64,
                 contract_bundle_hash="7" * 64,
+                runner_archive_hash="8" * 64,
                 built_at=NOW,
             ),
         )
@@ -309,7 +311,16 @@ def persist_terminal_generation(active: ActivationResult, disposition: RunDispos
         ready.revision,
         ready.state_hash,
         ready.state.model_copy(
-            update={"disposition": RunDisposition.DONE, "finalization_evidence": evidence}
+            update={
+                "disposition": RunDisposition.DONE,
+                "finalization_evidence": evidence,
+                "finalization_index_release_binding": IndexReleaseBinding(
+                    repository_id=active.repository_id,
+                    run_id=active.run_id,
+                    prior_revision=active.index_revision,
+                    prior_hash=active.index_hash,
+                ),
+            }
         ),
     )
 
@@ -320,7 +331,23 @@ def activated_index(
 ) -> tuple[ActiveRunIndex, ActivationResult]:
     index = preparation_index(tmp_path, authorization_verifier=authorization_verifier)
     reservation = index.reserve("repo-1")
-    return index, index.activate_reservation(activation_request(reservation))
+    request = activation_request(reservation)
+    assert request.initial_state is not None
+    public_key = index.finalization_public_key
+    initial = request.initial_state.model_copy(
+        update={
+            "finalization_public_key": public_key,
+            "finalization_public_key_hash": hashlib.sha256(bytes.fromhex(public_key)).hexdigest(),
+        }
+    )
+    return index, index.activate_reservation(
+        request.model_copy(
+            update={
+                "initial_state": initial,
+                "initial_state_hash": hash_json(initial.model_dump(mode="json", round_trip=True)),
+            }
+        )
+    )
 
 
 def abandoned_state(

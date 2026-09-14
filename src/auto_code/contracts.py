@@ -10,6 +10,8 @@ from typing import Annotated, Any, Literal, Mapping, Protocol, Self, TypeAlias
 from urllib.parse import urlsplit, urlunsplit
 import uuid
 
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -88,6 +90,16 @@ class RunDisposition(StrEnum):
     HUMAN_REVIEW = "human_review"
     DONE = "done"
     ABANDONED = "abandoned"
+
+
+class StepKind(StrEnum):
+    CONTINUE = "continue"
+    MCP_ACTION = "mcp_action"
+    ITERATION_FAILED = "iteration_failed"
+    REPAIR_REQUIRED = "repair_required"
+    READY_TO_FINALIZE = "ready_to_finalize"
+    HUMAN_REVIEW = "human_review"
+    DONE = "done"
 
 
 class PreparationPhase(StrEnum):
@@ -1709,6 +1721,54 @@ class McpActionRequest(ContractModel):
         )
 
 
+class StepResult(ContractModel):
+    """The public, CAS-bound result of one deterministic supervisor step."""
+
+    kind: StepKind
+    run_id: EffectReference
+    state_revision: int = Field(ge=1)
+    state_hash: Sha256
+    request_id: str | None = None
+    stage: Stage | None = None
+    action: McpActionRequest | None = None
+    failure: FailureRecord | None = None
+    evidence: tuple[EvidenceRef, ...] = ()
+
+    @field_validator("run_id")
+    @classmethod
+    def validate_run_id(cls, value: str) -> str:
+        return reject_unsafe_persisted_value(value)
+
+    @field_validator("request_id")
+    @classmethod
+    def validate_request_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _canonical_uuid(value, "Step request ID")
+
+    @model_validator(mode="after")
+    def validate_result_shape(self) -> StepResult:
+        if self.kind is StepKind.MCP_ACTION:
+            if (
+                self.action is None
+                or self.request_id != self.action.request_id
+                or self.action.run_id != self.run_id
+            ):
+                raise ValueError("MCP action step results require correlated request and run identifiers")
+        elif self.action is not None or self.request_id is not None:
+            raise ValueError("Only MCP action step results may contain an action")
+        if self.kind in {StepKind.ITERATION_FAILED, StepKind.REPAIR_REQUIRED, StepKind.HUMAN_REVIEW}:
+            if self.failure is None:
+                raise ValueError("Failed step results require a classified failure")
+        elif self.failure is not None:
+            raise ValueError("Only failed step results may contain a failure")
+        if self.kind is StepKind.CONTINUE and self.stage is None:
+            raise ValueError("Continuation step results require a stage")
+        if self.kind is not StepKind.CONTINUE and self.stage is not None:
+            raise ValueError("Only continuation step results may contain a stage")
+        return self
+
+
 class TrustedMcpReceipt(ContractModel):
     schema_version: Literal["v1"] = "v1"
     receipt_id: str
@@ -1726,6 +1786,7 @@ class TrustedMcpReceipt(ContractModel):
     result_hash: Sha256
     outcome: EffectOutcome
     external_revision: str | None = None
+    observed_state_id: str | None = None
     bridge_identity: EffectReference
     mcp_server_identity: EffectReference
     tool_call_id: EffectReference
@@ -1763,7 +1824,7 @@ class TrustedMcpReceipt(ContractModel):
     def normalize_receipt_hashes(cls, value: str) -> str:
         return value.lower()
 
-    @field_validator("expected_external_revision", "external_revision")
+    @field_validator("expected_external_revision", "external_revision", "observed_state_id")
     @classmethod
     def validate_receipt_revision(cls, value: str | None) -> str | None:
         if value is None:
@@ -2175,9 +2236,12 @@ class RunnerIdentity(ContractModel):
     source_sha: Sha256
     dependency_lock_hash: Sha256
     contract_bundle_hash: Sha256
+    runner_archive_hash: Sha256
     built_at: datetime
 
-    @field_validator("content_hash", "source_sha", "dependency_lock_hash", "contract_bundle_hash")
+    @field_validator(
+        "content_hash", "source_sha", "dependency_lock_hash", "contract_bundle_hash", "runner_archive_hash"
+    )
     @classmethod
     def normalize_runner_hashes(cls, value: str) -> str:
         return canonical_text(value, "Runner identity hash").lower()
@@ -2566,6 +2630,124 @@ class FinalizationEvidence(ContractModel):
         return reject_unsafe_persisted_value(value)
 
 
+class IndexReleaseBinding(ContractModel):
+    repository_id: str
+    run_id: str
+    prior_revision: int = Field(ge=1)
+    prior_hash: Sha256
+
+    @field_validator("repository_id", "run_id")
+    @classmethod
+    def validate_identifiers(cls, value: str) -> str:
+        validated = _safe_snapshot_identifier(value, "Index release identifier")
+        assert validated is not None
+        return validated
+
+    @field_validator("prior_hash")
+    @classmethod
+    def normalize_prior_hash(cls, value: str) -> str:
+        return value.lower()
+
+    def receipt_for(self, terminal_generation_hash: str) -> IndexReleaseReceipt:
+        return IndexReleaseReceipt.create(
+            repository_id=self.repository_id,
+            run_id=self.run_id,
+            prior_revision=self.prior_revision,
+            prior_hash=self.prior_hash,
+            terminal_generation_hash=terminal_generation_hash,
+        )
+
+
+class IndexReleaseReceipt(ContractModel):
+    repository_id: str
+    run_id: str
+    prior_revision: int = Field(ge=1)
+    prior_hash: Sha256
+    terminal_generation_hash: Sha256
+    receipt_hash: Sha256
+    signature: str | None = None
+
+    @field_validator("repository_id", "run_id")
+    @classmethod
+    def validate_identifiers(cls, value: str) -> str:
+        validated = _safe_snapshot_identifier(value, "Index release identifier")
+        assert validated is not None
+        return validated
+
+    @field_validator("prior_hash", "terminal_generation_hash", "receipt_hash")
+    @classmethod
+    def normalize_hashes(cls, value: str) -> str:
+        return value.lower()
+
+    @model_validator(mode="after")
+    def validate_receipt_hash(self) -> IndexReleaseReceipt:
+        if self.receipt_hash != hash_json(self._receipt_payload()):
+            raise ValueError("Index release receipt hash does not match its binding")
+        return self
+
+    @field_validator("signature")
+    @classmethod
+    def validate_signature(cls, value: str | None) -> str | None:
+        if value is not None and re.fullmatch(r"[0-9a-f]{128}", value) is None:
+            raise ValueError("Index release signature is invalid")
+        return value
+
+    def _receipt_payload(self) -> dict[str, object]:
+        return self.model_dump(mode="json", round_trip=True, exclude={"receipt_hash", "signature"})
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        repository_id: str,
+        run_id: str,
+        prior_revision: int,
+        prior_hash: str,
+        terminal_generation_hash: str,
+    ) -> IndexReleaseReceipt:
+        payload = {
+            "repository_id": repository_id,
+            "run_id": run_id,
+            "prior_revision": prior_revision,
+            "prior_hash": prior_hash,
+            "terminal_generation_hash": terminal_generation_hash,
+        }
+        return cls(**payload, receipt_hash=hash_json(payload))
+
+    def signing_payload(self) -> dict[str, object]:
+        return {
+            "domain": "auto-code-index-release/v1",
+            **self.model_dump(mode="json", round_trip=True, exclude={"signature"}),
+        }
+
+    def with_signature(self, signature: str) -> IndexReleaseReceipt:
+        return self.model_copy(update={"signature": signature})
+
+    def matches(self, expected: IndexReleaseReceipt) -> bool:
+        return self._receipt_payload() == expected._receipt_payload() and self.receipt_hash == expected.receipt_hash
+
+    def verify_signature(self, public_key: str, public_key_hash: str) -> None:
+        try:
+            public_key_bytes = bytes.fromhex(public_key)
+            if hashlib.sha256(public_key_bytes).hexdigest() != public_key_hash or self.signature is None:
+                raise ValueError
+            Ed25519PublicKey.from_public_bytes(public_key_bytes).verify(
+                bytes.fromhex(self.signature),
+                canonical_json_bytes(self.signing_payload()),
+            )
+        except (InvalidSignature, ValueError):
+            raise ValueError("Index release signature is invalid") from None
+
+    @property
+    def binding(self) -> IndexReleaseBinding:
+        return IndexReleaseBinding(
+            repository_id=self.repository_id,
+            run_id=self.run_id,
+            prior_revision=self.prior_revision,
+            prior_hash=self.prior_hash,
+        )
+
+
 class StageOutput(ContractModel):
     stage: Stage
     content_hash: Sha256
@@ -2596,6 +2778,7 @@ class RunState(ContractModel):
     task_definition_manifest: TaskDefinitionManifest | None = None
     task_status_manifest: TaskStatusManifest | None = None
     product_change_manifest: str | None = None
+    product_change_manifest_hash: Sha256 | None = None
     build_identity: str | None = None
     verification_result: str | None = None
     browser_result: str | None = None
@@ -2607,7 +2790,14 @@ class RunState(ContractModel):
     human_authorizations: tuple[HumanAuthorization, ...] = ()
     runner_identity: RunnerIdentity | None = None
     repair_runner_identity: RepairRunnerIdentity | None = None
+    repair_activation_public_key: Sha256 | None = None
+    repair_activation_public_key_hash: Sha256 | None = None
+    finalization_public_key: Sha256 | None = None
+    finalization_public_key_hash: Sha256 | None = None
     restart_receipt_hash: RestartReceiptHash | None = None
+    restart_receipt_request_hash: RestartReceiptHash | None = None
+    repair_activation_receipt: str | None = Field(default=None, max_length=16_777_216)
+    repair_activation_selection_proof: str | None = Field(default=None, max_length=65_536)
     pending_external_request: PendingExternalRequest | None = None
     prefinalization_ticket_projection: str | None = None
     commit_sha: str | None = None
@@ -2616,12 +2806,30 @@ class RunState(ContractModel):
     finalization_eligible: bool = False
     finalization: str | None = None
     finalization_evidence: FinalizationEvidence | None = None
+    finalization_index_released: bool = False
+    finalization_index_release_binding: IndexReleaseBinding | None = None
+    finalization_index_release_receipt: IndexReleaseReceipt | None = None
+    finalization_retry_wait_seconds: float = Field(default=0, ge=0)
+    finalization_next_eligible_at: datetime | None = None
+
+    @field_validator("finalization_next_eligible_at")
+    @classmethod
+    def validate_finalization_eligibility_time(cls, value: datetime | None) -> datetime | None:
+        if value is not None and (value.tzinfo is None or value.utcoffset() is None):
+            raise ValueError("Finalization eligibility time must include a timezone")
+        return value
 
     @field_validator(
         "project_policy_hash",
         "preparation_input_hash",
         "ticket_snapshot_hash",
         "compatibility_receipt_hash",
+        "product_change_manifest_hash",
+        "repair_activation_public_key",
+        "repair_activation_public_key_hash",
+        "finalization_public_key",
+        "finalization_public_key_hash",
+        "restart_receipt_request_hash",
     )
     @classmethod
     def normalize_preparation_binding_hashes(cls, value: str | None) -> str | None:
@@ -2666,6 +2874,37 @@ class RunState(ContractModel):
                 raise ValueError("Compatibility receipt hash does not match its reference")
         elif self.preparation_phase is not PreparationPhase.SELECTED or self.compensated:
             raise ValueError("Preparation state requires a complete preparation binding")
+        if (self.repair_activation_public_key is None) != (self.repair_activation_public_key_hash is None):
+            raise ValueError("Repair activation trust binding must be complete")
+        if self.repair_activation_public_key is not None and (
+            hashlib.sha256(bytes.fromhex(self.repair_activation_public_key)).hexdigest()
+            != self.repair_activation_public_key_hash
+        ):
+            raise ValueError("Repair activation public key hash does not match")
+        if (self.finalization_public_key is None) != (self.finalization_public_key_hash is None):
+            raise ValueError("Finalization trust binding must be complete")
+        if self.finalization_public_key is not None and (
+            hashlib.sha256(bytes.fromhex(self.finalization_public_key)).hexdigest()
+            != self.finalization_public_key_hash
+        ):
+            raise ValueError("Finalization public key hash does not match")
+        if self.finalization_public_key == self.repair_activation_public_key and self.finalization_public_key is not None:
+            raise ValueError("Finalization public key must be dedicated")
+        if self.finalization_index_release_receipt is not None and (
+            self.finalization_index_release_binding is None
+            or self.finalization_index_release_receipt.binding != self.finalization_index_release_binding
+        ):
+            raise ValueError("Index release receipt does not match its binding")
+        if self.finalization_index_released and (
+            self.finalization_index_release_binding is None
+            or self.finalization_index_release_receipt is None
+            or self.finalization_index_release_receipt.signature is None
+        ):
+            raise ValueError("Released finalization requires an exact index release receipt")
+        if (self.product_change_manifest is None) != (self.product_change_manifest_hash is None):
+            raise ValueError("Product Change Manifest reference and hash must be bound together")
+        if (self.restart_receipt_hash is None) != (self.restart_receipt_request_hash is None):
+            raise ValueError("Repair activation receipt reference and hash must be bound together")
         if self.crew_iteration_count > self.authorized_iteration_limit:
             raise ValueError("Crew Iteration count exceeds authorized limit")
         if self.iteration_open and self.crew_iteration_count == 0:
@@ -2868,6 +3107,10 @@ class SelectedActivationClaimRequest(ContractModel):
     ticket_snapshot: TicketSnapshot
     original_state_id: str
     original_external_revision: str
+    repair_activation_public_key: Sha256
+    repair_activation_public_key_hash: Sha256
+    finalization_public_key: Sha256
+    finalization_public_key_hash: Sha256
 
     @field_validator("expected_index_hash")
     @classmethod
@@ -2894,6 +3137,17 @@ class SelectedActivationClaimRequest(ContractModel):
             reject_unsafe_persisted_value(self.original_external_revision)
         except ValueError:
             raise ValueError("Selected activation claim is invalid") from None
+        if (
+            hashlib.sha256(bytes.fromhex(self.repair_activation_public_key)).hexdigest()
+            != self.repair_activation_public_key_hash
+        ):
+            raise ValueError("Selected activation repair trust binding is invalid")
+        if (
+            self.finalization_public_key == self.repair_activation_public_key
+            or hashlib.sha256(bytes.fromhex(self.finalization_public_key)).hexdigest()
+            != self.finalization_public_key_hash
+        ):
+            raise ValueError("Selected activation finalization trust binding is invalid")
         return self
 
 

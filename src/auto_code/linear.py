@@ -208,6 +208,7 @@ class LinearGateway:
         ticket_id: str,
         *,
         expected_external_revision: str | None = None,
+        expected_state_id: str | None = None,
     ) -> McpActionRequest:
         return self.request_action(
             generation,
@@ -215,7 +216,7 @@ class LinearGateway:
             entity="ticket",
             target=ticket_id,
             expected_external_revision=expected_external_revision,
-            arguments={"ticket_id": ticket_id},
+            arguments=({"ticket_id": ticket_id, "state_id": expected_state_id} if expected_state_id is not None else {"ticket_id": ticket_id}),
         )
 
     def request_state(
@@ -346,6 +347,7 @@ class LinearGateway:
         receipt: TrustedMcpReceipt,
         *,
         state_update: ReceiptStateUpdate | None = None,
+        wait_seconds: float = 0,
     ) -> StateGeneration:
         if not isinstance(receipt, TrustedMcpReceipt):
             raise UntrustedReceiptError("MCP receipt is not bridge authenticated")
@@ -365,11 +367,13 @@ class LinearGateway:
         if not _receipt_matches_pending(receipt, pending, current.state.run_id):
             raise UntrustedReceiptError("MCP receipt does not match the pending request")
 
+        if not isinstance(wait_seconds, (int, float)) or isinstance(wait_seconds, bool) or wait_seconds < 0:
+            raise ValueError("receipt retry wait is invalid")
         invoked = EffectInvocation(
             effect_id=pending.effect_id,
             sequence=current.state.effect_ledger[-1].sequence + 1,
             timestamp=receipt.observed_at,
-            payload=EffectInvocationPayload(),
+            payload=EffectInvocationPayload(wait_seconds=float(wait_seconds)),
         )
         observed = EffectObservation(
             effect_id=pending.effect_id,

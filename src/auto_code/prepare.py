@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
+import hashlib
 import hmac
 from pathlib import Path
 from typing import Literal, Protocol
@@ -181,6 +182,8 @@ class PrepareCoordinator:
         role_config: object,
         reservation_owner: Callable[[], ReservationOwner],
         now: Callable[[], datetime],
+        repair_activation_public_key: bytes,
+        finalization_public_key: bytes,
         linear: LinearGateway | None = None,
         context: PreparationContextAuthority | None = None,
     ) -> None:
@@ -192,6 +195,13 @@ class PrepareCoordinator:
         self.role_config = role_config
         self.reservation_owner = reservation_owner
         self.now = now
+        if not isinstance(repair_activation_public_key, bytes) or len(repair_activation_public_key) != 32:
+            raise ValueError("repair activation public key is invalid")
+        self.repair_activation_public_key = bytes(repair_activation_public_key)
+        if not isinstance(finalization_public_key, bytes) or len(finalization_public_key) != 32:
+            raise ValueError("finalization public key is invalid")
+        self.finalization_public_key = finalization_public_key.hex()
+        self.finalization_public_key_hash = hashlib.sha256(finalization_public_key).hexdigest()
         self.linear = linear
         self.context = context
 
@@ -235,6 +245,8 @@ class PrepareCoordinator:
             pagination_complete=True,
             source_page_hashes=reference.source_page_hashes,
         )
+        if self.finalization_public_key == self.repair_activation_public_key.hex():
+            raise PrepareError("finalization public key is invalid")
         claim = self.index.claim_selected_activation(
             SelectedActivationClaimRequest(
                 reservation_id=reservation.reservation_id,
@@ -245,6 +257,10 @@ class PrepareCoordinator:
                 ticket_snapshot=snapshot,
                 original_state_id=original_state_id,
                 original_external_revision=original_external_revision,
+                repair_activation_public_key=self.repair_activation_public_key.hex(),
+                repair_activation_public_key_hash=hashlib.sha256(self.repair_activation_public_key).hexdigest(),
+                finalization_public_key=self.finalization_public_key,
+                finalization_public_key_hash=self.finalization_public_key_hash,
             )
         )
         if claim.outcome == "wait":

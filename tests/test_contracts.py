@@ -246,6 +246,7 @@ def runner_identity() -> RunnerIdentity:
         source_sha=RUNNER_SOURCE_HASH,
         dependency_lock_hash=RUNNER_LOCK_HASH,
         contract_bundle_hash=RUNNER_CONTRACT_BUNDLE_HASH,
+        runner_archive_hash="e" * 64,
         built_at=NOW,
     )
 
