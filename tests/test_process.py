@@ -13,6 +13,7 @@ import sys
 import threading
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from auto_code.contracts import EvidenceRef
 from auto_code.process import (
@@ -575,6 +576,108 @@ def test_launcher_socket_starts_finalization_child_only_with_procfs_pid_isolatio
         "isolate_procfs": True,
         "capabilities": (b"descriptor", b"trust", b"binding"),
     }
+
+
+def test_sandbox_prepares_a_child_only_after_verifying_signed_evidence(tmp_path: Path) -> None:
+    socket_path = tmp_path / "launcher.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(1)
+    signing_key = Ed25519PrivateKey.generate()
+    observed: dict[str, object] = {}
+
+    def serve() -> None:
+        connection, _ = listener.accept()
+        with connection:
+            raw = connection.makefile("rb").readline()
+            observed.update(json.loads(raw))
+            unsigned_evidence = {
+                "domain": "auto-code-sandbox-child-evidence/v1",
+                "pid": 124,
+                "pid_namespace_inode": 456,
+                "mount_namespace_inode": 789,
+                "fd_numbers": [],
+            }
+            connection.sendall(
+                canonical_json_bytes(
+                    {
+                        "child_id": "f" * 32,
+                        "evidence": {
+                            **{key: value for key, value in unsigned_evidence.items() if key != "domain"},
+                            "signature": signing_key.sign(canonical_json_bytes(unsigned_evidence)).hex(),
+                        },
+                    }
+                )
+                + b"\n"
+            )
+
+    thread = threading.Thread(target=serve)
+    thread.start()
+    try:
+        evidence = LauncherSocketSandbox(
+            socket_path,
+            "launcher",
+            signing_key.public_key().public_bytes_raw(),
+        ).prepare_finalization_child((sys.executable, "-c", "pass"))
+    finally:
+        thread.join(timeout=3)
+        listener.close()
+
+    assert evidence.pid == 124
+    assert evidence.pid_namespace_inode == 456
+    assert evidence.mount_namespace_inode == 789
+    assert evidence.fd_numbers == ()
+    assert observed == {
+        "schema_version": "v1",
+        "sandbox_identity": "launcher",
+        "operation": "prepare_finalization_child",
+        "argv": [sys.executable, "-c", "pass"],
+        "isolate_procfs": True,
+    }
+
+
+@pytest.mark.parametrize("signing_key", (None, Ed25519PrivateKey.generate()), ids=("unsigned", "wrong-key"))
+def test_sandbox_rejects_unsigned_or_wrong_peer_evidence(tmp_path: Path, signing_key: Ed25519PrivateKey | None) -> None:
+    socket_path = tmp_path / "launcher.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(1)
+    pinned_key = Ed25519PrivateKey.generate()
+
+    def serve() -> None:
+        connection, _ = listener.accept()
+        with connection:
+            connection.makefile("rb").readline()
+            unsigned_evidence = {
+                "domain": "auto-code-sandbox-child-evidence/v1",
+                "pid": 124,
+                "pid_namespace_inode": 456,
+                "mount_namespace_inode": 789,
+                "fd_numbers": [],
+            }
+            signature = "" if signing_key is None else signing_key.sign(canonical_json_bytes(unsigned_evidence)).hex()
+            connection.sendall(
+                canonical_json_bytes(
+                    {
+                        "child_id": "f" * 32,
+                        "evidence": {
+                            **{key: value for key, value in unsigned_evidence.items() if key != "domain"},
+                            "signature": signature,
+                        },
+                    }
+                )
+                + b"\n"
+            )
+
+    thread = threading.Thread(target=serve)
+    thread.start()
+    try:
+        sandbox = LauncherSocketSandbox(socket_path, "launcher", pinned_key.public_key().public_bytes_raw())
+        with pytest.raises(ProcessConfigurationError, match="Finalization child evidence is invalid"):
+            sandbox.prepare_finalization_child((sys.executable, "-c", "pass"))
+    finally:
+        thread.join(timeout=3)
+        listener.close()
 
 
 def test_runner_rejects_a_working_directory_symlink_to_authoritative_state(sandbox_policy: SandboxPolicy) -> None:

@@ -121,6 +121,15 @@ def _require_hash(value: object, description: str) -> str:
     return value
 
 
+def _require_public_key(value: object, description: str) -> bytes:
+    if not isinstance(value, str) or len(value) != 64:
+        raise ValueError(f"{description} is invalid")
+    try:
+        return bytes.fromhex(value)
+    except ValueError as error:
+        raise ValueError(f"{description} is invalid") from error
+
+
 def _require_nonnegative_int(value: object, description: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise ValueError(f"{description} is invalid")
@@ -194,7 +203,7 @@ def load_protected_bootstrap() -> _LauncherRuntime:
             "state_fd", "index_fd", "git_fd", "key_fd", "state_sha256", "index_sha256", "bridge_sha256",
             "git_sha256", "key_sha256", "bridge_transport_device", "bridge_transport_inode",
             "bridge_transport_peer_pid", "bridge_transport_peer_uid", "bridge_transport_peer_gid",
-            "finalization_public_key_hash", "finalization_parent", "sandbox_socket_path", "sandbox_identity", "signature",
+            "finalization_public_key_hash", "finalization_parent", "sandbox_socket_path", "sandbox_identity", "sandbox_public_key", "signature",
         }
         if set(config) != expected or config["domain"] != "auto-code-launcher-bootstrap/v1":
             raise ValueError
@@ -213,7 +222,11 @@ def load_protected_bootstrap() -> _LauncherRuntime:
             raise ValueError
         state_root = _require_path(config["state_root"], "state root")
         repository_root = _require_path(config["repository_root"], "repository root")
-        sandbox = LauncherSocketSandbox(Path(_require_path_value(config["sandbox_socket_path"], "sandbox socket")), _require_sandbox_identity(config["sandbox_identity"]))
+        sandbox = LauncherSocketSandbox(
+            Path(_require_path_value(config["sandbox_socket_path"], "sandbox socket")),
+            _require_sandbox_identity(config["sandbox_identity"]),
+            _require_public_key(config["sandbox_public_key"], "sandbox public key"),
+        )
         key_hash = _require_hash(config["finalization_public_key_hash"], "finalization public key hash")
         parent = FinalizationParentCapability.from_payload(config["finalization_parent"])
         parent.verify()

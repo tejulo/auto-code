@@ -14,10 +14,14 @@ from pathlib import Path
 import re
 import socket
 import stat
+import struct
 import subprocess
 import time
 from typing import Protocol
 import uuid
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from .contracts import EvidenceRef, sanitize_untrusted_text
 from .hashing import canonical_json_bytes
@@ -118,6 +122,17 @@ class SandboxCompleted:
 
 
 @dataclass(frozen=True, slots=True)
+class SandboxChildEvidence:
+    """Sandbox-signed observation of a child before finalization FD transfer."""
+
+    pid: int
+    pid_namespace_inode: int
+    mount_namespace_inode: int
+    fd_numbers: tuple[int, ...]
+    signature: str
+
+
+@dataclass(frozen=True, slots=True)
 class ObservedLauncherEffect:
     receipt_hash: str
     returncode: int
@@ -172,7 +187,7 @@ class Sandbox(Protocol):
 class LauncherSocketSandbox:
     """Delegate execution to the launcher-owned sandbox service over a pinned Unix socket."""
 
-    def __init__(self, socket_path: Path, identity: str) -> None:
+    def __init__(self, socket_path: Path, identity: str, evidence_public_key: bytes | None = None) -> None:
         path = Path(socket_path)
         if not path.is_absolute() or ".." in path.parts or not identity or len(identity) > 255:
             raise ProcessConfigurationError("Launcher sandbox configuration is invalid")
@@ -183,6 +198,49 @@ class LauncherSocketSandbox:
         self.identity = identity
         self._device = metadata.st_dev
         self._inode = metadata.st_ino
+        if evidence_public_key is not None:
+            if not isinstance(evidence_public_key, bytes) or len(evidence_public_key) != 32:
+                raise ProcessConfigurationError("Launcher sandbox evidence key is invalid")
+            try:
+                self._evidence_public_key = Ed25519PublicKey.from_public_bytes(evidence_public_key)
+            except ValueError as error:
+                raise ProcessConfigurationError("Launcher sandbox evidence key is invalid") from error
+        else:
+            self._evidence_public_key = None
+
+    def prepare_finalization_child(self, argv: tuple[str, ...]) -> SandboxChildEvidence:
+        """Require signed, empty-FD evidence before the launcher can transfer authority."""
+
+        if (
+            self._evidence_public_key is None
+            or not argv
+            or any(not isinstance(argument, str) or not argument for argument in argv)
+        ):
+            raise ProcessConfigurationError("Finalization child evidence is invalid")
+        try:
+            response = self._exchange(
+                {
+                    "schema_version": "v1",
+                    "sandbox_identity": self.identity,
+                    "operation": "prepare_finalization_child",
+                    "argv": list(argv),
+                    "isolate_procfs": True,
+                },
+                5.0,
+                require_peer_credentials=True,
+            )
+            if not isinstance(response, dict) or set(response) != {"child_id", "evidence"}:
+                raise ValueError
+            child_id = response["child_id"]
+            if not isinstance(child_id, str) or len(child_id) != 32 or any(character not in "0123456789abcdef" for character in child_id):
+                raise ValueError
+            evidence = _sandbox_child_evidence(response["evidence"])
+            if evidence.fd_numbers != ():
+                raise ValueError
+            self._evidence_public_key.verify(bytes.fromhex(evidence.signature), _sandbox_child_evidence_payload(evidence))
+            return evidence
+        except (InvalidSignature, OSError, TypeError, ValueError, ProcessConfigurationError) as error:
+            raise ProcessConfigurationError("Finalization child evidence is invalid") from error
 
     def run(
         self,
@@ -446,6 +504,7 @@ class LauncherSocketSandbox:
         executable_descriptor: int | None = None,
         executable_descriptors: tuple[int, ...] = (),
         descriptors: tuple[int, ...] = (),
+        require_peer_credentials: bool = False,
     ) -> object:
         metadata = os.lstat(self.socket_path)
         if not stat.S_ISSOCK(metadata.st_mode) or (metadata.st_dev, metadata.st_ino) != (self._device, self._inode):
@@ -454,6 +513,8 @@ class LauncherSocketSandbox:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as transport:
             transport.settimeout(timeout)
             transport.connect(str(self.socket_path))
+            if require_peer_credentials:
+                self._require_peer_credentials(transport)
             descriptors_to_send = (
                 descriptors or executable_descriptors
                 if executable_descriptor is None
@@ -481,6 +542,16 @@ class LauncherSocketSandbox:
             return json.loads(response.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ProcessConfigurationError("Launcher sandbox response is invalid") from error
+
+    @staticmethod
+    def _require_peer_credentials(transport: socket.socket) -> None:
+        try:
+            credentials = transport.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+            peer_pid, peer_uid, _ = struct.unpack("3i", credentials)
+        except (OSError, struct.error) as error:
+            raise ProcessConfigurationError("Launcher sandbox peer is invalid") from error
+        if peer_pid < 1 or peer_uid != os.geteuid():
+            raise ProcessConfigurationError("Launcher sandbox peer is invalid")
 
     def start(self, *args: object, **kwargs: object) -> ProcessHandle:
         raise SandboxStartError()
@@ -521,6 +592,51 @@ def _finalization_returncode(response: object, *, complete: bool) -> int | None:
     if isinstance(returncode, bool) or not isinstance(returncode, int):
         raise ProcessConfigurationError("Finalization child result is invalid")
     return returncode
+
+
+def _sandbox_child_evidence(value: object) -> SandboxChildEvidence:
+    if not isinstance(value, dict) or set(value) != {
+        "pid",
+        "pid_namespace_inode",
+        "mount_namespace_inode",
+        "fd_numbers",
+        "signature",
+    }:
+        raise ValueError
+    numbers = value["fd_numbers"]
+    if not isinstance(numbers, list) or any(
+        not isinstance(number, int) or isinstance(number, bool) or number < 0 for number in numbers
+    ):
+        raise ValueError
+    evidence = SandboxChildEvidence(
+        pid=value["pid"],
+        pid_namespace_inode=value["pid_namespace_inode"],
+        mount_namespace_inode=value["mount_namespace_inode"],
+        fd_numbers=tuple(numbers),
+        signature=value["signature"],
+    )
+    if (
+        any(
+            not isinstance(number, int) or isinstance(number, bool) or number < 1
+            for number in (evidence.pid, evidence.pid_namespace_inode, evidence.mount_namespace_inode)
+        )
+        or len(evidence.signature) != 128
+        or any(character not in "0123456789abcdef" for character in evidence.signature)
+    ):
+        raise ValueError
+    return evidence
+
+
+def _sandbox_child_evidence_payload(evidence: SandboxChildEvidence) -> bytes:
+    return canonical_json_bytes(
+        {
+            "domain": "auto-code-sandbox-child-evidence/v1",
+            "pid": evidence.pid,
+            "pid_namespace_inode": evidence.pid_namespace_inode,
+            "mount_namespace_inode": evidence.mount_namespace_inode,
+            "fd_numbers": list(evidence.fd_numbers),
+        }
+    )
 
 
 class FilesystemEvidenceSink:
