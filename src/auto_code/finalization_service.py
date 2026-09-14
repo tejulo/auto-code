@@ -718,8 +718,10 @@ class _LauncherFinalizationServiceInternal:
             if record["status"] != "issued":
                 raise FinalizationServiceError("capability is replayed")
             _atomic_replace_json(self._record_path(request.nonce), {"descriptor": descriptor.payload(), "status": "consumed", "response": None})
-        result = self._dispatch_handler(request)
-        response = self._response(request, result=result, error=None)
+        try:
+            response = self._response(request, result=self._dispatch_handler(request), error=None)
+        except Exception:
+            response = self._response(request, result=None, error="rejected")
         with _interprocess_lock(self._record_root / "lock"):
             _atomic_replace_json(self._record_path(request.nonce), {"descriptor": descriptor.payload(), "status": "completed", "response": response.payload()})
         return response

@@ -11,12 +11,14 @@ import fcntl
 import hashlib
 import hmac
 import json
+import math
 import os
 from pathlib import Path
 import socket
 import stat
 import struct
 import sys
+import time
 from typing import Sequence
 import uuid
 
@@ -170,17 +172,37 @@ class _ProtectedBridgeClient:
         self._transport = transport
         self._server_identity = server_identity
 
-    def call(self, server_identity: str, tool_name: str, arguments: object) -> McpToolResult:
+    def call(self, server_identity: str, tool_name: str, arguments: object, *, deadline: float | None = None) -> McpToolResult:
         if server_identity != self._server_identity or not isinstance(tool_name, str):
             raise RuntimeError("bridge request is invalid")
+        if deadline is None:
+            deadline = time.monotonic() + 5.0
+        if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) or not math.isfinite(deadline):
+            raise RuntimeError("bridge deadline is invalid")
+
+        def remaining() -> float:
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                raise RuntimeError("bridge response is unavailable")
+            return timeout
+
         request = canonical_json_bytes(
             {"domain": "auto-code-launcher-bridge-request/v1", "server_identity": server_identity, "tool_name": tool_name, "arguments": arguments}
         ) + b"\n"
-        self._transport.sendall(request)
-        response = self._transport.makefile("rb", closefd=False).readline(_MAX_BOOTSTRAP_BYTES + 1)
+        try:
+            self._transport.settimeout(remaining())
+            self._transport.sendall(request)
+            self._transport.settimeout(remaining())
+            with self._transport.makefile("rb") as response_stream:
+                response = response_stream.readline(_MAX_BOOTSTRAP_BYTES + 1)
+        except OSError as error:
+            raise RuntimeError("bridge response is unavailable") from error
         if len(response) > _MAX_BOOTSTRAP_BYTES:
             raise RuntimeError("bridge response is invalid")
-        payload = json.loads(response.decode("ascii"), object_pairs_hook=_reject_duplicate_json_keys)
+        try:
+            payload = json.loads(response.decode("ascii"), object_pairs_hook=_reject_duplicate_json_keys)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            raise RuntimeError("bridge response is invalid") from error
         if not isinstance(payload, dict) or set(payload) != {"tool_call_id", "result", "external_revision", "observed_state_id", "outcome", "observations"}:
             raise RuntimeError("bridge response is invalid")
         return McpToolResult(

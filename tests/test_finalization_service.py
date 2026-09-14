@@ -249,6 +249,31 @@ def test_descriptor_nonce_is_single_use(service: FinalizationService, handlers: 
     assert handlers.calls == [("finalize", "run-1", 3, "a" * 64, None)]
 
 
+def test_handler_failure_completes_nonce_with_replayable_signed_error(tmp_path: Path) -> None:
+    """Leaving a failed handler's nonce consumed would make the request unrecoverable."""
+
+    calls: list[FinalizationRequest] = []
+
+    def fail(request: FinalizationRequest) -> StepResult:
+        calls.append(request)
+        raise RuntimeError("bridge transport rejected the response")
+
+    service = FinalizationService(
+        signing_key=Ed25519PrivateKey.generate(),
+        state_root=tmp_path / "state",
+        handlers=FinalizationHandlers(finalize=fail, receipt=fail),
+    )
+    issued = descriptor(service, tmp_path / "launcher.sock")
+
+    first = service.dispatch(issued.request())
+
+    first.verify(issued, trust(service))
+    assert first.result is None
+    assert first.error == "rejected"
+    assert service.dispatch(issued.request()) == first
+    assert calls == [issued.request()]
+
+
 def test_receipt_capability_binds_its_request_id(service: FinalizationService, handlers: RecordingHandlers, tmp_path: Path) -> None:
     """Omitting the receipt correlation ID would let another bridge receipt be consumed."""
 
