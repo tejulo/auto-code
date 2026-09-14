@@ -275,7 +275,7 @@ def test_launcher_prepares_verified_child_before_transferring_finalization_capab
         def transfer_finalization_fds(self, capability_fds: tuple[int, int, int]) -> SandboxChildEvidence:
             assert tuple(os.pread(descriptor, 1, 0) for descriptor in capability_fds) == (b"{", b"{", b"{")
             actions.append("transfer")
-            return SandboxChildEvidence("f" * 32, "e" * 64, 124, 456, 789, (0, 1, 2, 4, 5, 6), "0" * 128)
+            return SandboxChildEvidence("f" * 32, "e" * 64, 124, 456, 789, (0, 1, 2, 4, 5, 6), "denied", "0" * 128)
 
         def poll(self) -> int | None:
             return None
@@ -320,6 +320,60 @@ def test_launcher_prepares_verified_child_before_transferring_finalization_capab
     assert actions == ["prepare", "transfer", "serve", "wait"]
 
 
+def test_launcher_rejects_post_transfer_evidence_without_bootstrap_fd_access_denial(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Serving a child that can open bootstrap FD 8 would expose launcher authority."""
+
+    _, generation = _persisted_run(tmp_path)
+    actions: list[str] = []
+
+    class PreparedChild:
+        pid = 124
+
+        def transfer_finalization_fds(self, capability_fds: tuple[int, int, int]) -> SandboxChildEvidence:
+            actions.append("transfer")
+            return SandboxChildEvidence("f" * 32, "e" * 64, 124, 456, 789, (0, 1, 2, 4, 5, 6), "opened", "0" * 128)
+
+        def wait(self, timeout: float | None = None) -> SandboxCompleted:
+            actions.append("wait")
+            return SandboxCompleted(-9)
+
+        def terminate_group(self) -> None:
+            actions.append("terminate")
+
+        def kill_group(self) -> None:
+            actions.append("kill")
+
+    class SequencedSandbox(LauncherSocketSandbox):
+        def __init__(self) -> None:
+            pass
+
+        def prepare_finalization_child(self, argv: tuple[str, ...]) -> PreparedChild:
+            return PreparedChild()
+
+    monkeypatch.setattr(
+        _LauncherFinalizationServiceInternal,
+        "serve_once",
+        lambda self, listener: actions.append("serve"),
+    )
+    runtime = replace(
+        _runtime(tmp_path, ActiveIndexHarness(tmp_path)),
+        sandbox=SequencedSandbox(),
+    )
+
+    with pytest.raises(FinalizationLauncherError, match="lifecycle"):
+        FinalizationLauncher(runtime).serve_ticket_process(
+            "run-1",
+            generation.revision,
+            generation.state_hash,
+            (sys.executable, "-c", "pass"),
+        )
+
+    assert actions == ["transfer", "kill", "wait"]
+
+
 def test_launcher_kills_child_when_post_transfer_evidence_is_not_only_456(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -332,7 +386,7 @@ def test_launcher_kills_child_when_post_transfer_evidence_is_not_only_456(
 
         def transfer_finalization_fds(self, capability_fds: tuple[int, int, int]) -> SandboxChildEvidence:
             actions.append("transfer")
-            return SandboxChildEvidence("f" * 32, "e" * 64, 124, 456, 789, (0, 1, 2, 4, 5), "0" * 128)
+            return SandboxChildEvidence("f" * 32, "e" * 64, 124, 456, 789, (0, 1, 2, 4, 5), "denied", "0" * 128)
 
         def wait(self, timeout: float | None = None) -> SandboxCompleted:
             actions.append("wait")
@@ -383,7 +437,7 @@ def test_launcher_reaps_child_and_reports_kill_failure_after_invalid_post_transf
 
         def transfer_finalization_fds(self, capability_fds: tuple[int, int, int]) -> SandboxChildEvidence:
             actions.append("transfer")
-            return SandboxChildEvidence("f" * 32, "e" * 64, 124, 456, 789, (0, 1, 2, 4, 5), "0" * 128)
+            return SandboxChildEvidence("f" * 32, "e" * 64, 124, 456, 789, (0, 1, 2, 4, 5), "denied", "0" * 128)
 
         def wait(self, timeout: float | None = None) -> SandboxCompleted:
             actions.append("wait")
@@ -429,7 +483,7 @@ def test_launcher_reports_both_cleanup_failures_after_invalid_post_transfer_evid
 
         def transfer_finalization_fds(self, capability_fds: tuple[int, int, int]) -> SandboxChildEvidence:
             actions.append("transfer")
-            return SandboxChildEvidence("f" * 32, "e" * 64, 124, 456, 789, (0, 1, 2, 4, 5), "0" * 128)
+            return SandboxChildEvidence("f" * 32, "e" * 64, 124, 456, 789, (0, 1, 2, 4, 5), "denied", "0" * 128)
 
         def wait(self, timeout: float | None = None) -> SandboxCompleted:
             actions.append("wait")
@@ -707,6 +761,7 @@ def _installed_launcher_result(
                                 "pid_namespace_inode": 456,
                                 "mount_namespace_inode": 789,
                                 "fd_numbers": [],
+                                "bootstrap_fd_access": "denied",
                             }
                             connection.sendall(
                                 canonical_json_bytes(

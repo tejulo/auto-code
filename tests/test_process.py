@@ -527,7 +527,13 @@ def test_sandbox_exposes_no_authority_first_finalization_start(tmp_path: Path) -
     assert not hasattr(sandbox, "start_finalization_child")
 
 
-def test_sandbox_prepares_a_child_only_after_verifying_signed_evidence(tmp_path: Path) -> None:
+@pytest.mark.parametrize("bootstrap_fd_access", ("denied", "opened"), ids=("denied", "opened"))
+def test_isolated_child_procfs_probe_requires_signed_denial(
+    tmp_path: Path,
+    bootstrap_fd_access: str,
+) -> None:
+    """A signed child probe must prove the parent bootstrap FD was inaccessible."""
+
     socket_path = tmp_path / "launcher.sock"
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(socket_path))
@@ -550,6 +556,7 @@ def test_sandbox_prepares_a_child_only_after_verifying_signed_evidence(tmp_path:
                 "pid_namespace_inode": 456,
                 "mount_namespace_inode": 789,
                 "fd_numbers": [],
+                "bootstrap_fd_access": bootstrap_fd_access,
             }
             connection.sendall(
                 canonical_json_bytes(
@@ -567,15 +574,29 @@ def test_sandbox_prepares_a_child_only_after_verifying_signed_evidence(tmp_path:
                 )
                 + b"\n"
             )
+        listener.settimeout(1)
+        for operation, response in (
+            ("kill_finalization_child", {}),
+            ("wait_finalization_child", {"returncode": -9, "stdout": "", "stderr": ""}),
+        ):
+            try:
+                cleanup, _ = listener.accept()
+            except TimeoutError:
+                return
+            with cleanup:
+                cleanup_request = json.loads(cleanup.makefile("rb").readline())
+                assert cleanup_request["operation"] == operation
+                cleanup.sendall(canonical_json_bytes(response) + b"\n")
 
     thread = threading.Thread(target=serve)
     thread.start()
     try:
-        child = LauncherSocketSandbox(
-            socket_path,
-            "launcher",
-            signing_key.public_key().public_bytes_raw(),
-        ).prepare_finalization_child((sys.executable, "-c", "pass"))
+        sandbox = LauncherSocketSandbox(socket_path, "launcher", signing_key.public_key().public_bytes_raw())
+        if bootstrap_fd_access != "denied":
+            with pytest.raises(ProcessConfigurationError, match="Finalization child evidence is invalid"):
+                sandbox.prepare_finalization_child((sys.executable, "-c", "pass"))
+            return
+        child = sandbox.prepare_finalization_child((sys.executable, "-c", "pass"))
     finally:
         thread.join(timeout=3)
         listener.close()
@@ -588,6 +609,7 @@ def test_sandbox_prepares_a_child_only_after_verifying_signed_evidence(tmp_path:
     assert evidence.pid_namespace_inode == 456
     assert evidence.mount_namespace_inode == 789
     assert evidence.fd_numbers == ()
+    assert evidence.bootstrap_fd_access == "denied"
     assert observed == {
         "schema_version": "v1",
         "sandbox_identity": "launcher",
@@ -625,6 +647,7 @@ def test_sandbox_returns_signed_post_transfer_evidence_for_only_456(
                 "pid_namespace_inode": 456,
                 "mount_namespace_inode": 789,
                 "fd_numbers": [],
+                "bootstrap_fd_access": "denied",
             }
             connection.sendall(
                 canonical_json_bytes(
@@ -663,6 +686,7 @@ def test_sandbox_returns_signed_post_transfer_evidence_for_only_456(
                 "pid_namespace_inode": 456,
                 "mount_namespace_inode": 789,
                 "fd_numbers": [0, 1, 2, 4, 5, 6],
+                "bootstrap_fd_access": "denied",
             }
             connection.sendall(
                 canonical_json_bytes(
@@ -736,6 +760,7 @@ def test_sandbox_rejects_forged_post_transfer_evidence(tmp_path: Path, cleanup_f
                 "pid_namespace_inode": 456,
                 "mount_namespace_inode": 789,
                 "fd_numbers": [],
+                "bootstrap_fd_access": "denied",
             }
             connection.sendall(
                 canonical_json_bytes(
@@ -832,6 +857,7 @@ def test_sandbox_rejects_unsigned_or_wrong_peer_evidence(tmp_path: Path, signing
                 "pid_namespace_inode": 456,
                 "mount_namespace_inode": 789,
                 "fd_numbers": [],
+                "bootstrap_fd_access": "denied",
             }
             signature = "" if signing_key is None else signing_key.sign(canonical_json_bytes(unsigned_evidence)).hex()
             connection.sendall(
@@ -901,6 +927,7 @@ def test_invalid_preparation_evidence_cleanup_kills_and_reaps_returned_child(
                 "pid_namespace_inode": 456,
                 "mount_namespace_inode": 789,
                 "fd_numbers": [],
+                "bootstrap_fd_access": "denied",
             }
             response: dict[str, object] = {"child_id": child_id}
             if evidence_kind == "forged":
@@ -981,6 +1008,7 @@ def test_sandbox_rejects_evidence_not_bound_to_the_exact_preparation(
                 "pid_namespace_inode": 456,
                 "mount_namespace_inode": 789,
                 "fd_numbers": fd_numbers,
+                "bootstrap_fd_access": "denied",
             }
             connection.sendall(
                 canonical_json_bytes(

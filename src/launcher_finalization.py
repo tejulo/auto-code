@@ -268,7 +268,11 @@ class FinalizationLauncher:
                 _sealed_descriptor(binding.to_bytes()),
             ]
             post_transfer_evidence = process.transfer_finalization_fds((descriptors[0], descriptors[1], descriptors[2]))
-            if not isinstance(post_transfer_evidence, SandboxChildEvidence) or post_transfer_evidence.fd_numbers != (0, 1, 2, 4, 5, 6):
+            if (
+                not isinstance(post_transfer_evidence, SandboxChildEvidence)
+                or post_transfer_evidence.fd_numbers != (0, 1, 2, 4, 5, 6)
+                or post_transfer_evidence.bootstrap_fd_access != "denied"
+            ):
                 raise FinalizationLauncherError("finalization child post-transfer evidence is invalid")
             service._peer_pid = process.pid
             service.serve_once(listener)

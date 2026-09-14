@@ -18,7 +18,7 @@ import stat
 import struct
 import subprocess
 import time
-from typing import Protocol
+from typing import Literal, Protocol, cast
 import uuid
 
 from cryptography.exceptions import InvalidSignature
@@ -136,6 +136,7 @@ class SandboxChildEvidence:
     pid_namespace_inode: int
     mount_namespace_inode: int
     fd_numbers: tuple[int, ...]
+    bootstrap_fd_access: Literal["denied"]
     signature: str
 
 
@@ -248,7 +249,12 @@ class LauncherSocketSandbox:
             if set(response) != {"child_id", "evidence"}:
                 raise ValueError
             evidence = _sandbox_child_evidence(response["evidence"])
-            if evidence.child_id != child_id or evidence.challenge != challenge or evidence.fd_numbers != ():
+            if (
+                evidence.child_id != child_id
+                or evidence.challenge != challenge
+                or evidence.fd_numbers != ()
+                or evidence.bootstrap_fd_access != "denied"
+            ):
                 raise ValueError
             self._evidence_public_key.verify(
                 bytes.fromhex(evidence.signature),
@@ -612,6 +618,7 @@ class SandboxChildHandle:
                 or evidence.pid_namespace_inode != self.evidence.pid_namespace_inode
                 or evidence.mount_namespace_inode != self.evidence.mount_namespace_inode
                 or evidence.fd_numbers != (0, 1, 2, 4, 5, 6)
+                or evidence.bootstrap_fd_access != "denied"
             ):
                 raise ValueError
             if self.sandbox._evidence_public_key is None:
@@ -685,6 +692,7 @@ def _sandbox_child_evidence(value: object) -> SandboxChildEvidence:
         "pid_namespace_inode",
         "mount_namespace_inode",
         "fd_numbers",
+        "bootstrap_fd_access",
         "signature",
     }:
         raise ValueError
@@ -700,6 +708,7 @@ def _sandbox_child_evidence(value: object) -> SandboxChildEvidence:
         pid_namespace_inode=value["pid_namespace_inode"],
         mount_namespace_inode=value["mount_namespace_inode"],
         fd_numbers=tuple(numbers),
+        bootstrap_fd_access=cast(Literal["denied"], value["bootstrap_fd_access"]),
         signature=value["signature"],
     )
     if (
@@ -713,6 +722,7 @@ def _sandbox_child_evidence(value: object) -> SandboxChildEvidence:
             not isinstance(number, int) or isinstance(number, bool) or number < 1
             for number in (evidence.pid, evidence.pid_namespace_inode, evidence.mount_namespace_inode)
         )
+        or not isinstance(evidence.bootstrap_fd_access, str)
         or len(evidence.signature) != 128
         or any(character not in "0123456789abcdef" for character in evidence.signature)
     ):
@@ -731,6 +741,7 @@ def _sandbox_child_evidence_payload(evidence: SandboxChildEvidence, sandbox_iden
             "pid_namespace_inode": evidence.pid_namespace_inode,
             "mount_namespace_inode": evidence.mount_namespace_inode,
             "fd_numbers": list(evidence.fd_numbers),
+            "bootstrap_fd_access": evidence.bootstrap_fd_access,
         }
     )
 
