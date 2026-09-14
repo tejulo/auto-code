@@ -13,15 +13,16 @@ The installed launcher uses the existing launcher-owned sandbox to run the ticke
 
 The launcher composes `GitGuard` with a protected `ProcessGitExecutor` and verified sandbox capability. The finalization bridge has one total deadline covering request write and response read. When a timeout occurs after the nonce becomes consumed, the launcher writes a signed terminal error response, allowing later invocation of the same nonce to replay that result without a second effect.
 
-## Process Boundary
+## Verified Process Boundary
 
 1. The privileged launcher validates bootstrap capabilities and retains state, index, bridge transport, Git executor, and finalization key in memory.
-2. It asks the launcher sandbox to start the ticket command under procfs/PID isolation.
-3. The sandboxed child receives only finalization FDs 4-6 and identifier arguments.
-4. The launcher validates the child peer and serves one request.
-5. The child cannot enumerate or open bootstrap FDs through `/proc/$PPID/fd` or equivalent parent-process paths.
+2. It authenticates the launcher sandbox with pinned socket identity, `SO_PEERCRED`, and a bootstrap-anchored response signature.
+3. The sandbox creates the child PID/mount namespace without finalization capability FDs and returns signed namespace inode and observed-FD-table evidence.
+4. The launcher verifies that evidence, including inability to open the launcher's FD 8 through procfs.
+5. Only then does the launcher send FDs 4-6 with `SCM_RIGHTS`; the sandbox returns signed final FD-table evidence.
+6. The launcher validates the child peer and serves one request.
 
-Failure to establish the isolated child boundary fails closed before issuing a capability.
+Failure to authenticate the sandbox, verify either evidence record, or transfer exactly FDs 4-6 kills the child and fails closed before capability use.
 
 ## Git Composition
 
@@ -33,7 +34,7 @@ Bridge I/O uses the descriptor-configured total deadline. Both send and receive 
 
 ## Verification
 
-- A sandboxed ticket child cannot read the launcher's bootstrap/key FD through procfs.
+- A sandboxed ticket child cannot read the launcher's bootstrap/key FD through procfs, as proven by signed child-observed evidence.
 - A missing or unsuitable sandbox boundary rejects finalization before child startup.
 - A valid finalization invokes the protected Git executor after all approved constraints hold.
 - Stalled bridge write/read observes the total deadline and creates one durable signed response.
