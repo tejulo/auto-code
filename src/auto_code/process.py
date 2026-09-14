@@ -12,6 +12,7 @@ import math
 import os
 from pathlib import Path
 import re
+import secrets
 import socket
 import stat
 import struct
@@ -125,6 +126,8 @@ class SandboxCompleted:
 class SandboxChildEvidence:
     """Sandbox-signed observation of a child before finalization FD transfer."""
 
+    child_id: str
+    challenge: str
     pid: int
     pid_namespace_inode: int
     mount_namespace_inode: int
@@ -208,7 +211,7 @@ class LauncherSocketSandbox:
         else:
             self._evidence_public_key = None
 
-    def prepare_finalization_child(self, argv: tuple[str, ...]) -> SandboxChildEvidence:
+    def prepare_finalization_child(self, argv: tuple[str, ...]) -> SandboxChildHandle:
         """Require signed, empty-FD evidence before the launcher can transfer authority."""
 
         if (
@@ -217,17 +220,20 @@ class LauncherSocketSandbox:
             or any(not isinstance(argument, str) or not argument for argument in argv)
         ):
             raise ProcessConfigurationError("Finalization child evidence is invalid")
+        transport: socket.socket | None = None
         try:
-            response = self._exchange(
+            challenge = secrets.token_hex(32)
+            transport = self._connect(5.0, require_peer_credentials=True)
+            response = self._exchange_on_transport(
+                transport,
                 {
                     "schema_version": "v1",
                     "sandbox_identity": self.identity,
                     "operation": "prepare_finalization_child",
                     "argv": list(argv),
                     "isolate_procfs": True,
+                    "challenge": challenge,
                 },
-                5.0,
-                require_peer_credentials=True,
             )
             if not isinstance(response, dict) or set(response) != {"child_id", "evidence"}:
                 raise ValueError
@@ -235,11 +241,16 @@ class LauncherSocketSandbox:
             if not isinstance(child_id, str) or len(child_id) != 32 or any(character not in "0123456789abcdef" for character in child_id):
                 raise ValueError
             evidence = _sandbox_child_evidence(response["evidence"])
-            if evidence.fd_numbers != ():
+            if evidence.child_id != child_id or evidence.challenge != challenge or evidence.fd_numbers != ():
                 raise ValueError
-            self._evidence_public_key.verify(bytes.fromhex(evidence.signature), _sandbox_child_evidence_payload(evidence))
-            return evidence
+            self._evidence_public_key.verify(
+                bytes.fromhex(evidence.signature),
+                _sandbox_child_evidence_payload(evidence, self.identity),
+            )
+            return SandboxChildHandle(self, evidence, transport)
         except (InvalidSignature, OSError, TypeError, ValueError, ProcessConfigurationError) as error:
+            if transport is not None:
+                transport.close()
             raise ProcessConfigurationError("Finalization child evidence is invalid") from error
 
     def run(
@@ -450,52 +461,6 @@ class LauncherSocketSandbox:
             5.0 if timeout is None else _positive_timeout(timeout),
         )
 
-    def start_finalization_child(
-        self,
-        argv: tuple[str, ...],
-        *,
-        capability_fds: tuple[int, int, int],
-        isolate_procfs: bool,
-    ) -> _LauncherSocketFinalizationHandle:
-        """Start a ticket only when the launcher sandbox attests PID/procfs isolation."""
-
-        if (
-            not isolate_procfs
-            or not argv
-            or any(not isinstance(argument, str) or not argument for argument in argv)
-            or len(capability_fds) != 3
-            or any(not isinstance(descriptor, int) or descriptor < 0 for descriptor in capability_fds)
-        ):
-            raise ProcessConfigurationError("Finalization child configuration is invalid")
-        try:
-            response = self._exchange(
-                {
-                    "schema_version": "v1",
-                    "sandbox_identity": self.identity,
-                    "operation": "start_finalization_child",
-                    "argv": list(argv),
-                    "capability_fd_targets": [4, 5, 6],
-                    "isolate_procfs": True,
-                },
-                5.0,
-                descriptors=capability_fds,
-            )
-            if (
-                not isinstance(response, dict)
-                or set(response) != {"child_id", "pid", "procfs_pid_isolated"}
-                or not isinstance(response["child_id"], str)
-                or len(response["child_id"]) != 32
-                or any(character not in "0123456789abcdef" for character in response["child_id"])
-                or isinstance(response["pid"], bool)
-                or not isinstance(response["pid"], int)
-                or response["pid"] < 1
-                or response["procfs_pid_isolated"] is not True
-            ):
-                raise ValueError
-        except (OSError, ValueError, ProcessConfigurationError) as error:
-            raise ProcessConfigurationError("Finalization child isolation is unavailable") from error
-        return _LauncherSocketFinalizationHandle(self, response["child_id"], response["pid"])
-
     def _exchange(
         self,
         request: Mapping[str, object],
@@ -506,38 +471,55 @@ class LauncherSocketSandbox:
         descriptors: tuple[int, ...] = (),
         require_peer_credentials: bool = False,
     ) -> object:
+        descriptors_to_send = (
+            descriptors or executable_descriptors
+            if executable_descriptor is None
+            else (executable_descriptor, *executable_descriptors, *descriptors)
+        )
+        with self._connect(timeout, require_peer_credentials=require_peer_credentials) as transport:
+            return self._exchange_on_transport(transport, request, descriptors=descriptors_to_send)
+
+    def _connect(self, timeout: float, *, require_peer_credentials: bool) -> socket.socket:
         metadata = os.lstat(self.socket_path)
         if not stat.S_ISSOCK(metadata.st_mode) or (metadata.st_dev, metadata.st_ino) != (self._device, self._inode):
             raise ProcessConfigurationError("Launcher sandbox socket identity changed")
-        raw = canonical_json_bytes(request) + b"\n"
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as transport:
+        transport = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
             transport.settimeout(timeout)
             transport.connect(str(self.socket_path))
             if require_peer_credentials:
                 self._require_peer_credentials(transport)
-            descriptors_to_send = (
-                descriptors or executable_descriptors
-                if executable_descriptor is None
-                else (executable_descriptor, *executable_descriptors, *descriptors)
+            return transport
+        except BaseException:
+            transport.close()
+            raise
+
+    @staticmethod
+    def _exchange_on_transport(
+        transport: socket.socket,
+        request: Mapping[str, object],
+        *,
+        descriptors: tuple[int, ...] = (),
+    ) -> object:
+        raw = canonical_json_bytes(request) + b"\n"
+        if not descriptors:
+            transport.sendall(raw)
+        else:
+            descriptor_array = array.array("i", descriptors)
+            sent = transport.sendmsg(
+                (raw,),
+                ((socket.SOL_SOCKET, socket.SCM_RIGHTS, descriptor_array),),
             )
-            if not descriptors_to_send:
-                transport.sendall(raw)
-            else:
-                descriptors = array.array("i", descriptors_to_send)
-                sent = transport.sendmsg(
-                    (raw,),
-                    ((socket.SOL_SOCKET, socket.SCM_RIGHTS, descriptors),),
-                )
-                if sent < len(raw):
-                    transport.sendall(raw[sent:])
-            response = b""
-            while not response.endswith(b"\n"):
-                chunk = transport.recv(65_536)
-                if not chunk:
-                    break
-                response += chunk
-                if len(response) > 1_048_576:
-                    raise ProcessConfigurationError("Launcher sandbox response is too large")
+            if sent < len(raw):
+                transport.sendall(raw[sent:])
+        response = b""
+        while not response.endswith(b"\n"):
+            chunk = transport.recv(65_536)
+            if not chunk:
+                break
+            response += chunk
+            if len(response) > 1_048_576:
+                raise ProcessConfigurationError("Launcher sandbox response is too large")
         try:
             return json.loads(response.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -557,13 +539,54 @@ class LauncherSocketSandbox:
         raise SandboxStartError()
 
 
-@dataclass(frozen=True, slots=True)
-class _LauncherSocketFinalizationHandle:
+@dataclass(slots=True)
+class SandboxChildHandle:
     """Remote process control remains with the trusted launcher sandbox."""
 
     sandbox: LauncherSocketSandbox
-    child_id: str
-    pid: int
+    evidence: SandboxChildEvidence
+    _transport: socket.socket = field(repr=False)
+    _transferred: bool = field(default=False, init=False, repr=False)
+
+    @property
+    def child_id(self) -> str:
+        return self.evidence.child_id
+
+    @property
+    def pid(self) -> int:
+        return self.evidence.pid
+
+    def transfer_finalization_fds(self, capability_fds: tuple[int, int, int]) -> None:
+        if (
+            self._transferred
+            or len(capability_fds) != 3
+            or any(not isinstance(descriptor, int) or descriptor < 0 for descriptor in capability_fds)
+        ):
+            raise ProcessConfigurationError("Finalization capability transfer is invalid")
+        try:
+            response = self.sandbox._exchange_on_transport(
+                self._transport,
+                {
+                    "schema_version": "v1",
+                    "sandbox_identity": self.sandbox.identity,
+                    "operation": "transfer_finalization_fds",
+                    "child_id": self.child_id,
+                    "challenge": self.evidence.challenge,
+                    "capability_fd_targets": [4, 5, 6],
+                },
+                descriptors=capability_fds,
+            )
+            if response != {
+                "child_id": self.child_id,
+                "challenge": self.evidence.challenge,
+                "capability_fds_transferred": True,
+            }:
+                raise ValueError
+            self._transferred = True
+        except (OSError, ValueError, ProcessConfigurationError) as error:
+            raise ProcessConfigurationError("Finalization capability transfer failed") from error
+        finally:
+            self._transport.close()
 
     def poll(self) -> int | None:
         response = self.sandbox._finalization_child_request("poll_finalization_child", self.child_id, 5.0)
@@ -596,6 +619,8 @@ def _finalization_returncode(response: object, *, complete: bool) -> int | None:
 
 def _sandbox_child_evidence(value: object) -> SandboxChildEvidence:
     if not isinstance(value, dict) or set(value) != {
+        "child_id",
+        "challenge",
         "pid",
         "pid_namespace_inode",
         "mount_namespace_inode",
@@ -609,6 +634,8 @@ def _sandbox_child_evidence(value: object) -> SandboxChildEvidence:
     ):
         raise ValueError
     evidence = SandboxChildEvidence(
+        child_id=value["child_id"],
+        challenge=value["challenge"],
         pid=value["pid"],
         pid_namespace_inode=value["pid_namespace_inode"],
         mount_namespace_inode=value["mount_namespace_inode"],
@@ -616,7 +643,13 @@ def _sandbox_child_evidence(value: object) -> SandboxChildEvidence:
         signature=value["signature"],
     )
     if (
-        any(
+        not isinstance(evidence.child_id, str)
+        or len(evidence.child_id) != 32
+        or any(character not in "0123456789abcdef" for character in evidence.child_id)
+        or not isinstance(evidence.challenge, str)
+        or len(evidence.challenge) != 64
+        or any(character not in "0123456789abcdef" for character in evidence.challenge)
+        or any(
             not isinstance(number, int) or isinstance(number, bool) or number < 1
             for number in (evidence.pid, evidence.pid_namespace_inode, evidence.mount_namespace_inode)
         )
@@ -627,10 +660,13 @@ def _sandbox_child_evidence(value: object) -> SandboxChildEvidence:
     return evidence
 
 
-def _sandbox_child_evidence_payload(evidence: SandboxChildEvidence) -> bytes:
+def _sandbox_child_evidence_payload(evidence: SandboxChildEvidence, sandbox_identity: str) -> bytes:
     return canonical_json_bytes(
         {
             "domain": "auto-code-sandbox-child-evidence/v1",
+            "sandbox_identity": sandbox_identity,
+            "challenge": evidence.challenge,
+            "child_id": evidence.child_id,
             "pid": evidence.pid,
             "pid_namespace_inode": evidence.pid_namespace_inode,
             "mount_namespace_inode": evidence.mount_namespace_inode,

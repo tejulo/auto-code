@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 import json
 import os
@@ -33,8 +34,13 @@ from launcher_finalization import (
     FinalizationLauncherError,
     _LauncherRuntime as FinalizationLauncherRuntime,
 )
-from auto_code.finalization_service import FinalizationCapabilityError, FinalizationParentCapability
+from auto_code.finalization_service import (
+    FinalizationCapabilityError,
+    FinalizationParentCapability,
+    _LauncherFinalizationServiceInternal,
+)
 from auto_code.prepare import PreparationContext, PreparationContextAuthority
+from auto_code.process import LauncherSocketSandbox, SandboxCompleted
 from auto_code.state import EMPTY_STATE_HASH, RunStateStore
 
 
@@ -244,6 +250,63 @@ def test_ticket_child_cannot_start_without_a_procfs_isolated_launcher_sandbox(tm
         os.close(descriptor)
 
     assert not marker.exists()
+
+
+def test_launcher_prepares_verified_child_before_transferring_finalization_capabilities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, generation = _persisted_run(tmp_path)
+    actions: list[str] = []
+
+    class PreparedChild:
+        pid = 124
+
+        def transfer_finalization_fds(self, capability_fds: tuple[int, int, int]) -> None:
+            assert tuple(os.pread(descriptor, 1, 0) for descriptor in capability_fds) == (b"{", b"{", b"{")
+            actions.append("transfer")
+
+        def poll(self) -> int | None:
+            return None
+
+        def wait(self, timeout: float | None = None) -> SandboxCompleted:
+            actions.append("wait")
+            return SandboxCompleted(0)
+
+        def terminate_group(self) -> None:
+            actions.append("terminate")
+
+        def kill_group(self) -> None:
+            actions.append("kill")
+
+    class SequencedSandbox(LauncherSocketSandbox):
+        def __init__(self) -> None:
+            pass
+
+        def prepare_finalization_child(self, argv: tuple[str, ...]) -> PreparedChild:
+            assert argv == (sys.executable, "-c", "pass")
+            actions.append("prepare")
+            return PreparedChild()
+
+    monkeypatch.setattr(
+        _LauncherFinalizationServiceInternal,
+        "serve_once",
+        lambda self, listener: actions.append("serve"),
+    )
+    runtime = replace(
+        _runtime(tmp_path, ActiveIndexHarness(tmp_path)),
+        sandbox=SequencedSandbox(),
+    )
+
+    result = FinalizationLauncher(runtime).serve_ticket_process(
+        "run-1",
+        generation.revision,
+        generation.state_hash,
+        (sys.executable, "-c", "pass"),
+    )
+
+    assert result == 0
+    assert actions == ["prepare", "transfer", "serve", "wait"]
 
 
 @pytest.mark.parametrize(

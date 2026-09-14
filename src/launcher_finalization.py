@@ -44,7 +44,7 @@ from auto_code.hashing import hash_json
 from auto_code.hashing import canonical_json_bytes
 from auto_code.linear import LinearGateway
 from auto_code.mcp_bridge import TrustedLinearBridge
-from auto_code.process import LauncherSocketSandbox, ProcessConfigurationError, ProcessHandle
+from auto_code.process import LauncherSocketSandbox, ProcessConfigurationError, SandboxChildHandle
 from auto_code.prepare import PreparationContextAuthority
 from auto_code.project_config import ProjectConfig
 from auto_code.state import RunStateStore, StateGeneration, _read_canonical_json
@@ -231,10 +231,11 @@ class FinalizationLauncher:
         socket_path = socket_directory / "service.sock"
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         descriptors: list[int] = []
-        process: ProcessHandle | None = None
+        process: SandboxChildHandle | None = None
         try:
             listener.bind(str(socket_path))
             listener.listen(1)
+            process = sandbox.prepare_finalization_child(ticket_argv)
             descriptor = self.serve_descriptor(
                 run_id,
                 expected_revision,
@@ -266,11 +267,7 @@ class FinalizationLauncher:
                 _sealed_descriptor(trust_bytes),
                 _sealed_descriptor(binding.to_bytes()),
             ]
-            process = sandbox.start_finalization_child(
-                ticket_argv,
-                capability_fds=(descriptors[0], descriptors[1], descriptors[2]),
-                isolate_procfs=True,
-            )
+            process.transfer_finalization_fds((descriptors[0], descriptors[1], descriptors[2]))
             service._peer_pid = process.pid
             service.serve_once(listener)
             return process.wait(timeout=descriptor.timeout_seconds).returncode

@@ -515,67 +515,16 @@ def test_production_ticket_invoker_uses_pinned_interpreter_sealed_archive_and_sa
     }
 
 
-def test_launcher_socket_starts_finalization_child_only_with_procfs_pid_isolation(tmp_path: Path) -> None:
-    """Dropping the isolation attestation or a capability FD would expose launcher authority."""
-
+def test_sandbox_exposes_no_authority_first_finalization_start(tmp_path: Path) -> None:
     socket_path = tmp_path / "launcher.sock"
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(socket_path))
-    listener.listen(1)
-    observed: dict[str, object] = {}
-
-    def serve() -> None:
-        connection, _ = listener.accept()
-        with connection:
-            descriptors = array.array("i")
-            raw, ancillary, _, _ = connection.recvmsg(65_536, socket.CMSG_SPACE(3 * descriptors.itemsize))
-            for level, kind, data in ancillary:
-                if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
-                    descriptors.frombytes(data[: len(data) - (len(data) % descriptors.itemsize)])
-            while not raw.endswith(b"\n"):
-                raw += connection.recv(65_536)
-            observed.update(json.loads(raw))
-            observed["capabilities"] = tuple(os.pread(descriptor, 32, 0) for descriptor in descriptors)
-            for descriptor in descriptors:
-                os.close(descriptor)
-            connection.sendall(
-                canonical_json_bytes(
-                    {
-                        "child_id": "f" * 32,
-                        "pid": 1,
-                        "procfs_pid_isolated": True,
-                    }
-                )
-                + b"\n"
-            )
-
-    thread = threading.Thread(target=serve)
-    thread.start()
-    descriptor_fds = tuple(os.memfd_create(f"capability-{slot}", os.MFD_CLOEXEC) for slot in (4, 5, 6))
     try:
-        for descriptor, payload in zip(descriptor_fds, (b"descriptor", b"trust", b"binding"), strict=True):
-            os.write(descriptor, payload)
-        handle = LauncherSocketSandbox(socket_path, "launcher").start_finalization_child(
-            (sys.executable, "-c", "pass"),
-            capability_fds=descriptor_fds,
-            isolate_procfs=True,
-        )
+        sandbox = LauncherSocketSandbox(socket_path, "launcher")
     finally:
-        for descriptor in descriptor_fds:
-            os.close(descriptor)
-        thread.join(timeout=3)
         listener.close()
 
-    assert handle.child_id == "f" * 32
-    assert observed == {
-        "schema_version": "v1",
-        "sandbox_identity": "launcher",
-        "operation": "start_finalization_child",
-        "argv": [sys.executable, "-c", "pass"],
-        "capability_fd_targets": [4, 5, 6],
-        "isolate_procfs": True,
-        "capabilities": (b"descriptor", b"trust", b"binding"),
-    }
+    assert not hasattr(sandbox, "start_finalization_child")
 
 
 def test_sandbox_prepares_a_child_only_after_verifying_signed_evidence(tmp_path: Path) -> None:
@@ -591,8 +540,12 @@ def test_sandbox_prepares_a_child_only_after_verifying_signed_evidence(tmp_path:
         with connection:
             raw = connection.makefile("rb").readline()
             observed.update(json.loads(raw))
+            child_id = "f" * 32
             unsigned_evidence = {
                 "domain": "auto-code-sandbox-child-evidence/v1",
+                "sandbox_identity": "launcher",
+                "challenge": observed["challenge"],
+                "child_id": child_id,
                 "pid": 124,
                 "pid_namespace_inode": 456,
                 "mount_namespace_inode": 789,
@@ -601,9 +554,13 @@ def test_sandbox_prepares_a_child_only_after_verifying_signed_evidence(tmp_path:
             connection.sendall(
                 canonical_json_bytes(
                     {
-                        "child_id": "f" * 32,
+                        "child_id": child_id,
                         "evidence": {
-                            **{key: value for key, value in unsigned_evidence.items() if key != "domain"},
+                            **{
+                                key: value
+                                for key, value in unsigned_evidence.items()
+                                if key not in {"domain", "sandbox_identity"}
+                            },
                             "signature": signing_key.sign(canonical_json_bytes(unsigned_evidence)).hex(),
                         },
                     }
@@ -614,7 +571,7 @@ def test_sandbox_prepares_a_child_only_after_verifying_signed_evidence(tmp_path:
     thread = threading.Thread(target=serve)
     thread.start()
     try:
-        evidence = LauncherSocketSandbox(
+        child = LauncherSocketSandbox(
             socket_path,
             "launcher",
             signing_key.public_key().public_bytes_raw(),
@@ -623,7 +580,11 @@ def test_sandbox_prepares_a_child_only_after_verifying_signed_evidence(tmp_path:
         thread.join(timeout=3)
         listener.close()
 
+    evidence = child.evidence
+    assert child.pid == 124
     assert evidence.pid == 124
+    assert evidence.child_id == "f" * 32
+    assert evidence.challenge == observed["challenge"]
     assert evidence.pid_namespace_inode == 456
     assert evidence.mount_namespace_inode == 789
     assert evidence.fd_numbers == ()
@@ -633,7 +594,105 @@ def test_sandbox_prepares_a_child_only_after_verifying_signed_evidence(tmp_path:
         "operation": "prepare_finalization_child",
         "argv": [sys.executable, "-c", "pass"],
         "isolate_procfs": True,
+        "challenge": observed["challenge"],
     }
+
+
+def test_sandbox_transfers_finalization_fds_only_on_the_authenticated_preparation_connection(
+    tmp_path: Path,
+) -> None:
+    socket_path = tmp_path / "launcher.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(1)
+    signing_key = Ed25519PrivateKey.generate()
+    requests: list[dict[str, object]] = []
+    capabilities: tuple[bytes, ...] = ()
+
+    def serve() -> None:
+        nonlocal capabilities
+        connection, _ = listener.accept()
+        with connection:
+            request = json.loads(connection.makefile("rb").readline())
+            requests.append(request)
+            child_id = "f" * 32
+            unsigned_evidence = {
+                "domain": "auto-code-sandbox-child-evidence/v1",
+                "sandbox_identity": "launcher",
+                "challenge": request["challenge"],
+                "child_id": child_id,
+                "pid": 124,
+                "pid_namespace_inode": 456,
+                "mount_namespace_inode": 789,
+                "fd_numbers": [],
+            }
+            connection.sendall(
+                canonical_json_bytes(
+                    {
+                        "child_id": child_id,
+                        "evidence": {
+                            **{
+                                key: value
+                                for key, value in unsigned_evidence.items()
+                                if key not in {"domain", "sandbox_identity"}
+                            },
+                            "signature": signing_key.sign(canonical_json_bytes(unsigned_evidence)).hex(),
+                        },
+                    }
+                )
+                + b"\n"
+            )
+            descriptors = array.array("i")
+            raw, ancillary, _, _ = connection.recvmsg(65_536, socket.CMSG_SPACE(3 * descriptors.itemsize))
+            for level, kind, data in ancillary:
+                if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                    descriptors.frombytes(data[: len(data) - (len(data) % descriptors.itemsize)])
+            while not raw.endswith(b"\n"):
+                raw += connection.recv(65_536)
+            transfer = json.loads(raw)
+            requests.append(transfer)
+            capabilities = tuple(os.pread(descriptor, 32, 0) for descriptor in descriptors)
+            for descriptor in descriptors:
+                os.close(descriptor)
+            connection.sendall(
+                canonical_json_bytes(
+                    {
+                        "child_id": child_id,
+                        "challenge": request["challenge"],
+                        "capability_fds_transferred": True,
+                    }
+                )
+                + b"\n"
+            )
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    descriptor_fds = tuple(os.memfd_create(f"capability-{slot}", os.MFD_CLOEXEC) for slot in (4, 5, 6))
+    child = None
+    try:
+        for descriptor, payload in zip(descriptor_fds, (b"descriptor", b"trust", b"binding"), strict=True):
+            os.write(descriptor, payload)
+        child = LauncherSocketSandbox(
+            socket_path,
+            "launcher",
+            signing_key.public_key().public_bytes_raw(),
+        ).prepare_finalization_child((sys.executable, "-c", "pass"))
+        child.transfer_finalization_fds(descriptor_fds)
+    finally:
+        for descriptor in descriptor_fds:
+            os.close(descriptor)
+        if child is not None:
+            child._transport.close()
+        thread.join(timeout=3)
+        listener.close()
+
+    assert capabilities == (b"descriptor", b"trust", b"binding")
+    assert [request["operation"] for request in requests] == [
+        "prepare_finalization_child",
+        "transfer_finalization_fds",
+    ]
+    assert requests[1]["child_id"] == "f" * 32
+    assert requests[1]["challenge"] == requests[0]["challenge"]
 
 
 @pytest.mark.parametrize("signing_key", (None, Ed25519PrivateKey.generate()), ids=("unsigned", "wrong-key"))
@@ -647,9 +706,13 @@ def test_sandbox_rejects_unsigned_or_wrong_peer_evidence(tmp_path: Path, signing
     def serve() -> None:
         connection, _ = listener.accept()
         with connection:
-            connection.makefile("rb").readline()
+            request = json.loads(connection.makefile("rb").readline())
+            child_id = "f" * 32
             unsigned_evidence = {
                 "domain": "auto-code-sandbox-child-evidence/v1",
+                "sandbox_identity": "launcher",
+                "challenge": request["challenge"],
+                "child_id": child_id,
                 "pid": 124,
                 "pid_namespace_inode": 456,
                 "mount_namespace_inode": 789,
@@ -659,9 +722,13 @@ def test_sandbox_rejects_unsigned_or_wrong_peer_evidence(tmp_path: Path, signing
             connection.sendall(
                 canonical_json_bytes(
                     {
-                        "child_id": "f" * 32,
+                        "child_id": child_id,
                         "evidence": {
-                            **{key: value for key, value in unsigned_evidence.items() if key != "domain"},
+                            **{
+                                key: value
+                                for key, value in unsigned_evidence.items()
+                                if key not in {"domain", "sandbox_identity"}
+                            },
                             "signature": signature,
                         },
                     }
@@ -673,6 +740,70 @@ def test_sandbox_rejects_unsigned_or_wrong_peer_evidence(tmp_path: Path, signing
     thread.start()
     try:
         sandbox = LauncherSocketSandbox(socket_path, "launcher", pinned_key.public_key().public_bytes_raw())
+        with pytest.raises(ProcessConfigurationError, match="Finalization child evidence is invalid"):
+            sandbox.prepare_finalization_child((sys.executable, "-c", "pass"))
+    finally:
+        thread.join(timeout=3)
+        listener.close()
+
+
+@pytest.mark.parametrize(
+    ("returned_child_id", "signed_child_id", "challenge_source", "fd_numbers"),
+    (
+        ("f" * 32, "f" * 32, "stale", []),
+        ("e" * 32, "f" * 32, "request", []),
+        ("f" * 32, "f" * 32, "request", [0, 1, 2]),
+    ),
+    ids=("replayed-challenge", "child-identity-mismatch", "nonempty-fd-table"),
+)
+def test_sandbox_rejects_evidence_not_bound_to_the_exact_preparation(
+    tmp_path: Path,
+    returned_child_id: str,
+    signed_child_id: str,
+    challenge_source: str,
+    fd_numbers: list[int],
+) -> None:
+    socket_path = tmp_path / "launcher.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(socket_path))
+    listener.listen(1)
+    signing_key = Ed25519PrivateKey.generate()
+
+    def serve() -> None:
+        connection, _ = listener.accept()
+        with connection:
+            request = json.loads(connection.makefile("rb").readline())
+            unsigned_evidence = {
+                "domain": "auto-code-sandbox-child-evidence/v1",
+                "sandbox_identity": "launcher",
+                "challenge": request["challenge"] if challenge_source == "request" else "0" * 64,
+                "child_id": signed_child_id,
+                "pid": 124,
+                "pid_namespace_inode": 456,
+                "mount_namespace_inode": 789,
+                "fd_numbers": fd_numbers,
+            }
+            connection.sendall(
+                canonical_json_bytes(
+                    {
+                        "child_id": returned_child_id,
+                        "evidence": {
+                            **{
+                                key: value
+                                for key, value in unsigned_evidence.items()
+                                if key not in {"domain", "sandbox_identity"}
+                            },
+                            "signature": signing_key.sign(canonical_json_bytes(unsigned_evidence)).hex(),
+                        },
+                    }
+                )
+                + b"\n"
+            )
+
+    thread = threading.Thread(target=serve)
+    thread.start()
+    try:
+        sandbox = LauncherSocketSandbox(socket_path, "launcher", signing_key.public_key().public_bytes_raw())
         with pytest.raises(ProcessConfigurationError, match="Finalization child evidence is invalid"):
             sandbox.prepare_finalization_child((sys.executable, "-c", "pass"))
     finally:
