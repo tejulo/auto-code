@@ -274,12 +274,19 @@ class FinalizationLauncher:
             service.serve_once(listener)
             return process.wait(timeout=descriptor.timeout_seconds).returncode
         except Exception as error:
+            cleanup_error: Exception | None = None
             if process is not None:
                 try:
                     process.kill_group()
+                except Exception as cleanup:
+                    cleanup_error = cleanup
+                try:
                     process.wait()
-                except (OSError, ProcessConfigurationError):
-                    pass
+                except Exception as cleanup:
+                    if cleanup_error is None:
+                        cleanup_error = cleanup
+            if cleanup_error is not None:
+                raise FinalizationLauncherError("finalization child cleanup failed") from cleanup_error
             raise FinalizationLauncherError("finalization launcher lifecycle failed") from error
         finally:
             for descriptor_fd in descriptors:

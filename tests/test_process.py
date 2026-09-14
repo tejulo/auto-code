@@ -716,9 +716,10 @@ def test_sandbox_rejects_forged_post_transfer_evidence(tmp_path: Path) -> None:
     socket_path = tmp_path / "launcher.sock"
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(socket_path))
-    listener.listen(1)
+    listener.listen(3)
     signing_key = Ed25519PrivateKey.generate()
     forged_key = Ed25519PrivateKey.generate()
+    cleanup_operations: list[str] = []
 
     def serve() -> None:
         connection, _ = listener.accept()
@@ -771,6 +772,16 @@ def test_sandbox_rejects_forged_post_transfer_evidence(tmp_path: Path) -> None:
                 )
                 + b"\n"
             )
+        for operation, response in (
+            ("kill_finalization_child", {}),
+            ("wait_finalization_child", {"returncode": -9, "stdout": "", "stderr": ""}),
+        ):
+            connection, _ = listener.accept()
+            with connection:
+                request = json.loads(connection.makefile("rb").readline())
+                cleanup_operations.append(request["operation"])
+                assert request["operation"] == operation
+                connection.sendall(canonical_json_bytes(response) + b"\n")
 
     thread = threading.Thread(target=serve, daemon=True)
     thread.start()
@@ -788,6 +799,8 @@ def test_sandbox_rejects_forged_post_transfer_evidence(tmp_path: Path) -> None:
             os.close(descriptor)
         thread.join(timeout=3)
         listener.close()
+
+    assert cleanup_operations == ["kill_finalization_child", "wait_finalization_child"]
 
 
 @pytest.mark.parametrize("signing_key", (None, Ed25519PrivateKey.generate()), ids=("unsigned", "wrong-key"))

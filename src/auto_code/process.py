@@ -599,12 +599,26 @@ class SandboxChildHandle:
             return evidence
         except (InvalidSignature, OSError, ValueError, ProcessConfigurationError) as error:
             try:
-                self.kill_group()
-            except (OSError, ProcessConfigurationError):
-                pass
+                self._kill_and_reap()
+            except ProcessConfigurationError as cleanup_error:
+                raise ProcessConfigurationError("Finalization capability transfer cleanup failed") from cleanup_error
             raise ProcessConfigurationError("Finalization capability transfer failed") from error
         finally:
             self._transport.close()
+
+    def _kill_and_reap(self) -> None:
+        cleanup_error: Exception | None = None
+        try:
+            self.kill_group()
+        except Exception as error:
+            cleanup_error = error
+        try:
+            self.wait()
+        except Exception as error:
+            if cleanup_error is None:
+                cleanup_error = error
+        if cleanup_error is not None:
+            raise ProcessConfigurationError("Finalization child cleanup failed") from cleanup_error
 
     def poll(self) -> int | None:
         response = self.sandbox._finalization_child_request("poll_finalization_child", self.child_id, 5.0)
